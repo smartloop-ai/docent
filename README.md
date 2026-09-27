@@ -7,7 +7,7 @@ Use the command line interface as a companion to the Studio app. It talks to the
 <img width="884" height="687" alt="cli-run-latte-df56cbde4925c0e214a91ade5bac6a96" src="https://github.com/user-attachments/assets/469de052-e3e0-4118-bca8-4494976507b1" />
 
 More at:
-[docs.smartloop.ai]([https://](https://smartloop.ai/docs/intro/)
+[docs.smartloop.ai](https://smartloop.ai/docs/intro/)
 
 ## Install
 
