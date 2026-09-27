@@ -1,9 +1,13 @@
-# Smartloop - Model Orchestration and reasoning
+# Smartloop
 
-The Smartloop CLI is a companion to the Studio app. It talks to the local service Studio runs, so you can manage projects, check on the agent, and chat with the assistant from the terminal — handy for scripting a repeatable setup.
+Smartloop is a local AI orchestration framework for extracting information from your own sources and generating new content. It runs on your device.
+
+Use the command line interface as a companion to the Studio app. It talks to the local service Studio runs, so you can manage projects, check on the agent, and chat with the assistant from the terminal — handy for scripting a repeatable setup.
 
 <img width="884" height="687" alt="cli-run-latte-df56cbde4925c0e214a91ade5bac6a96" src="https://github.com/user-attachments/assets/469de052-e3e0-4118-bca8-4494976507b1" />
 
+More at:
+[docs.smartloop.ai]([https://](https://smartloop.ai/docs/intro/)
 
 ## Install
 
