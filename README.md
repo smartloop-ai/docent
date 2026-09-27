@@ -1,6 +1,6 @@
-# Smartloop Command Line Interface
+# Smartloop - Model Orchestration and reasoning
 
-Smartloop CLI is designed to use with studio desktop and interacting with local service to manage projects, documents, skills and connections
+Use the command line interface along studio desktop and interacting with local agent to manage projects, documents, skills and connections, chat and build solutions
 
 ## Install
 
