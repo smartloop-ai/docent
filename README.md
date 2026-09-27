@@ -2,9 +2,12 @@
 
 Use the command line interface along studio desktop and interacting with local agent to manage projects, documents, skills and connections, chat and build solutions
 
+<img width="884" height="687" alt="cli-run-latte-df56cbde4925c0e214a91ade5bac6a96" src="https://github.com/user-attachments/assets/469de052-e3e0-4118-bca8-4494976507b1" />
+
+
 ## Install
 
-macOS and Linux:
+macOS and Linux
 
 ```sh
 curl -fsSL https://smartloop.ai/install | sh
