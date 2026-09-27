@@ -1,6 +1,6 @@
 # Smartloop - Model Orchestration and reasoning
 
-Use the command line interface along studio desktop and interacting with local agent to manage projects, documents, skills and connections, chat and build solutions
+The Smartloop CLI is a companion to the Studio app. It talks to the local service Studio runs, so you can manage projects, check on the agent, and chat with the assistant from the terminal — handy for scripting a repeatable setup.
 
 <img width="884" height="687" alt="cli-run-latte-df56cbde4925c0e214a91ade5bac6a96" src="https://github.com/user-attachments/assets/469de052-e3e0-4118-bca8-4494976507b1" />
 
