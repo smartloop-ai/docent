@@ -174,6 +174,37 @@ agent's tool calls (web search, document lookup, model selection, etc.) is
 printed on stderr as `[step] message` lines, colored when the terminal
 supports it, so it doesn't interleave with the streamed answer on stdout.
 
+When the answer draws on documents or web pages, the sources it actually used
+follow it on stdout as a numbered list:
+
+```
+References
+[1] https://releases.rs/
+```
+
+### Models
+
+The orchestrator picks which model serves each turn from the models enabled
+for the project. List what's available and its state for the current project:
+
+```sh
+smartloop model list
+```
+
+Enable or disable a model:
+
+```sh
+smartloop model enable gemma4-e2b
+smartloop model disable gemma4-e2b
+```
+
+`enable` downloads the weights first when they aren't on disk yet, showing
+progress, and only then switches the model on. Weights are shared across
+projects, so each model downloads once. Models marked `(sign in)` need
+`smartloop login` first. `disable` also unloads the model from memory. All
+three take `--project <project-id>` to act on a project other than the current
+one. The `sl-mini` orchestrator is always on and isn't listed.
+
 ## Configuration
 
 The CLI connects to the Smartloop API at `http://localhost:38540` by default.

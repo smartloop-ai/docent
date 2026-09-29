@@ -340,7 +340,7 @@ pub fn setup(client: &Client, base_url: &str) {
         None => eprintln!("No workspace found yet; the agent will fetch embeddings on first index"),
     }
 
-    bootstrap(base_url);
+    stream_progress(base_url, "/v1/bootstrap", serde_json::json!({}), "Setup");
 }
 
 /// The workspace SLP is using: `config.json`'s workspace id, or the only
@@ -399,21 +399,36 @@ fn ensure_embeddings(workspace: &Path) {
     );
 }
 
-/// Run `POST /v1/bootstrap` and print its SSE progress. Downloads the default
-/// chat model when the workspace has none, which can take minutes, so the
-/// request has no timeout.
-fn bootstrap(base_url: &str) {
+/// POST `body` to an SSE endpoint that reports long-running work
+/// (`/v1/bootstrap`, `/v1/init`) and print its progress on stderr: byte
+/// progress on one updating line, stage messages one per line. Fails on an
+/// error frame, which arrives inside a 200 response. Downloads can take
+/// minutes, so the request has no timeout.
+pub fn stream_progress(base_url: &str, path: &str, body: serde_json::Value, action: &str) {
     let client = Client::builder()
         .timeout(None)
         .build()
         .unwrap_or_else(|e| fail(format!("Failed to build HTTP client: {}", e)));
     let response = client
-        .post(format!("{}/v1/bootstrap", base_url))
-        .json(&serde_json::json!({}))
+        .post(format!("{}{}", base_url, path))
+        .json(&body)
         .send()
-        .unwrap_or_else(|e| fail(format!("Failed to bootstrap: {}", e)));
+        .unwrap_or_else(|e| fail(format!("{} failed: {}", action, e)));
     if !response.status().is_success() {
-        fail(format!("Failed to bootstrap: {}", response.status()));
+        let status = response.status();
+        let detail = response
+            .json::<serde_json::Value>()
+            .ok()
+            .and_then(|b| b["detail"].as_str().map(str::to_string));
+        let hint = if matches!(status.as_u16(), 401 | 403) {
+            "; sign in with `smartloop login`"
+        } else {
+            ""
+        };
+        match detail {
+            Some(detail) => fail(format!("{} failed: {} ({}){}", action, detail, status, hint)),
+            None => fail(format!("{} failed: {}{}", action, status, hint)),
+        }
     }
 
     let show_progress = std::io::stderr().is_terminal();
@@ -422,7 +437,7 @@ fn bootstrap(base_url: &str) {
     let mut last_message = String::new();
 
     for line in std::io::BufReader::new(response).lines() {
-        let line = line.unwrap_or_else(|e| fail(format!("Bootstrap stream dropped: {}", e)));
+        let line = line.unwrap_or_else(|e| fail(format!("{} stream dropped: {}", action, e)));
         let line = line.trim();
         if line.is_empty() {
             event.clear();
@@ -440,8 +455,9 @@ fn bootstrap(base_url: &str) {
                 eprintln!();
             }
             fail(format!(
-                "Setup failed: {}",
-                data["message"].as_str().unwrap_or("bootstrap failed")
+                "{} failed: {}",
+                action,
+                data["message"].as_str().unwrap_or("unknown error")
             ));
         }
 
