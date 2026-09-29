@@ -232,20 +232,64 @@ fn download(url: &str, dest: &Path, label: &str) {
         .unwrap_or_else(|e| fail(format!("Failed to move download into {}: {}", dest.display(), e)));
 }
 
+const BAR_WIDTH: usize = 30;
+
+/// Redraw the progress line in place on stderr:
+///
+/// ```text
+/// Downloading gemma-4-e2b.gguf  ██████████████▋░░░░░░░░░░░░░░░   49%  1.2/2.5 GB
+/// ```
+///
+/// Eighth-width blocks make the bar's leading edge move smoothly. Without a
+/// known total only the transferred size is shown.
 fn report_progress(label: &str, downloaded: u64, total: u64) {
-    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    let label = truncate_label(label, 48);
     if total > 0 {
+        let fraction = (downloaded as f64 / total as f64).clamp(0.0, 1.0);
         eprint!(
-            "\r{}... {:.0}/{:.0} MB ({}%)",
+            "\r\x1b[2K{}  {}  {:>3}%  {}/{}",
             label,
-            mb(downloaded),
-            mb(total),
-            downloaded * 100 / total
+            progress_bar(fraction),
+            (fraction * 100.0) as u64,
+            format_size(downloaded),
+            format_size(total)
         );
     } else {
-        eprint!("\r{}... {:.0} MB", label, mb(downloaded));
+        eprint!("\r\x1b[2K{}  {}", label, format_size(downloaded));
     }
     let _ = std::io::stderr().flush();
+}
+
+fn progress_bar(fraction: f64) -> String {
+    const PARTIAL: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+    let eighths = (fraction * (BAR_WIDTH * 8) as f64) as usize;
+    let full = eighths / 8;
+    let mut bar = "█".repeat(full);
+    if full < BAR_WIDTH {
+        let partial = PARTIAL[eighths % 8];
+        bar.push_str(partial);
+        let used = full + usize::from(!partial.is_empty());
+        bar.push_str(&"░".repeat(BAR_WIDTH - used));
+    }
+    format!("\x1b[36m{}\x1b[0m", bar)
+}
+
+fn format_size(bytes: u64) -> String {
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    if mb >= 1024.0 {
+        format!("{:.1} GB", mb / 1024.0)
+    } else {
+        format!("{:.0} MB", mb)
+    }
+}
+
+/// Keep the bar from wrapping on long model file names.
+fn truncate_label(label: &str, max: usize) -> String {
+    if label.chars().count() <= max {
+        return label.to_string();
+    }
+    let kept: String = label.chars().take(max - 1).collect();
+    format!("{}…", kept)
 }
 
 /// Extract with the system `tar` (bsdtar on macOS and Windows 10+, which
@@ -434,6 +478,7 @@ pub fn stream_progress(base_url: &str, path: &str, body: serde_json::Value, acti
     let show_progress = std::io::stderr().is_terminal();
     let mut event = String::new();
     let mut on_progress_line = false;
+    let mut current_file = String::new();
     let mut last_message = String::new();
 
     for line in std::io::BufReader::new(response).lines() {
@@ -465,8 +510,14 @@ pub fn stream_progress(base_url: &str, path: &str, body: serde_json::Value, acti
         let total = data["total"].as_u64().unwrap_or(0);
         if let (Some(downloaded), true) = (downloaded, total > 0) {
             if show_progress {
-                let name = data["filename"].as_str().unwrap_or("model");
+                let name = data["filename"].as_str().unwrap_or("model").to_string();
+                // A model can be several files (weights, vision projector):
+                // finish the previous file's bar and give each its own.
+                if on_progress_line && name != current_file {
+                    eprintln!();
+                }
                 report_progress(&format!("Downloading {}", name), downloaded, total);
+                current_file = name;
                 on_progress_line = true;
             }
             continue;
@@ -593,4 +644,22 @@ fn detach(cmd: &mut Command) {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_bar_is_always_full_width() {
+        for step in 0..=1000 {
+            let bar = progress_bar(step as f64 / 1000.0);
+            let cells = bar
+                .trim_start_matches("\x1b[36m")
+                .trim_end_matches("\x1b[0m")
+                .chars()
+                .count();
+            assert_eq!(cells, BAR_WIDTH, "at {}", step);
+        }
+    }
 }
