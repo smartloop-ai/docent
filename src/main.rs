@@ -8,6 +8,7 @@ use prettytable::{Attr, Cell, Row, Table, color};
 use reqwest::blocking::{Client, Response, multipart};
 
 mod framework;
+mod progress;
 
 const LOGO: &str = r#"
 █▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█
@@ -554,16 +555,17 @@ fn list_models(client: &Client, project_id: &str) {
 }
 
 /// PATCH a project's model entry; the server canonicalizes the name.
-fn patch_project_model(client: &Client, project_id: &str, name: &str, enabled: bool) {
+fn patch_project_model(client: &Client, project_id: &str, name: &str, enabled: bool) -> Result<(), String> {
     let action = if enabled { "enable model" } else { "disable model" };
     let response = client
         .patch(format!("{}/{}", project_models_url(project_id), name))
         .json(&serde_json::json!({ "enabled": enabled }))
         .send()
-        .unwrap_or_else(|e| fail(format!("Failed to {}: {}", action, e)));
+        .map_err(|e| format!("Failed to {}: {}", action, e))?;
     if !response.status().is_success() {
-        fail(error_message(action, response));
+        return Err(error_message(action, response));
     }
+    Ok(())
 }
 
 /// Same sequence as the studio app's model toggle: weights are fetched
@@ -576,16 +578,35 @@ fn enable_model(client: &Client, project_id: &str, name: &str) {
         .and_then(|m| m["downloaded"].as_bool())
         .unwrap_or_default();
 
-    if !downloaded {
+    let mut list = progress::Checklist::new();
+    let download = list.add(&format!("Download {}", name));
+    let enable = list.add("Enable for project");
+
+    if downloaded {
+        list.done(download, "downloaded");
+    } else {
+        list.start(download);
         framework::stream_progress(
             &base_url(),
             "/v1/init",
             serde_json::json!({ "model_name": name, "project_id": project_id }),
-            &format!("Downloading {}", name),
+            &mut list,
+            download,
+            &|status| match status {
+                "downloading" => framework::Stage::Start(download),
+                "download_complete" => framework::Stage::Done(download),
+                "model_ready" => framework::Stage::Present(download),
+                _ => framework::Stage::Other,
+            },
         );
+        list.finish_before(enable);
     }
 
-    patch_project_model(client, project_id, name, true);
+    list.start(enable);
+    if let Err(e) = patch_project_model(client, project_id, name, true) {
+        list.fail(enable, e);
+    }
+    list.done(enable, "");
     println!("Model {} enabled", name);
 }
 
@@ -600,7 +621,7 @@ fn disable_model(client: &Client, project_id: &str, name: &str) {
         println!("Model {} is not enabled", name);
         return;
     }
-    patch_project_model(client, project_id, name, false);
+    patch_project_model(client, project_id, name, false).unwrap_or_else(|e| fail(e));
     println!("Model {} disabled", name);
 }
 
@@ -986,9 +1007,7 @@ fn main() {
                 if !is_local() {
                     fail("SMARTLOOP_API_URL is set; start that agent where it runs".to_string());
                 }
-                let client = Client::new();
-                framework::start(&client, &base_url());
-                framework::ensure_running(&client, &base_url(), true);
+                framework::start(&Client::new(), &base_url());
             }
             AgentCommands::Stop => framework::stop(),
         },

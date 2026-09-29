@@ -65,8 +65,25 @@ Any command that talks to the agent starts it when nothing answers on
 4. Run the agent's bootstrap, which downloads the default chat model, creates
    the default project and loads the model.
 
-Each step is skipped when its files are already there. To do this up front,
-or to stop the agent:
+Each step is skipped when its files are already there. Progress shows as a
+checklist on stderr that redraws in place, with the active download's bar in
+Smartloop pink:
+
+```
+[✓] SLP framework 1.2.7                667 MB
+[✓] Start agent                    port 38540
+[✓] Embeddings (bge-m3)                417 MB
+[•] Chat model sl-mini
+    ██████████████▋░░░░░░░░░░░░░░░   49%  377 MB/769 MB
+[ ] Default project
+[ ] Load model
+[ ] Skills and connections
+```
+
+When stderr isn't a terminal, each step prints one line as it finishes
+instead. `smartloop model enable` shows the same checklist for its download.
+
+To do this up front, or to stop the agent:
 
 ```sh
 smartloop agent start
