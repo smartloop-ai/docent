@@ -8,7 +8,7 @@
 //! `slp-service.js` launches it.
 
 use std::fs;
-use std::io::{BufRead, IsTerminal, Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use reqwest::blocking::Client;
 
 use crate::fail;
+use crate::progress::{Checklist, format_size};
 
 /// SLP framework version this CLI installs and runs.
 pub const VERSION: &str = "1.2.7";
@@ -79,47 +80,54 @@ fn archive_url() -> String {
     format!("{}/slp/{}/{}-{}-slp.{}", base.trim_end_matches('/'), VERSION, plat, arch, ext)
 }
 
-/// Download and extract the framework unless this version is already present.
-/// Returns the binary path.
-pub fn ensure_installed() -> PathBuf {
+/// Download and extract the framework unless this version is already present,
+/// as one step on `list`. Returns the binary path.
+fn ensure_installed(list: &mut Checklist) -> PathBuf {
     let binary = binary_path();
     if is_non_empty_file(&binary) {
         return binary;
     }
 
+    let step = list.add(&format!("SLP framework {}", VERSION));
+    list.start(step);
+
     let root = install_dir();
     let version_dir = root.join(VERSION);
     let cache_dir = root.join("cache");
     for dir in [&root, &cache_dir] {
-        fs::create_dir_all(dir)
-            .unwrap_or_else(|e| fail(format!("Failed to create {}: {}", dir.display(), e)));
+        if let Err(e) = fs::create_dir_all(dir) {
+            list.fail(step, format!("Failed to create {}: {}", dir.display(), e));
+        }
     }
     // Start from a clean version dir so a half-finished earlier install
     // can't leave stale files next to the new ones.
     let _ = fs::remove_dir_all(&version_dir);
-    fs::create_dir_all(&version_dir)
-        .unwrap_or_else(|e| fail(format!("Failed to create {}: {}", version_dir.display(), e)));
+    if let Err(e) = fs::create_dir_all(&version_dir) {
+        list.fail(step, format!("Failed to create {}: {}", version_dir.display(), e));
+    }
 
     let url = archive_url();
     let file_name = url.rsplit('/').next().unwrap_or("slp-archive");
     let archive = cache_dir.join(format!("slp-{}-{}", VERSION, file_name));
 
-    eprintln!("Installing SLP framework {} into {}", VERSION, version_dir.display());
-    download(&url, &archive, "Downloading framework");
+    let size = download(&url, &archive, list, step).unwrap_or_else(|e| list.fail(step, e));
 
-    eprintln!("Extracting...");
+    list.note(step, "extracting…");
     let result = extract(&archive, &version_dir);
     let _ = fs::remove_file(&archive);
     if let Err(e) = result {
         let _ = fs::remove_dir_all(&version_dir);
-        fail(e);
+        list.fail(step, e);
     }
 
     if !is_non_empty_file(&binary) {
-        fail(format!(
-            "Binary missing or empty at {} after install — the archive may be incomplete",
-            binary.display()
-        ));
+        list.fail(
+            step,
+            format!(
+                "Binary missing or empty at {} after install — the archive may be incomplete",
+                binary.display()
+            ),
+        );
     }
 
     #[cfg(unix)]
@@ -138,6 +146,7 @@ pub fn ensure_installed() -> PathBuf {
             .status();
     }
 
+    list.note(step, "verifying…");
     let verified = Command::new(&binary)
         .arg("--version")
         .stdout(Stdio::null())
@@ -146,11 +155,14 @@ pub fn ensure_installed() -> PathBuf {
         .map(|s| s.success())
         .unwrap_or(false);
     if !verified {
-        fail(format!("Installation verification failed: '{} --version' did not succeed", binary.display()));
+        list.fail(
+            step,
+            format!("Installation verification failed: '{} --version' did not succeed", binary.display()),
+        );
     }
 
     write_markers(&root);
-    eprintln!("Installed SLP framework {}", VERSION);
+    list.done(step, &format_size(size));
     binary
 }
 
@@ -171,18 +183,19 @@ fn write_markers(root: &Path) {
 
 /// Stream `url` to `dest` through a `.part` file renamed on success, so an
 /// interrupted download never leaves a truncated file at the real path.
-fn download(url: &str, dest: &Path, label: &str) {
+/// Progress goes to `step` on `list`. Returns the size downloaded.
+fn download(url: &str, dest: &Path, list: &mut Checklist, step: usize) -> Result<u64, String> {
     // No overall timeout: the archive is hundreds of MB.
     let client = Client::builder()
         .timeout(None)
         .build()
-        .unwrap_or_else(|e| fail(format!("Failed to build HTTP client: {}", e)));
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
     let mut response = client
         .get(url)
         .send()
-        .unwrap_or_else(|e| fail(format!("Failed to download {}: {}", url, e)));
+        .map_err(|e| format!("Failed to download {}: {}", url, e))?;
     if !response.status().is_success() {
-        fail(format!("Failed to download {}: {}", url, response.status()));
+        return Err(format!("Failed to download {}: {}", url, response.status()));
     }
 
     let total = response.content_length().unwrap_or(0);
@@ -191,12 +204,11 @@ fn download(url: &str, dest: &Path, label: &str) {
         dest.file_name().and_then(|n| n.to_str()).unwrap_or("download")
     ));
     let mut file = fs::File::create(&partial)
-        .unwrap_or_else(|e| fail(format!("Failed to create {}: {}", partial.display(), e)));
+        .map_err(|e| format!("Failed to create {}: {}", partial.display(), e))?;
 
-    let show_progress = std::io::stderr().is_terminal();
     let mut buf = vec![0u8; 256 * 1024];
     let mut downloaded: u64 = 0;
-    let mut last_report = Instant::now();
+    list.progress(step, 0, total);
 
     loop {
         let n = match response.read(&mut buf) {
@@ -204,92 +216,25 @@ fn download(url: &str, dest: &Path, label: &str) {
             Ok(n) => n,
             Err(e) => {
                 let _ = fs::remove_file(&partial);
-                fail(format!("Download interrupted: {}", e));
+                return Err(format!("Download interrupted: {}", e));
             }
         };
         if let Err(e) = file.write_all(&buf[..n]) {
             let _ = fs::remove_file(&partial);
-            fail(format!("Failed to write {}: {}", partial.display(), e));
+            return Err(format!("Failed to write {}: {}", partial.display(), e));
         }
         downloaded += n as u64;
-
-        if show_progress && last_report.elapsed() >= Duration::from_millis(200) {
-            last_report = Instant::now();
-            report_progress(label, downloaded, total);
-        }
+        list.progress(step, downloaded, total);
     }
     drop(file);
 
     if total > 0 && downloaded != total {
         let _ = fs::remove_file(&partial);
-        fail(format!("Download of {} incomplete: {} of {} bytes", url, downloaded, total));
-    }
-    if show_progress {
-        report_progress(label, downloaded, total);
-        eprintln!();
+        return Err(format!("Download of {} incomplete: {} of {} bytes", url, downloaded, total));
     }
     fs::rename(&partial, dest)
-        .unwrap_or_else(|e| fail(format!("Failed to move download into {}: {}", dest.display(), e)));
-}
-
-const BAR_WIDTH: usize = 30;
-
-/// Redraw the progress line in place on stderr:
-///
-/// ```text
-/// Downloading gemma-4-e2b.gguf  ██████████████▋░░░░░░░░░░░░░░░   49%  1.2/2.5 GB
-/// ```
-///
-/// Eighth-width blocks make the bar's leading edge move smoothly. Without a
-/// known total only the transferred size is shown.
-fn report_progress(label: &str, downloaded: u64, total: u64) {
-    let label = truncate_label(label, 48);
-    if total > 0 {
-        let fraction = (downloaded as f64 / total as f64).clamp(0.0, 1.0);
-        eprint!(
-            "\r\x1b[2K{}  {}  {:>3}%  {}/{}",
-            label,
-            progress_bar(fraction),
-            (fraction * 100.0) as u64,
-            format_size(downloaded),
-            format_size(total)
-        );
-    } else {
-        eprint!("\r\x1b[2K{}  {}", label, format_size(downloaded));
-    }
-    let _ = std::io::stderr().flush();
-}
-
-fn progress_bar(fraction: f64) -> String {
-    const PARTIAL: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
-    let eighths = (fraction * (BAR_WIDTH * 8) as f64) as usize;
-    let full = eighths / 8;
-    let mut bar = "█".repeat(full);
-    if full < BAR_WIDTH {
-        let partial = PARTIAL[eighths % 8];
-        bar.push_str(partial);
-        let used = full + usize::from(!partial.is_empty());
-        bar.push_str(&"░".repeat(BAR_WIDTH - used));
-    }
-    format!("\x1b[36m{}\x1b[0m", bar)
-}
-
-fn format_size(bytes: u64) -> String {
-    let mb = bytes as f64 / (1024.0 * 1024.0);
-    if mb >= 1024.0 {
-        format!("{:.1} GB", mb / 1024.0)
-    } else {
-        format!("{:.0} MB", mb)
-    }
-}
-
-/// Keep the bar from wrapping on long model file names.
-fn truncate_label(label: &str, max: usize) -> String {
-    if label.chars().count() <= max {
-        return label.to_string();
-    }
-    let kept: String = label.chars().take(max - 1).collect();
-    format!("{}…", kept)
+        .map_err(|e| format!("Failed to move download into {}: {}", dest.display(), e))?;
+    Ok(downloaded)
 }
 
 /// Extract with the system `tar` (bsdtar on macOS and Windows 10+, which
@@ -346,15 +291,26 @@ fn is_healthy(client: &Client, base_url: &str) -> bool {
 /// when nothing answers, and a first run pulls the models it needs; a custom
 /// `SMARTLOOP_API_URL` is left to whoever runs it.
 pub fn ensure_running(client: &Client, base_url: &str, local: bool) {
-    if !is_healthy(client, base_url) {
-        if !local {
-            fail(format!("No agent is running at {}", base_url));
-        }
-        start(client, base_url);
+    let healthy = is_healthy(client, base_url);
+    if !healthy && !local {
+        fail(format!("No agent is running at {}", base_url));
+    }
+    let mut list = Checklist::new();
+    if !healthy {
+        launch(&mut list, client, base_url);
     }
     if local && needs_setup(client, base_url) {
-        setup(client, base_url);
+        setup(&mut list, client, base_url);
     }
+}
+
+/// `smartloop agent start`: bring the local agent up and ready, or say it
+/// already is.
+pub fn start(client: &Client, base_url: &str) {
+    if is_healthy(client, base_url) {
+        eprintln!("Agent already running at {}", base_url);
+    }
+    ensure_running(client, base_url, true);
 }
 
 /// Same test the studio app runs before bootstrapping: no project yet, or no
@@ -375,16 +331,37 @@ fn needs_setup(client: &Client, base_url: &str) -> bool {
 /// First-run setup: make sure the workspace exists, fetch the embedding model
 /// document search needs, then let `/v1/bootstrap` download the chat model,
 /// create the default project and load it.
-pub fn setup(client: &Client, base_url: &str) {
-    // A plain read that creates the workspace when there isn't one.
-    let _ = client.get(format!("{}/v1/models/workspace", base_url)).send();
+fn setup(list: &mut Checklist, client: &Client, base_url: &str) {
+    let embeddings = list.add("Embeddings (bge-m3)");
+    let model = list.add("Chat model");
+    let project = list.add("Default project");
+    let load = list.add("Load model");
+    let services = list.add("Skills and connections");
 
+    // A plain read that creates the workspace when there isn't one.
+    list.start(embeddings);
+    let _ = client.get(format!("{}/v1/models/workspace", base_url)).send();
     match workspace_dir() {
-        Some(workspace) => ensure_embeddings(&workspace),
-        None => eprintln!("No workspace found yet; the agent will fetch embeddings on first index"),
+        Some(workspace) => ensure_embeddings(list, embeddings, &workspace),
+        // The agent fetches it itself the first time it indexes.
+        None => list.done(embeddings, "on first index"),
     }
 
-    stream_progress(base_url, "/v1/bootstrap", serde_json::json!({}), "Setup");
+    stream_progress(base_url, "/v1/bootstrap", serde_json::json!({}), list, model, &|status| {
+        match status {
+            "downloading" => Stage::Start(model),
+            "download_complete" => Stage::Done(model),
+            "model_ready" => Stage::Present(model),
+            "creating_project" => Stage::Start(project),
+            "project_created" => Stage::Done(project),
+            "loading" => Stage::Start(load),
+            "model_loaded" => Stage::Done(load),
+            "setup" => Stage::Start(services),
+            "setup_complete" => Stage::Done(services),
+            _ => Stage::Other,
+        }
+    });
+    list.finish_all();
 }
 
 /// The workspace SLP is using: `config.json`'s workspace id, or the only
@@ -424,31 +401,52 @@ fn workspace_dir() -> Option<PathBuf> {
 /// looks for it (AppSettings.embedding_gguf_file / embedding_gguf_base_url).
 /// Without it the agent downloads it on first index and falls back to TF-IDF
 /// retrieval until then.
-fn ensure_embeddings(workspace: &Path) {
+fn ensure_embeddings(list: &mut Checklist, step: usize, workspace: &Path) {
     let file = std::env::var("SLP_EMBEDDING_GGUF_FILE").unwrap_or_else(|_| EMBEDDING_FILE.to_string());
     let dir = workspace.join("models").join("embeddings");
     let target = dir.join(&file);
     if is_non_empty_file(&target) {
+        list.done(step, "downloaded");
         return;
     }
-    fs::create_dir_all(&dir)
-        .unwrap_or_else(|e| fail(format!("Failed to create {}: {}", dir.display(), e)));
+    if let Err(e) = fs::create_dir_all(&dir) {
+        list.fail(step, format!("Failed to create {}: {}", dir.display(), e));
+    }
 
     let base = std::env::var("SLP_EMBEDDING_GGUF_BASE_URL")
         .unwrap_or_else(|_| format!("{}/embeddings", DEFAULT_DOWNLOAD_URL));
-    download(
-        &format!("{}/{}", base.trim_end_matches('/'), file),
-        &target,
-        "Downloading embeddings",
-    );
+    let url = format!("{}/{}", base.trim_end_matches('/'), file);
+    let size = download(&url, &target, list, step).unwrap_or_else(|e| list.fail(step, e));
+    list.done(step, &format_size(size));
+}
+
+/// Where one SSE status frame lands on the checklist.
+pub enum Stage {
+    /// The step began.
+    Start(usize),
+    /// The step finished.
+    Done(usize),
+    /// The step had nothing to do: its files were already there.
+    Present(usize),
+    /// Not a step of its own.
+    Other,
 }
 
 /// POST `body` to an SSE endpoint that reports long-running work
-/// (`/v1/bootstrap`, `/v1/init`) and print its progress on stderr: byte
-/// progress on one updating line, stage messages one per line. Fails on an
-/// error frame, which arrives inside a 200 response. Downloads can take
-/// minutes, so the request has no timeout.
-pub fn stream_progress(base_url: &str, path: &str, body: serde_json::Value, action: &str) {
+/// (`/v1/bootstrap`, `/v1/init`) and show it on `list`: `stage` maps each
+/// frame's `status` to a step, and byte progress goes to `download`. A step
+/// starting finishes the ones before it, which covers stages the server skips
+/// without saying (an existing project). Fails on an error frame, which
+/// arrives inside a 200 response. Downloads can take minutes, so the request
+/// has no timeout.
+pub fn stream_progress(
+    base_url: &str,
+    path: &str,
+    body: serde_json::Value,
+    list: &mut Checklist,
+    download: usize,
+    stage: &dyn Fn(&str) -> Stage,
+) {
     let client = Client::builder()
         .timeout(None)
         .build()
@@ -457,32 +455,30 @@ pub fn stream_progress(base_url: &str, path: &str, body: serde_json::Value, acti
         .post(format!("{}{}", base_url, path))
         .json(&body)
         .send()
-        .unwrap_or_else(|e| fail(format!("{} failed: {}", action, e)));
+        .unwrap_or_else(|e| list.fail(download, format!("Failed to reach the agent: {}", e)));
     if !response.status().is_success() {
         let status = response.status();
         let detail = response
             .json::<serde_json::Value>()
             .ok()
-            .and_then(|b| b["detail"].as_str().map(str::to_string));
+            .and_then(|b| b["detail"].as_str().map(str::to_string))
+            .unwrap_or_else(|| status.to_string());
         let hint = if matches!(status.as_u16(), 401 | 403) {
             "; sign in with `smartloop login`"
         } else {
             ""
         };
-        match detail {
-            Some(detail) => fail(format!("{} failed: {} ({}){}", action, detail, status, hint)),
-            None => fail(format!("{} failed: {}{}", action, status, hint)),
-        }
+        list.fail(download, format!("{} ({}){}", detail, status, hint));
     }
 
-    let show_progress = std::io::stderr().is_terminal();
+    // Per-file byte counts: a model can be several files (weights, vision
+    // projector), shown as one bar over their sum.
+    let mut files: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
     let mut event = String::new();
-    let mut on_progress_line = false;
-    let mut current_file = String::new();
-    let mut last_message = String::new();
+    let mut current = download;
 
     for line in std::io::BufReader::new(response).lines() {
-        let line = line.unwrap_or_else(|e| fail(format!("{} stream dropped: {}", action, e)));
+        let line = line.unwrap_or_else(|e| list.fail(current, format!("Stream dropped: {}", e)));
         let line = line.trim();
         if line.is_empty() {
             event.clear();
@@ -496,69 +492,77 @@ pub fn stream_progress(base_url: &str, path: &str, body: serde_json::Value, acti
         let Ok(data) = serde_json::from_str::<serde_json::Value>(data.trim()) else { continue };
 
         if event == "error" || data["status"] == "error" {
-            if on_progress_line {
-                eprintln!();
-            }
-            fail(format!(
-                "{} failed: {}",
-                action,
-                data["message"].as_str().unwrap_or("unknown error")
-            ));
+            let message = data["message"].as_str().unwrap_or("unknown error").to_string();
+            list.fail(current, message);
         }
 
-        let downloaded = data["downloaded"].as_u64();
-        let total = data["total"].as_u64().unwrap_or(0);
-        if let (Some(downloaded), true) = (downloaded, total > 0) {
-            if show_progress {
-                let name = data["filename"].as_str().unwrap_or("model").to_string();
-                // A model can be several files (weights, vision projector):
-                // finish the previous file's bar and give each its own.
-                if on_progress_line && name != current_file {
-                    eprintln!();
-                }
-                report_progress(&format!("Downloading {}", name), downloaded, total);
-                current_file = name;
-                on_progress_line = true;
-            }
+        if let (Some(done), Some(total)) = (data["downloaded"].as_u64(), data["total"].as_u64())
+            && total > 0
+        {
+            let name = data["filename"].as_str().unwrap_or_default().to_string();
+            files.insert(name, (done, total));
+            let (done, total) = files.values().fold((0, 0), |(d, t), (fd, ft)| (d + fd, t + ft));
+            list.progress(download, done, total);
             continue;
         }
 
-        let message = data["message"].as_str().unwrap_or_default().trim().to_string();
-        if message.is_empty() || message == last_message {
-            continue;
+        let status = data["status"].as_str().unwrap_or_default();
+        let message = data["message"].as_str().unwrap_or_default();
+        if let Some(name) = model_name_in(message)
+            && (status == "downloading" || status == "model_ready")
+        {
+            list.set_label(download, &format!("Chat model {}", name));
         }
-        if on_progress_line {
-            eprintln!();
-            on_progress_line = false;
+
+        match stage(status) {
+            Stage::Start(step) => {
+                list.finish_before(step);
+                list.start(step);
+                current = step;
+            }
+            Stage::Done(step) => {
+                list.finish_before(step);
+                let total: u64 = files.values().map(|(_, t)| t).sum();
+                let detail = if step == download && total > 0 { format_size(total) } else { String::new() };
+                list.done(step, &detail);
+            }
+            Stage::Present(step) => {
+                list.finish_before(step);
+                list.done(step, "downloaded");
+            }
+            Stage::Other => {}
         }
-        eprintln!("{}", message);
-        last_message = message;
-    }
-    if on_progress_line {
-        eprintln!();
     }
 }
 
-/// Start `slp agent start` detached from this process, logging to
-/// `~/.smartloop/server.log`, and wait until `/health` answers.
-pub fn start(client: &Client, base_url: &str) {
-    if is_healthy(client, base_url) {
-        eprintln!("Agent already running at {}", base_url);
-        return;
-    }
+/// The model named in a stage message such as "Downloading model sl-mini..."
+/// or "Model sl-mini already available.".
+fn model_name_in(message: &str) -> Option<String> {
+    let mut words = message.split_whitespace();
+    words.find(|w| w.eq_ignore_ascii_case("model"))?;
+    let name = words.next()?.trim_end_matches(['.', '…']);
+    (!name.is_empty()).then(|| name.to_string())
+}
 
-    let binary = ensure_installed();
+/// Install the framework if needed and start `slp agent start` detached from
+/// this process, logging to `~/.smartloop/server.log`, then wait until
+/// `/health` answers.
+fn launch(list: &mut Checklist, client: &Client, base_url: &str) {
+    let binary = ensure_installed(list);
+    let step = list.add("Start agent");
+    list.start(step);
+
     let home = install_dir();
     let log_path = home.join("server.log");
     let mut log = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
-        .unwrap_or_else(|e| fail(format!("Failed to open {}: {}", log_path.display(), e)));
+        .unwrap_or_else(|e| list.fail(step, format!("Failed to open {}: {}", log_path.display(), e)));
     let _ = writeln!(log, "\n--- Service starting from smartloop CLI (pid {}) ---", std::process::id());
     let log_err = log
         .try_clone()
-        .unwrap_or_else(|e| fail(format!("Failed to open {}: {}", log_path.display(), e)));
+        .unwrap_or_else(|e| list.fail(step, format!("Failed to open {}: {}", log_path.display(), e)));
 
     let mut cmd = Command::new(&binary);
     cmd.args(["agent", "start", "--port", &port().to_string()])
@@ -569,41 +573,40 @@ pub fn start(client: &Client, base_url: &str) {
         .stderr(log_err);
     detach(&mut cmd);
 
-    eprintln!("Starting agent...");
     // Never waited on once healthy: the agent outlives the CLI on purpose.
     #[allow(clippy::zombie_processes)]
     let mut child = cmd
         .spawn()
-        .unwrap_or_else(|e| fail(format!("Failed to start {}: {}", binary.display(), e)));
+        .unwrap_or_else(|e| list.fail(step, format!("Failed to start {}: {}", binary.display(), e)));
 
+    let running = format!("port {}", port());
     let started = Instant::now();
     while started.elapsed() < START_TIMEOUT {
         if is_healthy(client, base_url) {
-            eprintln!("Agent running at {}", base_url);
+            list.done(step, &running);
             return;
         }
         if let Ok(Some(status)) = child.try_wait() {
             // Lost a race for the port: the studio app (or another CLI)
             // started an agent at the same moment, so ours could not bind.
-            // Theirs coming up is as good as ours.
-            // A crash with the port free fails right away.
+            // Theirs coming up is as good as ours. A crash with the port
+            // free fails right away.
             let waiting = Instant::now();
             while port_in_use() && waiting.elapsed() < START_TIMEOUT {
                 if is_healthy(client, base_url) {
-                    eprintln!("Agent running at {}", base_url);
+                    list.done(step, &running);
                     return;
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }
-            fail(format!(
-                "Agent exited before becoming healthy ({}); see {}",
-                status,
-                log_path.display()
-            ));
+            list.fail(
+                step,
+                format!("Agent exited before becoming healthy ({}); see {}", status, log_path.display()),
+            );
         }
         std::thread::sleep(Duration::from_secs(1));
     }
-    fail(format!("Timed out waiting for the agent to start; see {}", log_path.display()));
+    list.fail(step, format!("Timed out waiting for the agent to start; see {}", log_path.display()));
 }
 
 /// Whether something is listening on the agent port, healthy or not.
@@ -644,22 +647,4 @@ fn detach(cmd: &mut Command) {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn progress_bar_is_always_full_width() {
-        for step in 0..=1000 {
-            let bar = progress_bar(step as f64 / 1000.0);
-            let cells = bar
-                .trim_start_matches("\x1b[36m")
-                .trim_end_matches("\x1b[0m")
-                .chars()
-                .count();
-            assert_eq!(cells, BAR_WIDTH, "at {}", step);
-        }
-    }
 }
