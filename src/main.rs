@@ -7,7 +7,8 @@ use futures_util::StreamExt;
 use prettytable::{Attr, Cell, Row, Table, color};
 use reqwest::blocking::{Client, Response, multipart};
 
-const DEFAULT_API_URL: &str = "http://localhost:38540";
+mod framework;
+
 const LOGO: &str = r#"
 █▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█
 ▄█ █ ▀ █ █▀█ █▀▄  █  █▄▄ █▄█ █▄█ █▀▀
@@ -28,13 +29,21 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Sign in by pasting a Smartloop token
+    Login {
+        /// Token to store; prompts for it (input hidden) when omitted
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Clear stored credentials
+    Logout,
     /// Manage projects
     Project {
         /// Name of the project
         #[command(subcommand)]
         command: ProjectCommands,
     },
-    /// Inspect the local agent
+    /// Start, stop, and inspect the local agent
     Agent {
         #[command(subcommand)]
         command: AgentCommands,
@@ -57,6 +66,10 @@ enum Commands {
 enum AgentCommands {
     /// Show the agent's endpoint, whether it is running, its model, and each project agent
     Status,
+    /// Install the SLP framework if needed, start the agent, and download its models
+    Start,
+    /// Stop the local agent
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -85,8 +98,23 @@ enum ProjectCommands {
 
 /// Base URL of the Smartloop agent, overridable for non-default installs.
 fn base_url() -> String {
-    let base = std::env::var("SMARTLOOP_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
+    let base = std::env::var("SMARTLOOP_API_URL")
+        .unwrap_or_else(|_| format!("http://localhost:{}", framework::port()));
     base.trim_end_matches('/').to_string()
+}
+
+/// True when the CLI talks to the agent it manages itself: the default local
+/// endpoint rather than a `SMARTLOOP_API_URL` someone else runs.
+fn is_local() -> bool {
+    std::env::var("SMARTLOOP_API_URL").is_err()
+}
+
+/// Client for talking to the agent, after making sure one is up. Starts the
+/// local framework (installing it on first use) when nothing answers.
+fn agent_client() -> Client {
+    let client = Client::new();
+    framework::ensure_running(&client, &base_url(), is_local());
+    client
 }
 
 fn api_url() -> String {
@@ -401,6 +429,66 @@ fn agent_status(client: &Client) {
     table.printstd();
 }
 
+/// Store a pasted token with the agent, which owns the credential store and
+/// uses it for every platform call. Sent as a developer token, the kind meant
+/// for the CLI and scripts.
+fn login(client: &Client, token: Option<String>) {
+    let token = token.unwrap_or_else(|| {
+        if !std::io::stdin().is_terminal() {
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .unwrap_or_else(|e| fail(format!("Failed to read token: {}", e)));
+            return input;
+        }
+        rpassword::prompt_password("Paste your token: ")
+            .unwrap_or_else(|e| fail(format!("Failed to read token: {}", e)))
+    });
+    let token = token.trim();
+    if token.is_empty() {
+        fail("No token given".to_string());
+    }
+
+    let response = client
+        .post(format!("{}/auth/token", api_url()))
+        .json(&serde_json::json!({ "token": token, "type": "developer_token" }))
+        .send()
+        .unwrap_or_else(|e| fail(format!("Failed to log in: {}", e)));
+    if !response.status().is_success() {
+        fail(error_message("log in", response));
+    }
+
+    let status: serde_json::Value = response
+        .json()
+        .unwrap_or_else(|e| fail(format!("Failed to parse response as JSON: {}", e)));
+
+    // The agent resolves the user with the token; no user means the platform
+    // refused it.
+    match status["user"]["email"].as_str() {
+        Some(email) => match status["user"]["name"].as_str() {
+            Some(name) if !name.is_empty() => println!("Logged in as {} <{}>", name, email),
+            _ => println!("Logged in as {}", email),
+        },
+        None => {
+            let _ = client
+                .delete(format!("{}/auth/token?type=developer_token", api_url()))
+                .send();
+            fail("The token was not accepted".to_string());
+        }
+    }
+}
+
+fn logout(client: &Client) {
+    let response = client
+        .delete(format!("{}/auth/token", api_url()))
+        .send()
+        .unwrap_or_else(|e| fail(format!("Failed to log out: {}", e)));
+    if !response.status().is_success() {
+        fail(error_message("log out", response));
+    }
+    println!("Logged out");
+}
+
 fn delete_project(client: &Client, id: String) {
     let response = client
         .delete(format!("{}/{}", projects_url(), id))
@@ -510,6 +598,10 @@ async fn run_turn_once(
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut tokens: u64 = 0;
+    // Whether the answer so far ends in a newline. A status line printed
+    // mid-answer (e.g. "[streaming] Response complete" right after the last
+    // token) must start on its own line rather than trail the text.
+    let mut at_line_start = true;
 
     while let Some(event) = stream.next().await {
         let event = event.map_err(|e| (format!("Failed to read stream: {}", e), tokens))?;
@@ -520,23 +612,32 @@ async fn run_turn_once(
                     tokens += 1;
                     let _ = out.write_all(content.as_bytes());
                     let _ = out.flush();
+                    if !content.is_empty() {
+                        at_line_start = content.ends_with('\n');
+                    }
                 }
                 if event["choices"][0]["finish_reason"].is_string() {
                     break;
                 }
             }
             Some("chat.status") => match event["message"].as_str() {
-                Some(message) if !message.trim().is_empty() => print_status(
-                    event["step"].as_str().unwrap_or_default(),
-                    message.trim(),
-                ),
+                Some(message) if !message.trim().is_empty() => {
+                    if !at_line_start {
+                        let _ = writeln!(out);
+                        let _ = out.flush();
+                        at_line_start = true;
+                    }
+                    print_status(event["step"].as_str().unwrap_or_default(), message.trim());
+                }
                 _ => {}
             },
             _ => {}
         }
     }
 
-    println!();
+    if !at_line_start {
+        let _ = writeln!(out);
+    }
     let elapsed = started.elapsed().as_secs_f64();
     let tokens_per_sec = if elapsed > 0.0 && tokens > 0 {
         tokens as f64 / elapsed
@@ -621,8 +722,10 @@ fn main() {
     let args = Args::parse();
 
     match args.command {
+        Commands::Login { token } => login(&agent_client(), token),
+        Commands::Logout => logout(&agent_client()),
         Commands::Project { command } => {
-            let client = Client::new();
+            let client = agent_client();
             match command {
                 ProjectCommands::List => list_projects(&client),
                 ProjectCommands::Create { name, description, import } => {
@@ -641,15 +744,25 @@ fn main() {
         }
         Commands::Agent { command } => match command {
             AgentCommands::Status => agent_status(&Client::new()),
+            AgentCommands::Start => {
+                if !is_local() {
+                    fail("SMARTLOOP_API_URL is set; start that agent where it runs".to_string());
+                }
+                let client = Client::new();
+                framework::start(&client, &base_url());
+                framework::ensure_running(&client, &base_url(), true);
+            }
+            AgentCommands::Stop => framework::stop(),
         },
         Commands::Run { prompt, project, session } => {
             // Resolved before the async runtime starts: the blocking client
             // must not run inside it.
-            let project = project.unwrap_or_else(|| select_project(&Client::new()));
+            let client = agent_client();
+            let project = project.unwrap_or_else(|| select_project(&client));
             let runtime = tokio::runtime::Runtime::new()
                 .unwrap_or_else(|e| fail(format!("Failed to start async runtime: {}", e)));
-            let client = openai_client();
-            runtime.block_on(run_chat(&client, prompt, project, session));
+            let chat = openai_client();
+            runtime.block_on(run_chat(&chat, prompt, project, session));
         }
     }
 }
