@@ -7,7 +7,8 @@ use futures_util::StreamExt;
 use prettytable::{Attr, Cell, Row, Table, color};
 use reqwest::blocking::{Client, Response, multipart};
 
-const DEFAULT_API_URL: &str = "http://localhost:38540";
+mod framework;
+
 const LOGO: &str = r#"
 █▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█
 ▄█ █ ▀ █ █▀█ █▀▄  █  █▄▄ █▄█ █▄█ █▀▀
@@ -28,13 +29,26 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Sign in by pasting a Smartloop token
+    Login {
+        /// Token to store; prompts for it (input hidden) when omitted
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Clear stored credentials
+    Logout,
     /// Manage projects
     Project {
         /// Name of the project
         #[command(subcommand)]
         command: ProjectCommands,
     },
-    /// Inspect the local agent
+    /// List, enable, and disable the models the orchestrator can pick
+    Model {
+        #[command(subcommand)]
+        command: ModelCommands,
+    },
+    /// Start, stop, and inspect the local agent
     Agent {
         #[command(subcommand)]
         command: AgentCommands,
@@ -57,6 +71,36 @@ enum Commands {
 enum AgentCommands {
     /// Show the agent's endpoint, whether it is running, its model, and each project agent
     Status,
+    /// Install the SLP framework if needed, start the agent, and download its models
+    Start,
+    /// Stop the local agent
+    Stop,
+}
+
+#[derive(Subcommand)]
+enum ModelCommands {
+    /// List available models and whether each is downloaded and enabled
+    List {
+        /// Project ID; defaults to the current project
+        #[arg(long, short)]
+        project: Option<String>,
+    },
+    /// Enable a model for a project, downloading it first when needed
+    Enable {
+        /// Model name, as shown by `smartloop model list`
+        name: String,
+        /// Project ID; defaults to the current project
+        #[arg(long, short)]
+        project: Option<String>,
+    },
+    /// Disable a model for a project and unload it
+    Disable {
+        /// Model name, as shown by `smartloop model list`
+        name: String,
+        /// Project ID; defaults to the current project
+        #[arg(long, short)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -85,8 +129,23 @@ enum ProjectCommands {
 
 /// Base URL of the Smartloop agent, overridable for non-default installs.
 fn base_url() -> String {
-    let base = std::env::var("SMARTLOOP_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
+    let base = std::env::var("SMARTLOOP_API_URL")
+        .unwrap_or_else(|_| format!("http://localhost:{}", framework::port()));
     base.trim_end_matches('/').to_string()
+}
+
+/// True when the CLI talks to the agent it manages itself: the default local
+/// endpoint rather than a `SMARTLOOP_API_URL` someone else runs.
+fn is_local() -> bool {
+    std::env::var("SMARTLOOP_API_URL").is_err()
+}
+
+/// Client for talking to the agent, after making sure one is up. Starts the
+/// local framework (installing it on first use) when nothing answers.
+fn agent_client() -> Client {
+    let client = Client::new();
+    framework::ensure_running(&client, &base_url(), is_local());
+    client
 }
 
 fn api_url() -> String {
@@ -401,6 +460,210 @@ fn agent_status(client: &Client) {
     table.printstd();
 }
 
+/// The given project, or the server's current one (the first when none is
+/// marked current).
+fn resolve_project(client: &Client, project: Option<String>) -> String {
+    if let Some(project) = project {
+        return project;
+    }
+    let projects = fetch_projects(client);
+    projects
+        .iter()
+        .find(|p| p["current"].as_bool().unwrap_or_default())
+        .or_else(|| projects.first())
+        .and_then(|p| p["id"].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| fail("No projects found; create one with `smartloop project create`".to_string()))
+}
+
+fn project_models_url(project_id: &str) -> String {
+    format!("{}/{}/models", projects_url(), project_id)
+}
+
+fn get_json_or_fail(client: &Client, url: String, action: &str) -> serde_json::Value {
+    let response = client
+        .get(url)
+        .send()
+        .unwrap_or_else(|e| fail(format!("Failed to {}: {}", action, e)));
+    if !response.status().is_success() {
+        fail(error_message(action, response));
+    }
+    response
+        .json()
+        .unwrap_or_else(|e| fail(format!("Failed to parse response as JSON: {}", e)))
+}
+
+/// The project's registered models, keyed by name: the downloaded/enabled
+/// state the catalog doesn't carry.
+fn project_model_state(client: &Client, project_id: &str) -> std::collections::HashMap<String, serde_json::Value> {
+    get_json_or_fail(client, project_models_url(project_id), "list project models")
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| (m["model_name"].as_str().unwrap_or_default().to_string(), m))
+        .collect()
+}
+
+/// The catalog (`/v1/models`) joined with the project's state. A model the
+/// project has never registered is neither downloaded nor enabled for it.
+fn list_models(client: &Client, project_id: &str) {
+    let catalog = get_json_or_fail(client, format!("{}/models", api_url()), "list models");
+    let state = project_model_state(client, project_id);
+
+    let flag = |on: bool| {
+        if on {
+            Cell::new("true").with_style(Attr::ForegroundColor(color::GREEN))
+        } else {
+            Cell::new("false")
+        }
+    };
+
+    let mut table = Table::new();
+    table.add_row(Row::new(vec![
+        Cell::new("Name"),
+        Cell::new("Capabilities"),
+        Cell::new("Access"),
+        Cell::new("Downloaded"),
+        Cell::new("Enabled"),
+    ]));
+
+    for model in catalog.as_array().cloned().unwrap_or_default() {
+        let name = model["name"].as_str().unwrap_or_default();
+        let entry = state.get(name);
+        let capabilities = model["capabilities"]
+            .as_array()
+            .map(|c| c.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        let access = model["access_level"].as_str().unwrap_or_default();
+        let access = if model["is_accessible"].as_bool() == Some(false) {
+            Cell::new(&format!("{} (sign in)", access)).with_style(Attr::ForegroundColor(color::YELLOW))
+        } else {
+            Cell::new(access)
+        };
+        table.add_row(Row::new(vec![
+            Cell::new(name),
+            Cell::new(&capabilities),
+            access,
+            flag(entry.and_then(|m| m["downloaded"].as_bool()).unwrap_or_default()),
+            flag(entry.and_then(|m| m["enabled"].as_bool()).unwrap_or_default()),
+        ]));
+    }
+
+    table.printstd();
+}
+
+/// PATCH a project's model entry; the server canonicalizes the name.
+fn patch_project_model(client: &Client, project_id: &str, name: &str, enabled: bool) {
+    let action = if enabled { "enable model" } else { "disable model" };
+    let response = client
+        .patch(format!("{}/{}", project_models_url(project_id), name))
+        .json(&serde_json::json!({ "enabled": enabled }))
+        .send()
+        .unwrap_or_else(|e| fail(format!("Failed to {}: {}", action, e)));
+    if !response.status().is_success() {
+        fail(error_message(action, response));
+    }
+}
+
+/// Same sequence as the studio app's model toggle: weights are fetched
+/// through `/v1/init` (scoped to the project) when they aren't on disk yet,
+/// and only then is the model switched on, so it is never enabled without
+/// weights.
+fn enable_model(client: &Client, project_id: &str, name: &str) {
+    let downloaded = project_model_state(client, project_id)
+        .get(name)
+        .and_then(|m| m["downloaded"].as_bool())
+        .unwrap_or_default();
+
+    if !downloaded {
+        framework::stream_progress(
+            &base_url(),
+            "/v1/init",
+            serde_json::json!({ "model_name": name, "project_id": project_id }),
+            &format!("Downloading {}", name),
+        );
+    }
+
+    patch_project_model(client, project_id, name, true);
+    println!("Model {} enabled", name);
+}
+
+fn disable_model(client: &Client, project_id: &str, name: &str) {
+    // A model the project never registered has nothing to switch off; the
+    // PATCH would answer 404 for it.
+    let registered = project_model_state(client, project_id).contains_key(name);
+    let catalog_has = get_json_or_fail(client, format!("{}/models", api_url()), "list models")
+        .as_array()
+        .is_some_and(|c| c.iter().any(|m| m["name"] == name));
+    if !registered && catalog_has {
+        println!("Model {} is not enabled", name);
+        return;
+    }
+    patch_project_model(client, project_id, name, false);
+    println!("Model {} disabled", name);
+}
+
+/// Store a pasted token with the agent, which owns the credential store and
+/// uses it for every platform call. Sent as a developer token, the kind meant
+/// for the CLI and scripts.
+fn login(client: &Client, token: Option<String>) {
+    let token = token.unwrap_or_else(|| {
+        if !std::io::stdin().is_terminal() {
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .unwrap_or_else(|e| fail(format!("Failed to read token: {}", e)));
+            return input;
+        }
+        rpassword::prompt_password("Paste your token: ")
+            .unwrap_or_else(|e| fail(format!("Failed to read token: {}", e)))
+    });
+    let token = token.trim();
+    if token.is_empty() {
+        fail("No token given".to_string());
+    }
+
+    let response = client
+        .post(format!("{}/auth/token", api_url()))
+        .json(&serde_json::json!({ "token": token, "type": "developer_token" }))
+        .send()
+        .unwrap_or_else(|e| fail(format!("Failed to log in: {}", e)));
+    if !response.status().is_success() {
+        fail(error_message("log in", response));
+    }
+
+    let status: serde_json::Value = response
+        .json()
+        .unwrap_or_else(|e| fail(format!("Failed to parse response as JSON: {}", e)));
+
+    // The agent resolves the user with the token; no user means the platform
+    // refused it.
+    match status["user"]["email"].as_str() {
+        Some(email) => match status["user"]["name"].as_str() {
+            Some(name) if !name.is_empty() => println!("Logged in as {} <{}>", name, email),
+            _ => println!("Logged in as {}", email),
+        },
+        None => {
+            let _ = client
+                .delete(format!("{}/auth/token?type=developer_token", api_url()))
+                .send();
+            fail("The token was not accepted".to_string());
+        }
+    }
+}
+
+fn logout(client: &Client) {
+    let response = client
+        .delete(format!("{}/auth/token", api_url()))
+        .send()
+        .unwrap_or_else(|e| fail(format!("Failed to log out: {}", e)));
+    if !response.status().is_success() {
+        fail(error_message("log out", response));
+    }
+    println!("Logged out");
+}
+
 fn delete_project(client: &Client, id: String) {
     let response = client
         .delete(format!("{}/{}", projects_url(), id))
@@ -442,6 +705,46 @@ fn print_status(step: &str, message: &str) {
     } else {
         eprintln!("[{}] {}", step, message);
     }
+}
+
+/// What to show for one citation, as the studio app labels its reference
+/// pills: a web source by its URL, a document by the path the agent gave or
+/// else its name.
+fn citation_label(citation: &serde_json::Value) -> Option<String> {
+    let field = |keys: &[&str]| {
+        keys.iter()
+            .filter_map(|k| citation[*k].as_str())
+            .map(str::trim)
+            .find(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let name = field(&["document_name", "document_id"]);
+    let url = field(&["url", "link", "source_url", "href", "web_url"]);
+
+    match (url, name) {
+        (Some(url), Some(name)) if name != url && !name.starts_with("http") => {
+            Some(format!("{} ({})", name, url))
+        }
+        (Some(url), _) => Some(url),
+        (None, name) => field(&["file_path", "path", "source_path"]).or(name),
+    }
+}
+
+/// Print the answer's sources under it as a numbered "References" list. On
+/// stdout, like the answer, so piping a reply keeps its sources.
+fn print_citations(out: &mut impl Write, citations: &[serde_json::Value]) {
+    let labels: Vec<String> = citations.iter().filter_map(citation_label).collect();
+    if labels.is_empty() {
+        return;
+    }
+
+    let styled = std::io::stdout().is_terminal();
+    let (dim, reset) = if styled { ("\x1b[2m", "\x1b[0m") } else { ("", "") };
+    let _ = writeln!(out, "\n{}References{}", dim, reset);
+    for (i, label) in labels.iter().enumerate() {
+        let _ = writeln!(out, "{}[{}]{} {}", dim, i + 1, reset, label);
+    }
+    let _ = out.flush();
 }
 
 /// Build the async SSE client used for chat streaming. Uses `async-openai`'s
@@ -510,6 +813,11 @@ async fn run_turn_once(
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut tokens: u64 = 0;
+    // Whether the answer so far ends in a newline. A status line printed
+    // mid-answer (e.g. "[streaming] Response complete" right after the last
+    // token) must start on its own line rather than trail the text.
+    let mut at_line_start = true;
+    let mut citations: Vec<serde_json::Value> = Vec::new();
 
     while let Some(event) = stream.next().await {
         let event = event.map_err(|e| (format!("Failed to read stream: {}", e), tokens))?;
@@ -520,23 +828,40 @@ async fn run_turn_once(
                     tokens += 1;
                     let _ = out.write_all(content.as_bytes());
                     let _ = out.flush();
+                    if !content.is_empty() {
+                        at_line_start = content.ends_with('\n');
+                    }
                 }
                 if event["choices"][0]["finish_reason"].is_string() {
                     break;
                 }
             }
+            // Sources the answer actually used, sent once after the last
+            // token and before the final chunk.
+            Some("chat.citations") => {
+                if let Some(list) = event["citations"].as_array() {
+                    citations = list.clone();
+                }
+            }
             Some("chat.status") => match event["message"].as_str() {
-                Some(message) if !message.trim().is_empty() => print_status(
-                    event["step"].as_str().unwrap_or_default(),
-                    message.trim(),
-                ),
+                Some(message) if !message.trim().is_empty() => {
+                    if !at_line_start {
+                        let _ = writeln!(out);
+                        let _ = out.flush();
+                        at_line_start = true;
+                    }
+                    print_status(event["step"].as_str().unwrap_or_default(), message.trim());
+                }
                 _ => {}
             },
             _ => {}
         }
     }
 
-    println!();
+    if !at_line_start {
+        let _ = writeln!(out);
+    }
+    print_citations(&mut out, &citations);
     let elapsed = started.elapsed().as_secs_f64();
     let tokens_per_sec = if elapsed > 0.0 && tokens > 0 {
         tokens as f64 / elapsed
@@ -621,8 +946,10 @@ fn main() {
     let args = Args::parse();
 
     match args.command {
+        Commands::Login { token } => login(&agent_client(), token),
+        Commands::Logout => logout(&agent_client()),
         Commands::Project { command } => {
-            let client = Client::new();
+            let client = agent_client();
             match command {
                 ProjectCommands::List => list_projects(&client),
                 ProjectCommands::Create { name, description, import } => {
@@ -639,17 +966,41 @@ fn main() {
                 ProjectCommands::Delete { id } => delete_project(&client, id),
             }
         }
+        Commands::Model { command } => {
+            let client = agent_client();
+            match command {
+                ModelCommands::List { project } => {
+                    list_models(&client, &resolve_project(&client, project))
+                }
+                ModelCommands::Enable { name, project } => {
+                    enable_model(&client, &resolve_project(&client, project), &name)
+                }
+                ModelCommands::Disable { name, project } => {
+                    disable_model(&client, &resolve_project(&client, project), &name)
+                }
+            }
+        }
         Commands::Agent { command } => match command {
             AgentCommands::Status => agent_status(&Client::new()),
+            AgentCommands::Start => {
+                if !is_local() {
+                    fail("SMARTLOOP_API_URL is set; start that agent where it runs".to_string());
+                }
+                let client = Client::new();
+                framework::start(&client, &base_url());
+                framework::ensure_running(&client, &base_url(), true);
+            }
+            AgentCommands::Stop => framework::stop(),
         },
         Commands::Run { prompt, project, session } => {
             // Resolved before the async runtime starts: the blocking client
             // must not run inside it.
-            let project = project.unwrap_or_else(|| select_project(&Client::new()));
+            let client = agent_client();
+            let project = project.unwrap_or_else(|| select_project(&client));
             let runtime = tokio::runtime::Runtime::new()
                 .unwrap_or_else(|e| fail(format!("Failed to start async runtime: {}", e)));
-            let client = openai_client();
-            runtime.block_on(run_chat(&client, prompt, project, session));
+            let chat = openai_client();
+            runtime.block_on(run_chat(&chat, prompt, project, session));
         }
     }
 }

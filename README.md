@@ -2,7 +2,7 @@
 
 Smartloop is a local AI orchestration framework for extracting information from your own sources and generating new content. It runs on your device.
 
-Use the command line interface as a companion to the Studio app. It talks to the local service Studio runs, so you can manage projects, check on the agent, and chat with the assistant from the terminal — handy for scripting a repeatable setup.
+Use the command line interface on its own or as a companion to the Studio app. It manages projects, checks on the agent, and chats with the assistant from the terminal — handy for scripting a repeatable setup. When no agent is running, it downloads the SLP framework and the models it needs and starts the agent itself, so Studio is optional.
 
 <img width="884" height="687" alt="cli-run-latte-df56cbde4925c0e214a91ade5bac6a96" src="https://github.com/user-attachments/assets/469de052-e3e0-4118-bca8-4494976507b1" />
 
@@ -48,6 +48,43 @@ cargo install --path .
 ```
 
 ## Usage
+
+### First run
+
+Any command that talks to the agent starts it when nothing answers on
+`http://localhost:38540`. On first use that means:
+
+1. Download SLP framework 1.2.7 from `https://dl.smartloop.ai/slp/1.2.7/` into
+   `~/.smartloop/1.2.7/`. Studio desktop uses the same folder and marker files,
+   so the two share one install.
+2. Start `slp agent start` in the background with `SLP_HOME=~/.smartloop`,
+   logging to `~/.smartloop/server.log`. The agent keeps running after the CLI
+   exits.
+3. Download the embedding model (`bge-m3-Q4_K_M.gguf`, ~417 MB) into the
+   workspace's `models/embeddings/` folder for document search.
+4. Run the agent's bootstrap, which downloads the default chat model, creates
+   the default project and loads the model.
+
+Each step is skipped when its files are already there. To do this up front,
+or to stop the agent:
+
+```sh
+smartloop agent start
+smartloop agent stop
+```
+
+### Login
+
+```sh
+smartloop login
+```
+
+Paste your Smartloop token at the prompt (input is hidden). The agent stores it
+and uses it for every platform call. The command prints the account it signed
+in as, or fails if the token is rejected. Use `--token <token>` or pipe the
+token on stdin in scripts. `smartloop logout` clears the stored credentials.
+
+### Projects
 
 List projects:
 
@@ -137,6 +174,37 @@ agent's tool calls (web search, document lookup, model selection, etc.) is
 printed on stderr as `[step] message` lines, colored when the terminal
 supports it, so it doesn't interleave with the streamed answer on stdout.
 
+When the answer draws on documents or web pages, the sources it actually used
+follow it on stdout as a numbered list:
+
+```
+References
+[1] https://releases.rs/
+```
+
+### Models
+
+The orchestrator picks which model serves each turn from the models enabled
+for the project. List what's available and its state for the current project:
+
+```sh
+smartloop model list
+```
+
+Enable or disable a model:
+
+```sh
+smartloop model enable gemma4-e2b
+smartloop model disable gemma4-e2b
+```
+
+`enable` downloads the weights first when they aren't on disk yet, showing
+progress, and only then switches the model on. Weights are shared across
+projects, so each model downloads once. Models marked `(sign in)` need
+`smartloop login` first. `disable` also unloads the model from memory. All
+three take `--project <project-id>` to act on a project other than the current
+one. The `sl-mini` orchestrator is always on and isn't listed.
+
 ## Configuration
 
 The CLI connects to the Smartloop API at `http://localhost:38540` by default.
@@ -145,6 +213,15 @@ Point it elsewhere with `SMARTLOOP_API_URL`:
 ```sh
 SMARTLOOP_API_URL=http://localhost:9000 smartloop project list
 ```
+
+With `SMARTLOOP_API_URL` set, the CLI only connects: it never installs or starts
+an agent for that URL.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `SLP_HOME` | `~/.smartloop` | Where the framework, workspace, models and logs live |
+| `SLP_PORT` | `38540` | Port the managed local agent listens on |
+| `SLP_BASE_URL` | `https://dl.smartloop.ai` | Where the framework archive is downloaded from |
 
 ## License
 
