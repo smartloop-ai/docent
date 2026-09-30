@@ -4,7 +4,7 @@ Smartloop is a local AI orchestration framework for extracting information from 
 
 Use the command line interface on its own or as a companion to the Studio app. It manages projects, checks on the agent, and chats with the assistant from the terminal — handy for scripting a repeatable setup. When no agent is running, it downloads the SLP framework and the models it needs and starts the agent itself, so Studio is optional.
 
-<img width="884" height="687" alt="cli-run-latte-df56cbde4925c0e214a91ade5bac6a96" src="https://github.com/user-attachments/assets/469de052-e3e0-4118-bca8-4494976507b1" />
+<img width="822" alt="smartloop run: a reply with its sources, the status line and the prompt" src="docs/tui.png" />
 
 More at:
 [docs.smartloop.ai](https://smartloop.ai/docs/intro/)
@@ -171,12 +171,39 @@ Start an interactive chat with the local agent:
 smartloop run
 ```
 
-Without `--project`, `run` lists your projects and asks which one to chat in;
-press Enter to take the server's current project. With a single project, or
-when stdin isn't a terminal, the current project is used without asking.
+In a terminal this opens a full-screen app, laid out like Claude Code. While
+a reply runs, a live status line above the prompt shows the agent's current
+step (web search, document lookup, model selection) and for how long, with a
+line per running download. The finished reply keeps its sources and the model
+that answered:
 
-Pass an initial prompt to send immediately; the session then keeps reading
-new prompts from stdin until EOF, `/quit`, `/exit`, `/q`, or `exit`:
+```
+> what is the capital of France?
+
+⏺ Paris is the capital of France.
+
+  References
+  [1] https://en.wikipedia.org/wiki/Paris
+  ⎿  sl-mini · 7 tokens · 0.4 tok/s · 16s
+
+[-] Reading en.wikipedia.org… (4s)
+╭──────────────────────────────────────────────────────────────────────╮
+│ >                                                                    │
+╰──────────────────────────────────────────────────────────────────────╯
+  [enter] send  [esc] interrupt  [?] shortcuts
+```
+
+On first use the app shows setup under its banner, as the same checklist,
+and opens the chat once the agent is ready. It chats in the server's current project;
+switch with `Ctrl+P`. `?` lists the shortcuts. `Ctrl+O` lists the project's models, where Enter
+enables one (downloading it first, with its progress in the status pane) or
+disables it. `Ctrl+G` shows setup and model downloads. Typing `/` lists the commands under the prompt, narrowing
+as you type: ↑/↓ picks one, Tab completes it and Enter runs it. Commands: `/login` (paste a
+token, masked, to sign in without leaving the chat), `/logout`, `/models`,
+`/projects`, `/downloads`, `/new` (a fresh session), `/clear`, `/help` and
+`/quit`. On exit the session id is printed, to resume with `--session`.
+
+Pass an initial prompt to send immediately:
 
 ```sh
 smartloop run "what are some things to do in madrid spain?"
@@ -185,17 +212,19 @@ smartloop run "what are some things to do in madrid spain?"
 Options:
 
 ```sh
-smartloop run --project <project-id>   # skip the project prompt
+smartloop run --project <project-id>   # chat in this project
 smartloop run --session <session-id>   # resume an existing session; a new one is created when omitted
+smartloop run --plain                  # line-by-line chat instead of the full-screen app
 ```
 
-The response streams token by token as it's generated. Progress from the
-agent's tool calls (web search, document lookup, model selection, etc.) is
-printed on stderr as `[step] message` lines, colored when the terminal
-supports it, so it doesn't interleave with the streamed answer on stdout.
-
-When the answer draws on documents or web pages, the sources it actually used
-follow it on stdout as a numbered list:
+When stdin or stdout isn't a terminal, or with `--plain`, `run` chats line by
+line instead: without `--project` it lists your projects and asks which one to
+chat in (press Enter for the current one), then keeps reading prompts from
+stdin until EOF, `/quit`, `/exit`, `/q`, or `exit`. The response streams token
+by token on stdout, and the agent's progress is printed on stderr as
+`[step] message` lines, so it doesn't interleave with the answer. When the
+answer draws on documents or web pages, the sources it used follow it on
+stdout as a numbered list:
 
 ```
 References

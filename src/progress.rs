@@ -55,6 +55,49 @@ struct Step {
     bar: ProgressBar,
 }
 
+/// Where setup reports its steps: the checklist on stderr, or the TUI.
+pub trait Steps {
+    /// Queue a step, shown as pending until it starts.
+    fn add(&mut self, label: &str) -> usize;
+    /// Name what a step works on once it's known, e.g. "Chat model" becomes
+    /// "Chat model sl-mini".
+    fn add_name(&mut self, step: usize, name: &str);
+    /// Set the dim text shown right of the label, e.g. "port 38540".
+    fn set_detail(&mut self, step: usize, detail: &str);
+    fn start(&mut self, step: usize);
+    /// Show a phase of an active step, e.g. "unpacking…", in place of its bar.
+    fn note(&mut self, step: usize, detail: &str);
+    /// Update the step's download bar.
+    fn progress(&mut self, step: usize, done: u64, total: u64);
+    /// Report something that doesn't end the step, e.g. a download retrying.
+    fn warn(&mut self, text: &str);
+    fn done(&mut self, step: usize);
+    /// Mark the step failed and stop with the error.
+    fn fail(&mut self, step: usize, message: String) -> !;
+    /// Steps queued so far.
+    fn len(&self) -> usize;
+
+    /// Finish every step before `step` that is still open: the server moved
+    /// past them, whether or not it said so.
+    fn finish_before(&mut self, step: usize) {
+        for i in 0..step {
+            self.done(i);
+        }
+    }
+
+    /// Mark every step that hasn't finished as done.
+    fn finish_all(&mut self) {
+        for i in 0..self.len() {
+            self.done(i);
+        }
+    }
+}
+
+/// `label` with `name` appended, unless it names it already.
+pub fn with_name(label: &str, name: &str) -> Option<String> {
+    (!label.split_whitespace().any(|w| w == name)).then(|| format!("{} {}", label, name))
+}
+
 pub struct Checklist {
     multi: MultiProgress,
     steps: Vec<Step>,
@@ -81,8 +124,11 @@ impl Checklist {
         }
     }
 
+}
+
+impl Steps for Checklist {
     /// Queue a step, shown as pending until it starts.
-    pub fn add(&mut self, label: &str) -> usize {
+    fn add(&mut self, label: &str) -> usize {
         self.banner();
         let bar = self.multi.add(ProgressBar::new(0));
         self.steps.push(Step {
@@ -98,23 +144,20 @@ impl Checklist {
         step
     }
 
-    /// Name what a step works on once it's known, e.g. "Chat model" becomes
-    /// "Chat model sl-mini"; a label that names it already stays.
-    pub fn add_name(&mut self, step: usize, name: &str) {
-        let label = &mut self.steps[step].label;
-        if !label.split_whitespace().any(|w| w == name) {
-            *label = format!("{} {}", label, name);
+    fn add_name(&mut self, step: usize, name: &str) {
+        if let Some(label) = with_name(&self.steps[step].label, name) {
+            self.steps[step].label = label;
             self.redraw(step);
         }
     }
 
     /// Set the dim text shown right of the label, e.g. "port 38540".
-    pub fn set_detail(&mut self, step: usize, detail: &str) {
+    fn set_detail(&mut self, step: usize, detail: &str) {
         self.steps[step].detail = detail.to_string();
         self.redraw(step);
     }
 
-    pub fn start(&mut self, step: usize) {
+    fn start(&mut self, step: usize) {
         if self.steps[step].state == State::Pending {
             self.steps[step].state = State::Active;
             let bar = &self.steps[step].bar;
@@ -125,7 +168,7 @@ impl Checklist {
     }
 
     /// Show a phase of an active step, e.g. "unpacking…", in place of its bar.
-    pub fn note(&mut self, step: usize, detail: &str) {
+    fn note(&mut self, step: usize, detail: &str) {
         self.start(step);
         let s = &mut self.steps[step];
         s.detail = detail.to_string();
@@ -134,7 +177,7 @@ impl Checklist {
     }
 
     /// Update the step's download bar; indicatif limits how often it redraws.
-    pub fn progress(&mut self, step: usize, done: u64, total: u64) {
+    fn progress(&mut self, step: usize, done: u64, total: u64) {
         self.start(step);
         let s = &mut self.steps[step];
         s.downloaded = Some(total.max(done));
@@ -149,7 +192,7 @@ impl Checklist {
 
     /// Print a line above the list that doesn't end the step, e.g. a
     /// download retrying.
-    pub fn warn(&mut self, text: &str) {
+    fn warn(&mut self, text: &str) {
         if self.tty {
             // Printed while the list is lifted, with a real newline:
             // `MultiProgress::println` pads lines to the terminal width
@@ -160,7 +203,7 @@ impl Checklist {
         }
     }
 
-    pub fn done(&mut self, step: usize) {
+    fn done(&mut self, step: usize) {
         let s = &mut self.steps[step];
         if s.state == State::Done {
             return;
@@ -179,21 +222,27 @@ impl Checklist {
         self.steps[step].bar.finish();
     }
 
-    /// Finish every step before `step` that is still open: the server moved
-    /// past them, whether or not it said so.
-    pub fn finish_before(&mut self, step: usize) {
-        for i in 0..step {
-            self.done(i);
+    /// Mark the step failed, leave the list on screen, and exit with the error.
+    fn fail(&mut self, step: usize, message: String) -> ! {
+        let s = &mut self.steps[step];
+        s.state = State::Failed;
+        s.fetching = false;
+        if !self.tty {
+            eprintln!("[✗] {}", s.label);
         }
+        self.redraw(step);
+        for s in &self.steps {
+            s.bar.finish();
+        }
+        crate::fail(message)
     }
 
-    /// Mark every step that hasn't finished as done.
-    pub fn finish_all(&mut self) {
-        for i in 0..self.steps.len() {
-            self.done(i);
-        }
+    fn len(&self) -> usize {
+        self.steps.len()
     }
+}
 
+impl Checklist {
     /// Close with `✓ <text> in 1min 12s` below the list, if there was one.
     /// Returns whether it printed.
     pub fn summary(&mut self, text: &str) -> bool {
@@ -210,20 +259,6 @@ impl Checklist {
         true
     }
 
-    /// Mark the step failed, leave the list on screen, and exit with the error.
-    pub fn fail(&mut self, step: usize, message: String) -> ! {
-        let s = &mut self.steps[step];
-        s.state = State::Failed;
-        s.fetching = false;
-        if !self.tty {
-            eprintln!("[✗] {}", s.label);
-        }
-        self.redraw(step);
-        for s in &self.steps {
-            s.bar.finish();
-        }
-        crate::fail(message)
-    }
 
     /// Restyle the step's line for its current state.
     fn redraw(&self, step: usize) {
@@ -342,17 +377,22 @@ fn bar_line(done: u64, total: u64) -> String {
     )
 }
 
-/// Eighth-width blocks make the bar's leading edge move smoothly.
 fn progress_bar(fraction: f64) -> String {
+    bar(fraction, BAR_WIDTH)
+}
+
+/// A `width`-cell bar; eighth-width blocks make its leading edge move
+/// smoothly.
+pub fn bar(fraction: f64, width: usize) -> String {
     const PARTIAL: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
-    let eighths = (fraction * (BAR_WIDTH * 8) as f64) as usize;
+    let eighths = (fraction.clamp(0.0, 1.0) * (width * 8) as f64) as usize;
     let full = eighths / 8;
     let mut bar = "█".repeat(full);
-    if full < BAR_WIDTH {
+    if full < width {
         let partial = PARTIAL[eighths % 8];
         bar.push_str(partial);
         let used = full + usize::from(!partial.is_empty());
-        bar.push_str(&"░".repeat(BAR_WIDTH - used));
+        bar.push_str(&"░".repeat(width - used));
     }
     bar
 }
@@ -369,7 +409,7 @@ pub fn format_size(bytes: u64) -> String {
 }
 
 /// `42s`, `1min 5s`, `1h 2min`.
-fn format_duration(d: Duration) -> String {
+pub fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     match secs {
         0..=59 => format!("{}s", secs),
