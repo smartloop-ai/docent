@@ -102,6 +102,7 @@ enum AppEvent {
     DownloadDone(usize),
     Notice(String),
     Error(String),
+    Status(Vec<(String, String)>),
 }
 
 /// One `Steps` call, carried from a worker thread to the app.
@@ -375,6 +376,8 @@ enum Overlay {
     Projects { rows: Option<Result<Vec<serde_json::Value>, String>>, selected: usize },
     Downloads,
     Help,
+    /// `/status`: rows fill in once the agent answers.
+    Status(Option<Vec<(String, String)>>),
 }
 
 enum Phase {
@@ -639,6 +642,11 @@ impl App {
                 self.load_models();
             }
             AppEvent::Notice(text) => self.entries.push(Entry::Notice(text)),
+            AppEvent::Status(rows) => {
+                if let Overlay::Status(shown) = &mut self.overlay {
+                    *shown = Some(rows);
+                }
+            }
             AppEvent::Error(text) => self.entries.push(Entry::Error(text)),
         }
     }
@@ -790,7 +798,7 @@ impl App {
             Overlay::None => self.key_chat(key),
             Overlay::Models { .. } => self.key_models(key),
             Overlay::Projects { .. } => self.key_projects(key),
-            Overlay::Downloads | Overlay::Help => {
+            Overlay::Downloads | Overlay::Help | Overlay::Status(_) => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                     self.overlay = Overlay::None;
                 }
@@ -804,6 +812,13 @@ impl App {
         }
         self.overlay = Overlay::Models { rows: None, selected: 0 };
         self.load_models();
+    }
+
+    fn open_status(&mut self) {
+        self.overlay = Overlay::Status(None);
+        self.spawn(|client, tx| {
+            let _ = tx.send(AppEvent::Status(crate::status_rows(&client)));
+        });
     }
 
     fn open_projects(&mut self) {
@@ -965,6 +980,7 @@ impl App {
             "/projects" => self.open_projects(),
             "/downloads" => self.overlay = Overlay::Downloads,
             "/help" | "/?" => self.overlay = Overlay::Help,
+            "/status" => self.open_status(),
             "/new" => {
                 self.session = chat::new_session_id();
                 self.entries.push(Entry::Notice("New session".to_string()));
@@ -1090,6 +1106,7 @@ impl App {
             Overlay::Projects { rows, selected } => self.draw_projects(frame, rows, *selected),
             Overlay::Downloads => self.draw_downloads(frame),
             Overlay::Help => draw_help(frame),
+            Overlay::Status(rows) => self.draw_status(frame, rows),
         }
     }
 
@@ -1144,7 +1161,7 @@ impl App {
     }
 
     /// The welcome card: the logo on the left, and on the right the
-    /// project, the agent and the versions; getting-started tips under them.
+    /// project, the agent and the versions; first commands under them.
     ///
     /// ```text
     /// ╭───────────────────────────────────────────────────────────────────────────╮
@@ -1153,11 +1170,11 @@ impl App {
     /// │ ▄█ █ ▀ █ █▀█ █▀▄  █  █▄▄ █▄█ █▄█ █▀▀    agent    http://localhost:38540/v1  │
     /// │ Local AI assistant · ? for shortcuts    version  CLI 1.0.14 · agent 1.2.7   │
     /// │                                                                           │
-    /// │ Getting started                                                           │
-    /// │   Ask anything, or begin with "search the web" for fresh results          │
+    /// │ Here are some commands to get you started                                 │
     /// │   /login     sign in for web search and more models                       │
     /// │   /models    enable, download or turn off models                          │
     /// │   /projects  switch to another project                                    │
+    /// │   /status    account, model, agent and versions                           │
     /// │                                                                           │
     /// ╰───────────────────────────────────────────────────────────────────────────╯
     /// ```
@@ -1209,7 +1226,7 @@ impl App {
             body
         };
 
-        // Getting started, under the logo and details, when there's room.
+        // First commands, under the logo and details, when there's room.
         let mut body = body;
         let tips = getting_started();
         if tips.iter().all(|t| t.width() <= inner) {
@@ -1439,6 +1456,32 @@ impl App {
         frame.render_stateful_widget(widget, area, &mut state);
     }
 
+    /// Who's signed in, the project and session, the agent, its model and
+    /// process, and the versions.
+    fn draw_status(&self, frame: &mut Frame, rows: &Option<Vec<(String, String)>>) {
+        let project = self.project.as_ref().map_or("…".to_string(), |(_, name)| name.clone());
+        let mut all = vec![("project".to_string(), project), ("session".to_string(), self.session.clone())];
+        match rows {
+            Some(rows) => all.extend(rows.iter().cloned()),
+            None => all.push(("agent".to_string(), format!("asking the agent {}", self.spinner()))),
+        }
+        let lines: Vec<Line> = all
+            .into_iter()
+            .map(|(label, value)| Line::from(vec![Span::styled(format!("{:<10}", label), dim()), Span::raw(value)]))
+            .collect();
+        let screen = frame.area();
+        let width = (lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4).clamp(40, screen.width);
+        let height = (lines.len() as u16 + 2).min(screen.height);
+        let area = Rect::new(
+            screen.x + (screen.width - width) / 2,
+            screen.y + (screen.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, area);
+        frame.render_widget(Paragraph::new(lines).block(panel(" Status ", &bar_hints(&[("esc", "close")]))), area);
+    }
+
     fn draw_downloads(&self, frame: &mut Frame) {
         let area = popup(frame.area(), 80, 60);
         let block = panel(" Downloads ", &bar_hints(&[("esc", "close")]));
@@ -1571,8 +1614,7 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-/// The welcome card's first steps: how to ask, and the commands to reach
-/// for first.
+/// The welcome card's first steps: the commands to reach for first.
 fn getting_started() -> Vec<Line<'static>> {
     let command = |name: &str, what: &str| {
         Line::from(vec![
@@ -1582,26 +1624,24 @@ fn getting_started() -> Vec<Line<'static>> {
         ])
     };
     vec![
-        Line::from(Span::styled("Getting started", key_style())),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled("Ask anything, or begin with \"search the web\" for fresh results", dim()),
-        ]),
+        Line::from(Span::styled("Here are some commands to get you started", key_style())),
         command("/login", "sign in for web search and more models"),
         command("/models", "enable, download or turn off models"),
         command("/projects", "switch to another project"),
+        command("/status", "account, model, agent and versions"),
     ]
 }
 
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
-const COMMANDS: [(&str, &str); 9] = [
+const COMMANDS: [(&str, &str); 10] = [
     ("/help", "shortcuts and commands"),
     ("/login", "sign in with a token"),
     ("/logout", "sign out"),
     ("/models", "enable, disable and download models"),
     ("/projects", "switch project"),
     ("/downloads", "setup and model downloads"),
+    ("/status", "account, model, agent and versions"),
     ("/new", "start a new session"),
     ("/clear", "clear the screen"),
     ("/quit", "quit"),
@@ -1618,6 +1658,7 @@ fn draw_help(frame: &mut Frame) {
         ("[ctrl+o] /models", "models: enable, disable, download"),
         ("[ctrl+p] /projects", "switch project"),
         ("[ctrl+g] /downloads", "setup and model downloads"),
+        ("/status", "account, model, agent and versions"),
         ("/login", "sign in with a token"),
         ("/logout", "sign out"),
         ("/new", "start a new session"),
@@ -1768,13 +1809,15 @@ mod tests {
         assert!(rows[banner + 1].contains("agent    http://localhost:"), "{}", text);
         assert!(rows[banner + 1].contains("/v1"), "{}", text);
         assert!(rows[banner + 2].contains(&format!("version  CLI {} · agent", env!("CARGO_PKG_VERSION"))), "{}", text);
-        assert!(!text.contains("account"), "{}", text);
+        // No account row (the /status tip mentions the word, not a value).
+        assert!(!text.contains("account  "), "{}", text);
         // Only as wide as what it holds, not the screen.
         let wide = screen(&app, 120, 24);
         let top = wide.lines().find(|r| r.starts_with('╭')).expect(&wide);
         assert!(top.ends_with('╮') && top.chars().count() < 100, "{}", wide);
-        assert!(rows[banner + 4].contains("Getting started"), "{}", text);
-        assert!(rows[banner + 6].contains("/login"), "{}", text);
+        assert!(rows[banner + 4].contains("Here are some commands to get you started"), "{}", text);
+        assert!(rows[banner + 5].contains("/login"), "{}", text);
+        assert!(!text.contains("search the web"), "{}", text);
         assert!(rows[banner - 2].starts_with('╭') && rows[banner + 10].starts_with('╰'), "{}", text);
         for i in 0..40 {
             app.entries.push(Entry::Notice(format!("line {}", i)));
@@ -1819,7 +1862,7 @@ mod tests {
         });
         app.input = "".into();
 
-        let (width, height) = (100, 30);
+        let (width, height) = (100, 42);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -1901,6 +1944,22 @@ mod tests {
         assert!(screen(&app, 80, 24).contains("Copied 25 characters"));
         assert_eq!(base64(b"hi!"), "aGkh");
         assert_eq!(base64(b"hi"), "aGk=");
+    }
+
+    #[test]
+    fn status_lists_the_session_and_what_the_agent_reports() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.overlay = Overlay::Status(None);
+        app.apply(AppEvent::Status(vec![
+            ("account".into(), "you@example.com".into()),
+            ("model".into(), "sl-mini (Q4_K_M, 32768 ctx, 769 MB)".into()),
+        ]));
+        let text = screen(&app, 80, 24);
+        for expected in ["Status", "project   Default", "session   cli-test", "account   you@example.com", "model     sl-mini (Q4_K_M"] {
+            assert!(text.contains(expected), "{}\n{}", expected, text);
+        }
     }
 
     #[test]

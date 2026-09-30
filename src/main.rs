@@ -743,6 +743,69 @@ fn logout(client: &Client) {
     println!("Logged out");
 }
 
+/// What `/status` in the chat app shows, as label and value: who's signed
+/// in, the agent and its health, the loaded model and the agent process.
+/// The account can take a platform round trip; this runs off the UI.
+pub fn status_rows(client: &Client) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    let account = request_json(client, format!("{}/auth/status", api_url()), "read sign-in status")
+        .ok()
+        .and_then(|status| {
+            let user = &status["user"];
+            user["email"].as_str().map(|email| match user["name"].as_str() {
+                Some(name) if !name.is_empty() => format!("{} <{}>", name, email),
+                _ => email.to_string(),
+            })
+        })
+        .unwrap_or_else(|| "not signed in · /login".to_string());
+    rows.push(("account".to_string(), account));
+
+    let health = get_json(client, format!("{}/health", base_url()));
+    let state = health.as_ref().and_then(|h| h["status"].as_str()).unwrap_or("not responding");
+    rows.push(("agent".to_string(), format!("{} · {}", api_url(), state)));
+
+    let model = health.as_ref().map(|h| {
+        if !h["model_loaded"].as_bool().unwrap_or_default() {
+            return "not loaded".to_string();
+        }
+        let mut details = Vec::new();
+        if let Some(quantization) = h["quantization"].as_str() {
+            details.push(quantization.to_string());
+        }
+        if let Some(n_ctx) = h["n_ctx"].as_u64() {
+            details.push(format!("{} ctx", n_ctx));
+        }
+        if let Some(size) = h["model_size_bytes"].as_u64() {
+            details.push(format_bytes(size));
+        }
+        let name = h["model_name"].as_str().unwrap_or_default();
+        if details.is_empty() { name.to_string() } else { format!("{} ({})", name, details.join(", ")) }
+    });
+    rows.push(("model".to_string(), model.unwrap_or_else(|| "unknown".to_string())));
+
+    if let Some(agents) = get_json(client, format!("{}/agents", base_url()))
+        && agents["supervised"].as_bool().unwrap_or_default()
+    {
+        let supervisor = &agents["supervisor"];
+        let children = agents["agents"].as_array().map_or(0, Vec::len);
+        rows.push((
+            "process".to_string(),
+            format!(
+                "pid {} · {} · {} project agent{}",
+                supervisor["pid"],
+                format_bytes(supervisor["rss_bytes"].as_u64().unwrap_or_default()),
+                children,
+                if children == 1 { "" } else { "s" }
+            ),
+        ));
+    }
+    rows.push((
+        "version".to_string(),
+        format!("CLI {} · agent {}", env!("CARGO_PKG_VERSION"), framework::VERSION),
+    ));
+    rows
+}
+
 pub fn try_logout(client: &Client) -> Result<(), String> {
     let response = client
         .delete(format!("{}/auth/token", api_url()))
