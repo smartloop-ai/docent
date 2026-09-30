@@ -195,7 +195,11 @@ that answered:
 
 On first use the app shows setup under its banner, as the same checklist,
 and opens the chat once the agent is ready. It chats in the server's current project;
-switch with `Ctrl+P`. `?` lists the shortcuts. `Ctrl+O` lists the project's models, where Enter
+switch with `Ctrl+P`. `?` lists the shortcuts. The mouse wheel or
+trackpad (or PgUp/PgDn) scrolls the chat, and dragging over it selects text
+and copies it to the clipboard when you let go (over SSH, through the
+terminal's OSC 52 support). Hold Option (macOS) or Shift (most Linux
+terminals) for the terminal's own selection instead. `Ctrl+O` lists the project's models, where Enter
 enables one (downloading it first, with its progress in the status pane) or
 disables it. `Ctrl+G` shows setup and model downloads. Typing `/` lists the commands under the prompt, narrowing
 as you type: ↑/↓ picks one, Tab completes it and Enter runs it. Commands: `/login` (paste a
