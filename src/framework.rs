@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
+use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, Signal, System, UpdateKind};
 
 use crate::fail;
 use crate::progress::{Checklist, format_size};
@@ -25,6 +26,8 @@ const DEFAULT_DOWNLOAD_URL: &str = "https://dl.smartloop.ai";
 /// Embedding GGUF SLP loads for document search (AppSettings.embedding_gguf_file).
 const EMBEDDING_FILE: &str = "bge-m3-Q4_K_M.gguf";
 const START_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long `smartloop agent stop` waits for a graceful exit before killing.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `~/.smartloop`, or `SLP_HOME` when set — the same home SLP itself resolves.
 pub fn install_dir() -> PathBuf {
@@ -88,7 +91,9 @@ fn ensure_installed(list: &mut Checklist) -> PathBuf {
         return binary;
     }
 
-    let step = list.add(&format!("SLP framework {}", VERSION));
+    let url = archive_url();
+    let (source, file_name) = url.rsplit_once('/').unwrap_or(("", "slp-archive"));
+    let step = list.add_download(&format!("Downloading SLP framework {}", VERSION), source, file_name);
     list.start(step);
 
     let root = install_dir();
@@ -106,13 +111,11 @@ fn ensure_installed(list: &mut Checklist) -> PathBuf {
         list.fail(step, format!("Failed to create {}: {}", version_dir.display(), e));
     }
 
-    let url = archive_url();
-    let file_name = url.rsplit('/').next().unwrap_or("slp-archive");
     let archive = cache_dir.join(format!("slp-{}-{}", VERSION, file_name));
 
-    let size = download(&url, &archive, list, step).unwrap_or_else(|e| list.fail(step, e));
+    download(&url, &archive, list, step).unwrap_or_else(|e| list.fail(step, e));
 
-    list.note(step, "extracting…");
+    list.note(step, &format!("Unpacking slp ({})", VERSION));
     let result = extract(&archive, &version_dir);
     let _ = fs::remove_file(&archive);
     if let Err(e) = result {
@@ -146,7 +149,7 @@ fn ensure_installed(list: &mut Checklist) -> PathBuf {
             .status();
     }
 
-    list.note(step, "verifying…");
+    list.note(step, &format!("Setting up slp ({})", VERSION));
     let verified = Command::new(&binary)
         .arg("--version")
         .stdout(Stdio::null())
@@ -162,7 +165,7 @@ fn ensure_installed(list: &mut Checklist) -> PathBuf {
     }
 
     write_markers(&root);
-    list.done(step, &format_size(size));
+    list.done(step);
     binary
 }
 
@@ -181,60 +184,158 @@ fn write_markers(root: &Path) {
     }
 }
 
-/// Stream `url` to `dest` through a `.part` file renamed on success, so an
-/// interrupted download never leaves a truncated file at the real path.
-/// Progress goes to `step` on `list`. Returns the size downloaded.
+/// Download `url` to `dest` through `<dest>.part`. A stalled or dropped
+/// connection is retried, resuming from the bytes already on disk with a
+/// Range request; so is a `.part` left by an earlier run.
 fn download(url: &str, dest: &Path, list: &mut Checklist, step: usize) -> Result<u64, String> {
-    // No overall timeout: the archive is hundreds of MB.
+    download_with(url, dest, list, step, STALL_TIMEOUT)
+}
+
+fn download_with(url: &str, dest: &Path, list: &mut Checklist, step: usize, stall: Duration) -> Result<u64, String> {
+    // Blocking reqwest applies this to each read, so it catches a stall
+    // without limiting how long the whole download may take.
     let client = Client::builder()
-        .timeout(None)
+        .timeout(stall)
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
-    let mut response = client
-        .get(url)
-        .send()
-        .map_err(|e| format!("Failed to download {}: {}", url, e))?;
-    if !response.status().is_success() {
-        return Err(format!("Failed to download {}: {}", url, response.status()));
-    }
-
-    let total = response.content_length().unwrap_or(0);
     let partial = dest.with_file_name(format!(
         "{}.part",
         dest.file_name().and_then(|n| n.to_str()).unwrap_or("download")
     ));
-    let mut file = fs::File::create(&partial)
-        .map_err(|e| format!("Failed to create {}: {}", partial.display(), e))?;
 
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut downloaded: u64 = 0;
-    list.progress(step, 0, total);
-
+    let mut fetch = Fetch {
+        downloaded: fs::metadata(&partial).map(|m| m.len()).unwrap_or(0),
+        total: 0,
+    };
+    let mut failures = 0;
     loop {
-        let n = match response.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
+        let before = fetch.downloaded;
+        match fetch.attempt(&client, url, &partial, list, step, stall) {
+            Ok(()) => break,
+            Err(Failure::Fatal(e)) => {
                 let _ = fs::remove_file(&partial);
-                return Err(format!("Download interrupted: {}", e));
+                return Err(e);
             }
-        };
-        if let Err(e) = file.write_all(&buf[..n]) {
-            let _ = fs::remove_file(&partial);
-            return Err(format!("Failed to write {}: {}", partial.display(), e));
+            Err(Failure::Retry(e)) => {
+                // Attempts that got somewhere don't count against the limit.
+                failures = if fetch.downloaded > before { 1 } else { failures + 1 };
+                if failures >= DOWNLOAD_ATTEMPTS {
+                    return Err(format!("Failed to download {}: {}", url, e));
+                }
+                list.warn(&format!("{}, resuming at {} ...", e, format_size(fetch.downloaded)));
+                std::thread::sleep(Duration::from_secs(2 * failures as u64));
+            }
         }
-        downloaded += n as u64;
-        list.progress(step, downloaded, total);
     }
-    drop(file);
 
-    if total > 0 && downloaded != total {
-        let _ = fs::remove_file(&partial);
-        return Err(format!("Download of {} incomplete: {} of {} bytes", url, downloaded, total));
-    }
     fs::rename(&partial, dest)
         .map_err(|e| format!("Failed to move download into {}: {}", dest.display(), e))?;
-    Ok(downloaded)
+    Ok(fetch.downloaded)
+}
+
+/// Give up after this many failed download attempts in a row.
+const DOWNLOAD_ATTEMPTS: u32 = 5;
+/// A download read that brings nothing for this long counts as stalled.
+const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bytes on disk so far and the full size, carried across attempts.
+struct Fetch {
+    downloaded: u64,
+    total: u64,
+}
+
+enum Failure {
+    /// The connection stalled or dropped; try again from where it stopped.
+    Retry(String),
+    /// Retrying won't help (not found, disk full).
+    Fatal(String),
+}
+
+impl Fetch {
+    /// One request, appending to `partial` from `downloaded` on.
+    fn attempt(
+        &mut self,
+        client: &Client,
+        url: &str,
+        partial: &Path,
+        list: &mut Checklist,
+        step: usize,
+        stall: Duration,
+    ) -> Result<(), Failure> {
+        let mut request = client.get(url);
+        if self.downloaded > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={}-", self.downloaded));
+        }
+        let mut response = request
+            .send()
+            .map_err(|e| Failure::Retry(format!("Connection failed ({})", e)))?;
+        let status = response.status();
+        let length = response.content_length().unwrap_or(0);
+
+        let mut file = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            self.total = content_range_total(&response).unwrap_or(self.downloaded + length);
+            fs::OpenOptions::new().append(true).open(partial)
+        } else if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            // The `.part` is no prefix of this file (it changed on the
+            // server); start over.
+            let _ = fs::remove_file(partial);
+            self.downloaded = 0;
+            return Err(Failure::Retry("Partial download is stale".to_string()));
+        } else if status.is_success() {
+            // The whole file: nothing to resume, or the server ignored the range.
+            self.downloaded = 0;
+            self.total = length;
+            fs::File::create(partial)
+        } else if status.is_server_error() {
+            return Err(Failure::Retry(format!("Server answered {}", status)));
+        } else {
+            return Err(Failure::Fatal(format!("Failed to download {}: {}", url, status)));
+        }
+        .map_err(|e| Failure::Fatal(format!("Failed to open {}: {}", partial.display(), e)))?;
+
+        let mut buf = vec![0u8; 256 * 1024];
+        list.progress(step, self.downloaded, self.total);
+        loop {
+            let n = match response.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if is_timeout(&e) => {
+                    return Err(Failure::Retry(format!("Download stalled for {}s", stall.as_secs())));
+                }
+                Err(e) => return Err(Failure::Retry(format!("Connection dropped ({})", e))),
+            };
+            file.write_all(&buf[..n])
+                .map_err(|e| Failure::Fatal(format!("Failed to write {}: {}", partial.display(), e)))?;
+            self.downloaded += n as u64;
+            list.progress(step, self.downloaded, self.total);
+        }
+        if self.total > 0 && self.downloaded < self.total {
+            return Err(Failure::Retry("Connection closed early".to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// A read that hit the client's timeout; reqwest wraps it in a plain I/O
+/// error.
+fn is_timeout(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::TimedOut
+        || e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+            .is_some_and(|r| r.is_timeout())
+}
+
+/// The full size from a 206's `Content-Range: bytes 100-999/1000`.
+fn content_range_total(response: &reqwest::blocking::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .rsplit('/')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Extract with the system `tar` (bsdtar on macOS and Windows 10+, which
@@ -290,27 +391,66 @@ fn is_healthy(client: &Client, base_url: &str) -> bool {
 /// local default endpoint (`local`), the framework is installed and started
 /// when nothing answers, and a first run pulls the models it needs; a custom
 /// `SMARTLOOP_API_URL` is left to whoever runs it.
-pub fn ensure_running(client: &Client, base_url: &str, local: bool) {
-    let healthy = is_healthy(client, base_url);
-    if !healthy && !local {
-        fail(format!("No agent is running at {}", base_url));
+///
+/// Locally, the agent process decides: a running one that doesn't answer yet
+/// is still starting and is waited on rather than started a second time.
+/// One left running after its home folder was deleted is killed first, so a
+/// fresh install and agent take its place.
+///
+/// Returns whether it had anything to do.
+pub fn ensure_running(client: &Client, base_url: &str, local: bool) -> bool {
+    if !local {
+        if !is_healthy(client, base_url) {
+            fail(format!("No agent is running at {}", base_url));
+        }
+        return false;
     }
     let mut list = Checklist::new();
+    let home = install_dir();
+    if !home.exists()
+        && let Some(pid) = agent_pid()
+    {
+        // Stop, install, start, then setup; counted before the first step
+        // finishes so the overall bar doesn't read 100% after it.
+        list.expect(3 + SETUP_STEPS);
+        let step = list.add(&format!("Stopping agent (pid {}): {} is missing", pid, home.display()));
+        list.start(step);
+        kill_agent(Pid::from_u32(pid));
+        list.done(step);
+    }
+    let running = agent_pid().is_some();
+    let healthy = is_healthy(client, base_url);
     if !healthy {
+        // Install, start or wait, then setup, so the overall bar doesn't
+        // fill up before setup queues its steps.
+        let install = usize::from(!running && !is_non_empty_file(&binary_path()));
+        list.expect(install + 1 + SETUP_STEPS);
+    }
+    if running {
+        if !healthy {
+            let step = list.add(&format!("Waiting for agent on port {}", port()));
+            list.start(step);
+            await_agent(&mut list, step, client, base_url, None);
+        }
+    } else if !healthy {
+        // Something other than an `slp` process may serve the port (a dev
+        // build, say); only start one when nothing answers either.
         launch(&mut list, client, base_url);
     }
-    if local && needs_setup(client, base_url) {
+    if needs_setup(client, base_url) {
         setup(&mut list, client, base_url);
     }
+    list.summary("Setup complete")
 }
 
 /// `smartloop agent start`: bring the local agent up and ready, or say it
 /// already is.
 pub fn start(client: &Client, base_url: &str) {
-    if is_healthy(client, base_url) {
-        eprintln!("Agent already running at {}", base_url);
+    if !ensure_running(client, base_url, true)
+        && let Some(pid) = agent_pid()
+    {
+        eprintln!("Agent already running (pid {}, port {})", pid, port());
     }
-    ensure_running(client, base_url, true);
 }
 
 /// Same test the studio app runs before bootstrapping: no project yet, or no
@@ -328,23 +468,26 @@ fn needs_setup(client: &Client, base_url: &str) -> bool {
     !has_projects || !model_loaded
 }
 
+/// Steps `setup` queues.
+const SETUP_STEPS: usize = 5;
+
 /// First-run setup: make sure the workspace exists, fetch the embedding model
 /// document search needs, then let `/v1/bootstrap` download the chat model,
 /// create the default project and load it.
 fn setup(list: &mut Checklist, client: &Client, base_url: &str) {
-    let embeddings = list.add("Embeddings (bge-m3)");
-    let model = list.add("Chat model");
-    let project = list.add("Default project");
-    let load = list.add("Load model");
-    let services = list.add("Skills and connections");
+    let (source, file) = embedding_source();
+    let embeddings = list.add_download("Downloading embeddings (bge-m3)", &source, &file);
+    let model = list.add_download("Downloading default model", base_url, "default model");
+    let project = list.add("Creating default project");
+    let load = list.add("Loading model");
+    let services = list.add("Setting up skills and connections");
 
     // A plain read that creates the workspace when there isn't one.
-    list.start(embeddings);
     let _ = client.get(format!("{}/v1/models/workspace", base_url)).send();
     match workspace_dir() {
         Some(workspace) => ensure_embeddings(list, embeddings, &workspace),
         // The agent fetches it itself the first time it indexes.
-        None => list.done(embeddings, "on first index"),
+        None => list.done(embeddings),
     }
 
     stream_progress(base_url, "/v1/bootstrap", serde_json::json!({}), list, model, &|status| {
@@ -402,22 +545,29 @@ fn workspace_dir() -> Option<PathBuf> {
 /// Without it the agent downloads it on first index and falls back to TF-IDF
 /// retrieval until then.
 fn ensure_embeddings(list: &mut Checklist, step: usize, workspace: &Path) {
-    let file = std::env::var("SLP_EMBEDDING_GGUF_FILE").unwrap_or_else(|_| EMBEDDING_FILE.to_string());
+    let (source, file) = embedding_source();
     let dir = workspace.join("models").join("embeddings");
     let target = dir.join(&file);
     if is_non_empty_file(&target) {
-        list.done(step, "downloaded");
+        list.done(step);
         return;
     }
+    list.start(step);
     if let Err(e) = fs::create_dir_all(&dir) {
         list.fail(step, format!("Failed to create {}: {}", dir.display(), e));
     }
 
+    let url = format!("{}/{}", source, file);
+    download(&url, &target, list, step).unwrap_or_else(|e| list.fail(step, e));
+    list.done(step);
+}
+
+/// Where the embedding GGUF comes from and its file name.
+fn embedding_source() -> (String, String) {
+    let file = std::env::var("SLP_EMBEDDING_GGUF_FILE").unwrap_or_else(|_| EMBEDDING_FILE.to_string());
     let base = std::env::var("SLP_EMBEDDING_GGUF_BASE_URL")
         .unwrap_or_else(|_| format!("{}/embeddings", DEFAULT_DOWNLOAD_URL));
-    let url = format!("{}/{}", base.trim_end_matches('/'), file);
-    let size = download(&url, &target, list, step).unwrap_or_else(|e| list.fail(step, e));
-    list.done(step, &format_size(size));
+    (base.trim_end_matches('/').to_string(), file)
 }
 
 /// Where one SSE status frame lands on the checklist.
@@ -511,7 +661,7 @@ pub fn stream_progress(
         if let Some(name) = model_name_in(message)
             && (status == "downloading" || status == "model_ready")
         {
-            list.set_label(download, &format!("Chat model {}", name));
+            list.set_file(download, &name);
         }
 
         match stage(status) {
@@ -520,15 +670,9 @@ pub fn stream_progress(
                 list.start(step);
                 current = step;
             }
-            Stage::Done(step) => {
+            Stage::Done(step) | Stage::Present(step) => {
                 list.finish_before(step);
-                let total: u64 = files.values().map(|(_, t)| t).sum();
-                let detail = if step == download && total > 0 { format_size(total) } else { String::new() };
-                list.done(step, &detail);
-            }
-            Stage::Present(step) => {
-                list.finish_before(step);
-                list.done(step, "downloaded");
+                list.done(step);
             }
             Stage::Other => {}
         }
@@ -549,7 +693,7 @@ fn model_name_in(message: &str) -> Option<String> {
 /// `/health` answers.
 fn launch(list: &mut Checklist, client: &Client, base_url: &str) {
     let binary = ensure_installed(list);
-    let step = list.add("Start agent");
+    let step = list.add(&format!("Starting agent on port {}", port()));
     list.start(step);
 
     let home = install_dir();
@@ -575,61 +719,181 @@ fn launch(list: &mut Checklist, client: &Client, base_url: &str) {
 
     // Never waited on once healthy: the agent outlives the CLI on purpose.
     #[allow(clippy::zombie_processes)]
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .unwrap_or_else(|e| list.fail(step, format!("Failed to start {}: {}", binary.display(), e)));
+    write_pid(child.id());
+    await_agent(list, step, client, base_url, Some(child));
+}
 
-    let running = format!("port {}", port());
+/// Wait until the agent answers `/health`, failing as soon as no agent
+/// process is left to wait on. `child` is the agent this CLI just spawned.
+fn await_agent(
+    list: &mut Checklist,
+    step: usize,
+    client: &Client,
+    base_url: &str,
+    mut child: Option<std::process::Child>,
+) {
+    let log_path = install_dir().join("server.log");
     let started = Instant::now();
     while started.elapsed() < START_TIMEOUT {
         if is_healthy(client, base_url) {
-            list.done(step, &running);
+            list.done(step);
             return;
         }
-        if let Ok(Some(status)) = child.try_wait() {
+        if let Some(status) = child.as_mut().and_then(|c| c.try_wait().ok().flatten()) {
             // Lost a race for the port: the studio app (or another CLI)
             // started an agent at the same moment, so ours could not bind.
-            // Theirs coming up is as good as ours. A crash with the port
-            // free fails right away.
-            let waiting = Instant::now();
-            while port_in_use() && waiting.elapsed() < START_TIMEOUT {
-                if is_healthy(client, base_url) {
-                    list.done(step, &running);
-                    return;
-                }
-                std::thread::sleep(Duration::from_secs(1));
+            // Theirs coming up is as good as ours; with none left, fail.
+            child = None;
+            if agent_pid().is_none() {
+                list.fail(
+                    step,
+                    format!("Agent exited before becoming healthy ({}); see {}", status, log_path.display()),
+                );
             }
-            list.fail(
-                step,
-                format!("Agent exited before becoming healthy ({}); see {}", status, log_path.display()),
-            );
+        } else if child.is_none() && agent_pid().is_none() {
+            list.fail(step, format!("Agent exited before becoming healthy; see {}", log_path.display()));
         }
         std::thread::sleep(Duration::from_secs(1));
     }
     list.fail(step, format!("Timed out waiting for the agent to start; see {}", log_path.display()));
 }
 
-/// Whether something is listening on the agent port, healthy or not.
-fn port_in_use() -> bool {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port()));
-    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
+/// Where the CLI records the agent's pid: `~/.smartloop/agent.pid`. SLP's
+/// own `agents.json` can name a start that lost the port race and exited.
+fn pid_path() -> PathBuf {
+    install_dir().join("agent.pid")
 }
 
-/// Stop the agent through the framework's own `slp agent stop`.
+fn write_pid(pid: u32) {
+    let _ = fs::write(pid_path(), pid.to_string());
+}
+
+fn processes() -> System {
+    let mut system = System::new();
+    let kind = ProcessRefreshKind::nothing()
+        .with_exe(UpdateKind::OnlyIfNotSet)
+        .with_cmd(UpdateKind::OnlyIfNotSet);
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+    system
+}
+
+/// Whether the process is a live `slp agent start` on our port, so a pid
+/// file pointing at a reused pid is not mistaken for the agent.
+fn is_agent(process: &Process) -> bool {
+    if process.status() == ProcessStatus::Zombie {
+        return false;
+    }
+    let name = process.exe().and_then(|e| e.file_name()).unwrap_or(process.name());
+    if name != binary_name() {
+        return false;
+    }
+    let args: Vec<_> = process.cmd().iter().map(|a| a.to_string_lossy()).collect();
+    let starts_agent = args.windows(2).any(|w| w[0] == "agent" && w[1] == "start");
+    // No `--port` means SLP's default, which is ours unless `SLP_PORT` moved it.
+    let agent_port = args
+        .windows(2)
+        .find(|w| w[0] == "--port")
+        .and_then(|w| w[1].parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+    starts_agent && agent_port == port()
+}
+
+/// The running agent: the pid on file when it is still the agent, otherwise
+/// any `slp agent start` on our port, such as one the studio app started.
+fn find_agent(system: &System) -> Option<Pid> {
+    let recorded = fs::read_to_string(pid_path())
+        .ok()
+        .and_then(|p| p.trim().parse().ok())
+        .map(Pid::from_u32)
+        .filter(|&pid| system.process(pid).is_some_and(is_agent));
+    let found = recorded.or_else(|| {
+        system
+            .processes()
+            .iter()
+            .filter(|(_, p)| is_agent(p))
+            // The agent's own workers run the same binary; take the parent.
+            .filter(|(_, p)| !p.parent().and_then(|pp| system.process(pp)).is_some_and(is_agent))
+            .map(|(&pid, _)| pid)
+            .min()
+    });
+    match found {
+        Some(pid) if recorded.is_none() => write_pid(pid.as_u32()),
+        None => {
+            let _ = fs::remove_file(pid_path());
+        }
+        _ => {}
+    }
+    found
+}
+
+/// Pid of the running local agent, if any.
+pub fn agent_pid() -> Option<u32> {
+    find_agent(&processes()).map(Pid::as_u32)
+}
+
+/// The agent and every process under it, so its workers stop with it.
+fn process_tree(system: &System, root: Pid) -> Vec<Pid> {
+    let mut tree = vec![root];
+    let mut i = 0;
+    while i < tree.len() {
+        let parent = tree[i];
+        tree.extend(
+            system
+                .processes()
+                .iter()
+                .filter(|(_, p)| p.parent() == Some(parent))
+                .map(|(&pid, _)| pid),
+        );
+        i += 1;
+    }
+    tree
+}
+
+/// `smartloop agent stop`: stop the agent by its pid.
 pub fn stop() {
-    let binary = binary_path();
-    if !is_non_empty_file(&binary) {
-        fail(format!("SLP framework {} is not installed", VERSION));
+    let Some(pid) = find_agent(&processes()) else {
+        eprintln!("Agent is not running");
+        return;
+    };
+    kill_agent(pid);
+    eprintln!("Stopped agent (pid {})", pid);
+}
+
+/// Ask the agent and its workers to exit, kill whatever is left after
+/// `STOP_TIMEOUT`, and forget its pid.
+fn kill_agent(pid: Pid) {
+    let mut system = processes();
+    let tree = process_tree(&system, pid);
+    for p in tree.iter().filter_map(|&p| system.process(p)) {
+        // Windows has no SIGTERM; there it is a plain kill.
+        if p.kill_with(Signal::Term).is_none() {
+            p.kill();
+        }
     }
-    let status = Command::new(&binary)
-        .args(["agent", "stop"])
-        .env("SLP_HOME", install_dir())
-        .current_dir(install_dir())
-        .status()
-        .unwrap_or_else(|e| fail(format!("Failed to run {}: {}", binary.display(), e)));
-    if !status.success() {
-        fail(format!("`slp agent stop` exited with {}", status));
+
+    let alive = |system: &System| {
+        tree.iter()
+            .filter(|&&p| system.process(p).is_some_and(|p| p.status() != ProcessStatus::Zombie))
+            .count()
+    };
+    let started = Instant::now();
+    loop {
+        system.refresh_processes_specifics(ProcessesToUpdate::Some(&tree), true, ProcessRefreshKind::nothing());
+        if alive(&system) == 0 {
+            break;
+        }
+        if started.elapsed() >= STOP_TIMEOUT {
+            for p in tree.iter().filter_map(|&p| system.process(p)) {
+                p.kill();
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
+    let _ = fs::remove_file(pid_path());
 }
 
 /// Keep the agent alive after the CLI exits and out of reach of the
@@ -647,4 +911,71 @@ fn detach(cmd: &mut Command) {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+
+    /// A server that stalls halfway through the first response and serves
+    /// the rest from the Range the retry asks for.
+    #[test]
+    fn download_resumes_after_a_stall() {
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/file.bin", listener.local_addr().unwrap());
+        let served = body.clone();
+        let server = std::thread::spawn(move || {
+            let mut ranges = Vec::new();
+            for (i, stream) in listener.incoming().take(2).enumerate() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut range = None;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                        range = v.trim().trim_end_matches('-').parse::<usize>().ok();
+                    }
+                }
+                ranges.push(range);
+                if i == 0 {
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", served.len());
+                    stream.write_all(head.as_bytes()).unwrap();
+                    stream.write_all(&served[..served.len() / 2]).unwrap();
+                    stream.flush().unwrap();
+                    std::thread::sleep(Duration::from_secs(3));
+                } else {
+                    let from = range.unwrap_or(0);
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\n\r\n",
+                        served.len() - from,
+                        from,
+                        served.len() - 1,
+                        served.len()
+                    );
+                    stream.write_all(head.as_bytes()).unwrap();
+                    stream.write_all(&served[from..]).unwrap();
+                }
+            }
+            ranges
+        });
+
+        let dir = std::env::temp_dir().join(format!("slp-download-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("file.bin");
+        let mut list = Checklist::new();
+        let step = list.add_download("Downloading test file", &url, "file.bin");
+        let size = download_with(&url, &dest, &mut list, step, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(size, body.len() as u64);
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        assert_eq!(server.join().unwrap(), vec![None, Some(body.len() / 2)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
