@@ -968,8 +968,12 @@ impl App {
         let status = self.status_lines();
         // Command hints take the footer's place while a command is typed.
         let hints = self.hint_lines();
-        let [body, status_area, input, footer] = Layout::vertical([
+        // A blank row at the top, and one between the conversation and the
+        // status line, so neither sits cramped against its neighbor.
+        let [_, body, _, status_area, input, footer] = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Min(3),
+            Constraint::Length(1),
             Constraint::Length(status.len().max(1) as u16),
             Constraint::Length(3),
             Constraint::Length(hints.len().max(1) as u16),
@@ -1044,18 +1048,83 @@ impl App {
         lines
     }
 
-    fn draw_conversation(&self, frame: &mut Frame, area: Rect) {
-        // The banner and who's signed in open the conversation, like a first
-        // message, and scroll away with it.
-        let mut lines: Vec<Line> = BANNER
+    /// The welcome card: the logo on the left, and on the right who's
+    /// signed in, the project, the agent and the versions.
+    ///
+    /// ```text
+    /// ╭──────────────────────────────────────────────────────────────╮
+    /// │                                                              │
+    /// │  █▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█   account  you@...    │
+    /// │  ▄█ █ ▀ █ █▀█ █▀▄  █  █▄▄ █▄█ █▄█ █▀▀   project  general_chat│
+    /// │  Local AI assistant                     agent    localhost…  │
+    /// │                                         version  cli 1.0.11  │
+    /// ╰──────────────────────────────────────────────────────────────╯
+    /// ```
+    fn welcome(&self, width: u16) -> Vec<Line<'static>> {
+        let width = width as usize;
+        let border = dim();
+        let account = self.account.clone().unwrap_or_else(|| "not signed in · /login".to_string());
+        let project = self.project.as_ref().map_or("…".to_string(), |(_, name)| name.clone());
+        let right = [
+            ("account", account),
+            ("project", project),
+            ("agent", crate::base_url().trim_start_matches("http://").to_string()),
+            ("version", format!("cli {} · SLP {}", env!("CARGO_PKG_VERSION"), framework::VERSION)),
+        ];
+        // Styled per span: the rows are taken apart into spans below.
+        let mut left: Vec<Line<'static>> = BANNER
             .iter()
-            .map(|row| Line::styled(*row, Style::new().fg(pink())))
+            .map(|row| Line::from(Span::styled(*row, Style::new().fg(pink()))))
             .collect();
-        let account = match &self.account {
-            Some(who) => format!("signed in as {}", who),
-            None => "not signed in · /login".to_string(),
+        left.push(Line::from(Span::styled("Local AI assistant · ? for shortcuts", dim())));
+        let left_width = BANNER[0].chars().count().max(left[2].width()) + 4;
+
+        let row = |label: &str, value: &str| {
+            Line::from(vec![
+                Span::styled(format!("{:<9}", label), dim()),
+                Span::raw(value.to_string()),
+            ])
         };
-        lines.push(Line::styled(format!("Local AI assistant · {} · ? for shortcuts", account), dim()));
+        let inner = width.saturating_sub(4);
+        // Two columns when there's room, else the details under the logo.
+        let body: Vec<Line<'static>> = if inner >= left_width + 30 {
+            (0..left.len().max(right.len()))
+                .map(|i| {
+                    let mut spans = left.get(i).cloned().unwrap_or_default().spans;
+                    let used: usize = spans.iter().map(|s| s.width()).sum();
+                    spans.push(Span::raw(" ".repeat(left_width.saturating_sub(used))));
+                    if let Some((label, value)) = right.get(i) {
+                        let room = inner.saturating_sub(left_width + 9);
+                        spans.extend(row(label, &truncate(value, room)).spans);
+                    }
+                    Line::from(spans)
+                })
+                .collect()
+        } else {
+            let mut body = left;
+            body.push(Line::default());
+            body.extend(right.iter().map(|(l, v)| row(l, &truncate(v, inner.saturating_sub(9)))));
+            body
+        };
+
+        let mut lines = vec![Line::styled(format!("╭{}╮", "─".repeat(width.saturating_sub(2))), border)];
+        let blank = Line::default();
+        for line in std::iter::once(&blank).chain(body.iter()).chain(std::iter::once(&blank)) {
+            let used = line.width().min(inner);
+            let mut spans = vec![Span::styled("│ ", border)];
+            spans.extend(line.spans.iter().cloned());
+            spans.push(Span::raw(" ".repeat(inner - used)));
+            spans.push(Span::styled(" │", border));
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::styled(format!("╰{}╯", "─".repeat(width.saturating_sub(2))), border));
+        lines
+    }
+
+    fn draw_conversation(&self, frame: &mut Frame, area: Rect) {
+        // The welcome card opens the conversation, like a first message, and
+        // scrolls away with it.
+        let mut lines = self.welcome(area.width);
         if !self.setup.steps.is_empty() {
             lines.push(Line::default());
             lines.extend(self.setup.lines());
@@ -1486,8 +1555,11 @@ mod tests {
         let text = screen(&app, 80, 24);
         let rows: Vec<&str> = text.lines().collect();
         // Short: the banner sits just above the prompt.
-        let banner = rows.iter().position(|r| r.starts_with("█▀ █▀▄▀█")).expect(&text);
-        assert!(rows[banner + 2].contains("not signed in"), "{}", text);
+        let banner = rows.iter().position(|r| r.contains("█▀ █▀▄▀█")).expect(&text);
+        assert!(rows[banner].contains("account  not signed in"), "{}", text);
+        assert!(rows[banner + 1].contains("project  Default"), "{}", text);
+        assert!(rows[banner + 3].contains(&format!("version  cli {}", env!("CARGO_PKG_VERSION"))), "{}", text);
+        assert!(rows[banner - 2].starts_with('╭') && rows[banner + 5].starts_with('╰'), "{}", text);
         for i in 0..40 {
             app.entries.push(Entry::Notice(format!("line {}", i)));
         }
@@ -1569,8 +1641,8 @@ mod tests {
         let rows: Vec<&str> = text.lines().collect();
         let at = rows.iter().position(|r| r.contains("hello")).expect(&text);
         let prompt = rows.iter().rposition(|r| r.starts_with('>')).expect(&text) - 1;
-        // Only the (empty) status row between them.
-        assert_eq!(prompt - at, 2, "{}", text);
+        // A blank row and the (empty) status row between them.
+        assert_eq!(prompt - at, 3, "{}", text);
     }
 
     #[test]
