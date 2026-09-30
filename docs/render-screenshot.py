@@ -8,8 +8,9 @@ a PNG in a terminal window:
     SCREENSHOT_JSON=/tmp/screen.json cargo test screenshot -- --ignored
     python3 docs/render-screenshot.py /tmp/screen.json docs/tui.png
 
-Needs Pillow. Text is set in Menlo; the two symbols it lacks (⏺ and ⎿) are
-drawn as shapes, the way a terminal's fallback font shows them.
+Needs Pillow. Text is set in Menlo; the symbols it lacks (⏺ and ⎿) and the
+box and block characters are drawn as shapes, so they join up as they do in
+a terminal.
 """
 
 import json
@@ -82,6 +83,18 @@ def main(source, target):
                 w = max(1, SCALE)
                 draw.line((cx, upper, cx, cy), fill=rgb, width=w)
                 draw.line((cx, cy, left + cell_w, cy), fill=rgb, width=w)
+            elif symbol in "│╭╮╰╯":
+                # Box edges meet their neighbors at the cell's center lines.
+                w = max(1, SCALE)
+                cx, cy = left + cell_w / 2, upper + cell_h / 2
+                right, bottom = left + cell_w + 1, upper + cell_h + 1
+                if symbol == "│":
+                    draw.line((cx, upper, cx, bottom), fill=rgb, width=w)
+                else:
+                    horizontal = (cx, right) if symbol in "╭╰" else (left, cx)
+                    vertical = (cy, bottom) if symbol in "╭╮" else (upper, cy)
+                    draw.line((horizontal[0], cy, horizontal[1], cy), fill=rgb, width=w)
+                    draw.line((cx, vertical[0], cx, vertical[1]), fill=rgb, width=w)
             elif symbol in "─▀▄█":
                 # Block and rule characters fill their cell edge to edge.
                 if symbol == "─":
