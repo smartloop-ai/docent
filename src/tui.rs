@@ -1144,7 +1144,7 @@ impl App {
     }
 
     /// The welcome card: the logo on the left, and on the right the
-    /// project, the agent and the versions.
+    /// project, the agent and the versions; getting-started tips under them.
     ///
     /// ```text
     /// ╭───────────────────────────────────────────────────────────────────────────╮
@@ -1152,6 +1152,12 @@ impl App {
     /// │ █▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█    project  general_chat               │
     /// │ ▄█ █ ▀ █ █▀█ █▀▄  █  █▄▄ █▄█ █▄█ █▀▀    agent    http://localhost:38540/v1  │
     /// │ Local AI assistant · ? for shortcuts    version  CLI 1.0.14 · agent 1.2.7   │
+    /// │                                                                           │
+    /// │ Getting started                                                           │
+    /// │   Ask anything, or begin with "search the web" for fresh results          │
+    /// │   /login     sign in for web search and more models                       │
+    /// │   /models    enable, download or turn off models                          │
+    /// │   /projects  switch to another project                                    │
     /// │                                                                           │
     /// ╰───────────────────────────────────────────────────────────────────────────╯
     /// ```
@@ -1202,6 +1208,14 @@ impl App {
             body.extend(right.iter().map(|(l, v)| row(l, &truncate(v, inner.saturating_sub(9)))));
             body
         };
+
+        // Getting started, under the logo and details, when there's room.
+        let mut body = body;
+        let tips = getting_started();
+        if tips.iter().all(|t| t.width() <= inner) {
+            body.push(Line::default());
+            body.extend(tips);
+        }
 
         // Shrunk to its content, with two columns of margin on the right.
         let inner = (body.iter().map(Line::width).max().unwrap_or(0) + 2).min(inner);
@@ -1557,6 +1571,28 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// The welcome card's first steps: how to ask, and the commands to reach
+/// for first.
+fn getting_started() -> Vec<Line<'static>> {
+    let command = |name: &str, what: &str| {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{:<11}", name), key_style()),
+            Span::styled(what.to_string(), dim()),
+        ])
+    };
+    vec![
+        Line::from(Span::styled("Getting started", key_style())),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Ask anything, or begin with \"search the web\" for fresh results", dim()),
+        ]),
+        command("/login", "sign in for web search and more models"),
+        command("/models", "enable, download or turn off models"),
+        command("/projects", "switch to another project"),
+    ]
+}
+
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
 const COMMANDS: [(&str, &str); 9] = [
@@ -1737,7 +1773,9 @@ mod tests {
         let wide = screen(&app, 120, 24);
         let top = wide.lines().find(|r| r.starts_with('╭')).expect(&wide);
         assert!(top.ends_with('╮') && top.chars().count() < 100, "{}", wide);
-        assert!(rows[banner - 2].starts_with('╭') && rows[banner + 4].starts_with('╰'), "{}", text);
+        assert!(rows[banner + 4].contains("Getting started"), "{}", text);
+        assert!(rows[banner + 6].contains("/login"), "{}", text);
+        assert!(rows[banner - 2].starts_with('╭') && rows[banner + 10].starts_with('╰'), "{}", text);
         for i in 0..40 {
             app.entries.push(Entry::Notice(format!("line {}", i)));
         }
@@ -1876,7 +1914,8 @@ mod tests {
         let text = screen(&app, 80, 24);
         assert!(text.contains("› /login"), "{}", text);
         assert!(text.contains("  /logout"), "{}", text);
-        assert!(!text.contains("/models"), "{}", text);
+        // The /models hint (not the card's tip) is filtered out.
+        assert!(!text.contains("enable, disable and download models"), "{}", text);
         app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.input, "/logout ");
