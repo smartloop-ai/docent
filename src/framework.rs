@@ -92,8 +92,8 @@ fn ensure_installed(list: &mut Checklist) -> PathBuf {
     }
 
     let url = archive_url();
-    let (source, file_name) = url.rsplit_once('/').unwrap_or(("", "slp-archive"));
-    let step = list.add_download(&format!("Downloading SLP framework {}", VERSION), source, file_name);
+    let file_name = url.rsplit_once('/').map_or("slp-archive", |(_, f)| f);
+    let step = list.add(&format!("SLP framework {}", VERSION));
     list.start(step);
 
     let root = install_dir();
@@ -115,7 +115,7 @@ fn ensure_installed(list: &mut Checklist) -> PathBuf {
 
     download(&url, &archive, list, step).unwrap_or_else(|e| list.fail(step, e));
 
-    list.note(step, &format!("Unpacking slp ({})", VERSION));
+    list.note(step, "unpacking…");
     let result = extract(&archive, &version_dir);
     let _ = fs::remove_file(&archive);
     if let Err(e) = result {
@@ -149,7 +149,7 @@ fn ensure_installed(list: &mut Checklist) -> PathBuf {
             .status();
     }
 
-    list.note(step, &format!("Setting up slp ({})", VERSION));
+    list.note(step, "verifying…");
     let verified = Command::new(&binary)
         .arg("--version")
         .stdout(Stdio::null())
@@ -165,6 +165,7 @@ fn ensure_installed(list: &mut Checklist) -> PathBuf {
     }
 
     write_markers(&root);
+    list.set_detail(step, "");
     list.done(step);
     binary
 }
@@ -410,25 +411,18 @@ pub fn ensure_running(client: &Client, base_url: &str, local: bool) -> bool {
     if !home.exists()
         && let Some(pid) = agent_pid()
     {
-        // Stop, install, start, then setup; counted before the first step
-        // finishes so the overall bar doesn't read 100% after it.
-        list.expect(3 + SETUP_STEPS);
-        let step = list.add(&format!("Stopping agent (pid {}): {} is missing", pid, home.display()));
+        let step = list.add(&format!("Stop agent (pid {})", pid));
+        list.set_detail(step, "home missing");
         list.start(step);
         kill_agent(Pid::from_u32(pid));
         list.done(step);
     }
     let running = agent_pid().is_some();
     let healthy = is_healthy(client, base_url);
-    if !healthy {
-        // Install, start or wait, then setup, so the overall bar doesn't
-        // fill up before setup queues its steps.
-        let install = usize::from(!running && !is_non_empty_file(&binary_path()));
-        list.expect(install + 1 + SETUP_STEPS);
-    }
     if running {
         if !healthy {
-            let step = list.add(&format!("Waiting for agent on port {}", port()));
+            let step = list.add("Wait for agent");
+            list.set_detail(step, &format!("port {}", port()));
             list.start(step);
             await_agent(&mut list, step, client, base_url, None);
         }
@@ -468,26 +462,25 @@ fn needs_setup(client: &Client, base_url: &str) -> bool {
     !has_projects || !model_loaded
 }
 
-/// Steps `setup` queues.
-const SETUP_STEPS: usize = 5;
-
 /// First-run setup: make sure the workspace exists, fetch the embedding model
 /// document search needs, then let `/v1/bootstrap` download the chat model,
 /// create the default project and load it.
 fn setup(list: &mut Checklist, client: &Client, base_url: &str) {
-    let (source, file) = embedding_source();
-    let embeddings = list.add_download("Downloading embeddings (bge-m3)", &source, &file);
-    let model = list.add_download("Downloading default model", base_url, "default model");
-    let project = list.add("Creating default project");
-    let load = list.add("Loading model");
-    let services = list.add("Setting up skills and connections");
+    let embeddings = list.add("Embeddings (bge-m3)");
+    let model = list.add("Chat model");
+    let project = list.add("Default project");
+    let load = list.add("Load model");
+    let services = list.add("Skills and connections");
 
     // A plain read that creates the workspace when there isn't one.
     let _ = client.get(format!("{}/v1/models/workspace", base_url)).send();
     match workspace_dir() {
         Some(workspace) => ensure_embeddings(list, embeddings, &workspace),
         // The agent fetches it itself the first time it indexes.
-        None => list.done(embeddings),
+        None => {
+            list.set_detail(embeddings, "on first index");
+            list.done(embeddings);
+        }
     }
 
     stream_progress(base_url, "/v1/bootstrap", serde_json::json!({}), list, model, &|status| {
@@ -549,6 +542,7 @@ fn ensure_embeddings(list: &mut Checklist, step: usize, workspace: &Path) {
     let dir = workspace.join("models").join("embeddings");
     let target = dir.join(&file);
     if is_non_empty_file(&target) {
+        list.set_detail(step, "downloaded");
         list.done(step);
         return;
     }
@@ -661,7 +655,7 @@ pub fn stream_progress(
         if let Some(name) = model_name_in(message)
             && (status == "downloading" || status == "model_ready")
         {
-            list.set_file(download, &name);
+            list.add_name(download, &name);
         }
 
         match stage(status) {
@@ -670,8 +664,13 @@ pub fn stream_progress(
                 list.start(step);
                 current = step;
             }
-            Stage::Done(step) | Stage::Present(step) => {
+            Stage::Done(step) => {
                 list.finish_before(step);
+                list.done(step);
+            }
+            Stage::Present(step) => {
+                list.finish_before(step);
+                list.set_detail(step, "downloaded");
                 list.done(step);
             }
             Stage::Other => {}
@@ -693,7 +692,8 @@ fn model_name_in(message: &str) -> Option<String> {
 /// `/health` answers.
 fn launch(list: &mut Checklist, client: &Client, base_url: &str) {
     let binary = ensure_installed(list);
-    let step = list.add(&format!("Starting agent on port {}", port()));
+    let step = list.add("Start agent");
+    list.set_detail(step, &format!("port {}", port()));
     list.start(step);
 
     let home = install_dir();
@@ -970,7 +970,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("file.bin");
         let mut list = Checklist::new();
-        let step = list.add_download("Downloading test file", &url, "file.bin");
+        let step = list.add("Test file");
         let size = download_with(&url, &dest, &mut list, step, Duration::from_secs(1)).unwrap();
 
         assert_eq!(size, body.len() as u64);

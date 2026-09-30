@@ -588,10 +588,11 @@ fn enable_model(client: &Client, project_id: &str, name: &str) {
         .unwrap_or_default();
 
     let mut list = progress::Checklist::new();
-    let download = list.add_download(&format!("Downloading {}", name), &base_url(), name);
-    let enable = list.add(&format!("Enabling {} for the project", name));
+    let download = list.add(&format!("Download {}", name));
+    let enable = list.add("Enable for project");
 
     if downloaded {
+        list.set_detail(download, "downloaded");
         list.done(download);
     } else {
         list.start(download);
