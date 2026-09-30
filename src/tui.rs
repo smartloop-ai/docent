@@ -1599,7 +1599,7 @@ fn draw_help(frame: &mut Frame) {
     ];
     let lines: Vec<Line> = rows
         .iter()
-        .map(|(key, what)| Line::from(vec![Span::styled(format!("{:<22}", key), Style::new().fg(Color::White)), Span::raw(*what)]))
+        .map(|(key, what)| Line::from(vec![Span::styled(format!("{:<22}", key), key_style()), Span::raw(*what)]))
         .collect();
     // Just tall enough for the list, centered.
     let screen = frame.area();
@@ -1615,6 +1615,13 @@ fn draw_help(frame: &mut Frame) {
     frame.render_widget(Paragraph::new(lines).block(panel(" Help ", &bar_hints(&[("esc", "close")]))), area);
 }
 
+/// A key in a hint: the terminal's own text color, bold, so it reads as
+/// white on a dark theme and dark on a light one (`Color::White` all but
+/// vanishes on a light background).
+fn key_style() -> Style {
+    Style::new().add_modifier(Modifier::BOLD)
+}
+
 /// `[ctrl+o] models  [esc] interrupt`: each key as a bracketed cap, then
 /// what it does.
 fn key_hints(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
@@ -1623,7 +1630,7 @@ fn key_hints(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(format!("[{}]", key), Style::new().fg(Color::White)));
+        spans.push(Span::styled(format!("[{}]", key), key_style()));
         spans.push(Span::styled(format!(" {}", what), dim()));
     }
     spans

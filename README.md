@@ -2,7 +2,7 @@
 
 Smartloop is a local AI orchestration framework for extracting information from your own sources and generating new content. It runs on your device.
 
-Use the command line interface on its own or as a companion to the Studio app. It manages projects, checks on the agent, and chats with the assistant from the terminal — handy for scripting a repeatable setup. When no agent is running, it downloads the SLP framework and the models it needs and starts the agent itself, so Studio is optional.
+The Smartloop command line interface runs Smartloop from your terminal. Chat with the local agent in a full-screen app, search the web, script repeatable workflows, and set up your own local AI infrastructure: the agent, its models, and your projects. If no local agent is running, the CLI downloads the framework and models it needs and starts one itself.
 
 <img width="822" alt="smartloop run: a reply with its sources, the status line and the prompt" src="docs/tui.png" />
 
