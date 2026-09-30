@@ -204,7 +204,7 @@ enables one (downloading it first, with its progress in the status pane) or
 disables it. `Ctrl+G` shows setup and model downloads. Typing `/` lists the commands under the prompt, narrowing
 as you type: ↑/↓ picks one, Tab completes it and Enter runs it. Commands: `/login` (paste a
 token, masked, to sign in without leaving the chat), `/logout`, `/models`,
-`/projects`, `/downloads`, `/new` (a fresh session), `/clear`, `/help` and
+`/projects`, `/downloads`, `/status` (account, model, agent and versions), `/new` (a fresh session), `/clear`, `/help` and
 `/quit`. On exit the session id is printed, to resume with `--session`.
 
 Pass an initial prompt to send immediately:
