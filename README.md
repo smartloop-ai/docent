@@ -199,7 +199,11 @@ or the one given with `--project`. `?` lists the shortcuts. The mouse wheel or
 trackpad (or PgUp/PgDn) scrolls the chat, and dragging over it selects text
 and copies it to the clipboard when you let go (over SSH, through the
 terminal's OSC 52 support). Hold Option (macOS) or Shift (most Linux
-terminals) for the terminal's own selection instead. `Ctrl+O` lists the project's models, where Enter
+terminals) for the terminal's own selection instead. Drop a file on the terminal (or paste
+its path) to attach it: it shows in the prompt as `[Image 1]` or `[Doc 1]`,
+Backspace removes it, and it's uploaded with the message so the answer can
+draw on it. Documents (PDF, Word, PowerPoint, Excel, CSV, text) are read as
+text. `Ctrl+O` lists the project's models, where Enter
 enables one (downloading it first, with its progress in the status pane) or
 disables it. Typing `/` lists the commands under the prompt, narrowing
 as you type: ↑/↓ picks one, Tab completes it and Enter runs it. Commands: `/login` (paste a

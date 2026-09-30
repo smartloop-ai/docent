@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
 };
 use futures_util::StreamExt;
@@ -73,14 +73,16 @@ pub fn run(client: &Client, prompt: Option<String>, project: Option<String>, ses
     let mut terminal = ratatui::init();
     // The wheel scrolls the chat. Put mouse reporting back on a panic too,
     // or the shell gets escape codes for every move.
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // Dropping a file on the terminal pastes its path; bracketed paste
+    // hands the app the whole path at once.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
         hook(info);
     }));
     let result = runtime.block_on(App::new(client.clone(), prompt, project, session).run(&mut terminal));
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     // A chat turn may still be streaming; don't wait for it.
     runtime.shutdown_background();
@@ -434,6 +436,9 @@ struct App {
     ticks: usize,
     /// The prompt takes a token for `/login`, masked, instead of a message.
     token_entry: bool,
+    /// Files dropped on the prompt, each shown there as a chip such as
+    /// `[Image 1]` until the message is sent.
+    attachments: Vec<Attachment>,
     /// The highlighted slash-command hint while typing a command.
     hint_at: usize,
     quit: bool,
@@ -469,6 +474,7 @@ impl App {
             clipboard: None,
             ticks: 0,
             token_entry: false,
+            attachments: Vec::new(),
             hint_at: 0,
             quit: false,
         }
@@ -488,6 +494,7 @@ impl App {
                 event = keys.next() => match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => self.key(key),
                     Some(Ok(Event::Mouse(mouse))) if matches!(self.overlay, Overlay::None) => self.mouse(mouse),
+                    Some(Ok(Event::Paste(text))) if matches!(self.overlay, Overlay::None) => self.paste(&text),
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(format!("Failed to read input: {}", e)),
                     None => break,
@@ -562,19 +569,32 @@ impl App {
         });
     }
 
-    fn send_turn(&mut self, message: String) {
+    /// Send a turn: `shown` is the prompt as typed (chips and all), `message`
+    /// what the agent gets. Attached files are uploaded first.
+    fn send_turn(&mut self, shown: String, message: String, files: Vec<Attachment>) {
         let Some((project, _)) = self.project.clone() else { return };
-        self.entries.push(Entry::User(message.clone()));
+        self.entries.push(Entry::User(shown));
         self.entries.push(Entry::Reply(Reply::default()));
         let entry = self.entries.len() - 1;
         self.scroll_back = 0;
-        let (chat, tx, session) = (self.chat.clone(), self.tx.clone(), self.session.clone());
+        let (chat, tx, session, client) = (self.chat.clone(), self.tx.clone(), self.session.clone(), self.client.clone());
         let task = tokio::spawn(async move {
             let events = tx.clone();
             let mut on = move |event| {
                 let _ = events.send(AppEvent::Chat(event));
             };
-            let result = chat::stream_turn(&chat, &message, &project, &session, &mut on).await;
+            let mut ids = Vec::new();
+            for file in files {
+                on(ChatEvent::Status { step: "upload".to_string(), message: format!("Uploading {}", file.name()) });
+                let client = client.clone();
+                let uploaded = tokio::task::spawn_blocking(move || crate::upload_asset(&client, &file.path)).await;
+                match uploaded {
+                    Ok(Ok(id)) => ids.push(id),
+                    Ok(Err(e)) => return drop(tx.send(AppEvent::TurnDone(Err(e)))),
+                    Err(e) => return drop(tx.send(AppEvent::TurnDone(Err(format!("Upload failed: {}", e))))),
+                }
+            }
+            let result = chat::stream_turn(&chat, &message, &ids, &project, &session, &mut on).await;
             let _ = tx.send(AppEvent::TurnDone(result));
         });
         self.turn = Some(Turn { started: Instant::now(), task, entry, tokens: 0, activity: None });
@@ -679,7 +699,7 @@ impl App {
             Some(project) => {
                 self.project = Some(project);
                 if let Some(prompt) = self.pending_prompt.take() {
-                    self.send_turn(prompt);
+                    self.send_turn(prompt.clone(), prompt, Vec::new());
                 }
             }
             None => self.entries.push(Entry::Error(
@@ -876,6 +896,15 @@ impl App {
                 self.cursor += 1;
             }
             KeyCode::Backspace if self.cursor > 0 => {
+                // A chip goes as a whole, and its file with it.
+                let before: String = self.input.chars().take(self.cursor).collect();
+                if let Some(i) = self.attachments.iter().position(|a| before.ends_with(&a.label)) {
+                    let label = self.attachments.remove(i).label;
+                    let start = self.byte_at(self.cursor - label.chars().count());
+                    self.input.replace_range(start..self.byte_at(self.cursor), "");
+                    self.cursor -= label.chars().count();
+                    return;
+                }
                 self.cursor -= 1;
                 let at = self.byte_at(self.cursor);
                 self.input.remove(at);
@@ -904,6 +933,36 @@ impl App {
     fn scroll(&mut self, lines: i32) {
         let back = (self.scroll_back as i32 + lines).clamp(0, self.scroll_limit.get() as i32);
         self.scroll_back = back as u16;
+    }
+
+    /// A paste: dropped files become chips, anything else is typed in.
+    fn paste(&mut self, text: &str) {
+        if self.token_entry {
+            return self.insert(text.trim());
+        }
+        match dropped_files(text) {
+            Some(paths) => {
+                for path in paths {
+                    let kind = if is_image(&path) { "Image" } else { "Doc" };
+                    let n = self.attachments.iter().filter(|a| a.label.starts_with(&format!("[{} ", kind))).count() + 1;
+                    let label = format!("[{} {}]", kind, n);
+                    let before = self.input.chars().take(self.cursor).last();
+                    if before.is_some_and(|c| c != ' ') {
+                        self.insert(" ");
+                    }
+                    self.insert(&label);
+                    self.insert(" ");
+                    self.attachments.push(Attachment { label, path });
+                }
+            }
+            None => self.insert(&text.replace(['\r', '\n'], " ")),
+        }
+    }
+
+    fn insert(&mut self, text: &str) {
+        let at = self.byte_at(self.cursor);
+        self.input.insert_str(at, text);
+        self.cursor += text.chars().count();
     }
 
     fn byte_at(&self, chars: usize) -> usize {
@@ -968,6 +1027,7 @@ impl App {
             "/clear" => {
                 self.stop_turn();
                 self.entries.clear();
+                self.attachments.clear();
                 self.session = chat::new_session_id();
                 self.scroll_back = 0;
             }
@@ -979,7 +1039,15 @@ impl App {
                 if self.turn.is_some() || self.project.is_none() {
                     return;
                 }
-                self.send_turn(input.clone());
+                // The chips still in the prompt are the files to send; the
+                // agent reads each chip as its file's name.
+                let files: Vec<Attachment> =
+                    std::mem::take(&mut self.attachments).into_iter().filter(|a| input.contains(&a.label)).collect();
+                let mut message = input.clone();
+                for file in &files {
+                    message = message.replace(&file.label, &file.name());
+                }
+                self.send_turn(input.clone(), message, files);
             }
         }
         // Never keep a pasted token in the history.
@@ -1549,6 +1617,63 @@ fn getting_started() -> Vec<Line<'static>> {
     ]
 }
 
+/// A file dropped on the prompt.
+#[derive(Debug, Clone)]
+struct Attachment {
+    /// Its chip in the prompt, e.g. `[Image 1]`.
+    label: String,
+    path: std::path::PathBuf,
+}
+
+impl Attachment {
+    fn name(&self) -> String {
+        self.path.file_name().map_or_else(|| self.path.display().to_string(), |n| n.to_string_lossy().into_owned())
+    }
+}
+
+/// The files in a paste, when it's nothing but paths to existing files, as
+/// a terminal pastes a dropped file: quoted, or with spaces escaped
+/// (`My\ Report.pdf`), or as a `file://` URL.
+fn dropped_files(text: &str) -> Option<Vec<std::path::PathBuf>> {
+    let mut paths = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = text.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None, '\\') => current.extend(chars.next()),
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    paths.push(std::mem::take(&mut current));
+                }
+            }
+            (_, c) => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        paths.push(current);
+    }
+    let files: Vec<std::path::PathBuf> = paths
+        .into_iter()
+        .map(|p| {
+            let p = p.strip_prefix("file://").map(|rest| rest.replace("%20", " ")).unwrap_or(p);
+            match p.strip_prefix("~/") {
+                Some(rest) => std::env::var("HOME").map(|h| format!("{}/{}", h, rest)).unwrap_or(p.clone()),
+                None => p,
+            }
+        })
+        .map(std::path::PathBuf::from)
+        .collect();
+    (!files.is_empty() && files.iter().all(|f| f.is_file())).then_some(files)
+}
+
+fn is_image(path: &std::path::Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "heic")
+}
+
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
 const COMMANDS: [(&str, &str); 7] = [
@@ -1570,6 +1695,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("[↑] [↓]", "earlier prompts"),
         ("wheel [pgup] [pgdn]", "scroll the conversation"),
         ("drag", "select and copy to the clipboard"),
+        ("drop a file", "attach it, shown as [Image 1] or [Doc 1]"),
         ("[ctrl+o] /models", "models: enable, disable, download"),
         ("/status", "account, model, agent and versions"),
         ("/login", "login with a token"),
@@ -1888,6 +2014,45 @@ mod tests {
         assert!(text.contains("  gemma4-e4b  not downloaded  general, vision"), "{}", text);
         assert!(text.contains("› qwen3.5-2b  ✓ enabled"), "{}", text);
         assert!(!text.contains("Capabilities") && !text.contains("Models"), "{}", text);
+    }
+
+    #[test]
+    fn dropped_files_become_chips() {
+        let dir = std::env::temp_dir().join(format!("slp-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = dir.join("my photo.png");
+        let report = dir.join("report.pdf");
+        std::fs::write(&photo, b"png").unwrap();
+        std::fs::write(&report, b"pdf").unwrap();
+
+        // How terminals paste a drop: escaped spaces, quotes, file:// URLs.
+        let escaped = format!("{} {}", photo.display().to_string().replace(' ', "\\ "), report.display());
+        assert_eq!(dropped_files(&escaped), Some(vec![photo.clone(), report.clone()]));
+        assert_eq!(dropped_files(&format!("'{}'", photo.display())), Some(vec![photo.clone()]));
+        assert_eq!(
+            dropped_files(&format!("file://{}", photo.display().to_string().replace(' ', "%20"))),
+            Some(vec![photo.clone()])
+        );
+        assert_eq!(dropped_files("just some text"), None);
+
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.input = "compare".into();
+        app.cursor = 7;
+        app.paste(&escaped);
+        assert_eq!(app.input, "compare [Image 1] [Doc 1] ");
+        assert_eq!(app.attachments.len(), 2);
+
+        // Backspace takes a chip, and its file, in one go.
+        app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.input, "compare [Image 1] ");
+        assert_eq!(app.attachments.len(), 1);
+
+        // Plain text pastes as text.
+        app.paste("these two");
+        assert_eq!(app.input, "compare [Image 1] these two");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
