@@ -54,9 +54,6 @@ const TICK: Duration = Duration::from_millis(100);
 /// A bar turning in brackets.
 const SPINNER: [&str; 4] = ["[-]", "[\\]", "[|]", "[/]"];
 
-/// The banner, its tagline, and a rule under them.
-const HEADER_ROWS: u16 = 4;
-
 const BANNER: [&str; 2] = [
     "█▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█",
     "▄█ █ ▀ █ █▀█ █▀▄  █  █▄▄ █▄█ █▄█ █▀▀",
@@ -971,8 +968,7 @@ impl App {
         let status = self.status_lines();
         // Command hints take the footer's place while a command is typed.
         let hints = self.hint_lines();
-        let [header, body, status_area, input, footer] = Layout::vertical([
-            Constraint::Length(HEADER_ROWS),
+        let [body, status_area, input, footer] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(status.len().max(1) as u16),
             Constraint::Length(3),
@@ -980,7 +976,6 @@ impl App {
         ])
         .areas(frame.area());
 
-        self.draw_header(frame, header);
         self.draw_conversation(frame, body);
         frame.render_widget(Paragraph::new(status), status_area);
         self.draw_input(frame, input);
@@ -1049,9 +1044,9 @@ impl App {
         lines
     }
 
-    /// The Smartloop banner and who's signed in, pinned above the
-    /// conversation so it never scrolls away.
-    fn draw_header(&self, frame: &mut Frame, area: Rect) {
+    fn draw_conversation(&self, frame: &mut Frame, area: Rect) {
+        // The banner and who's signed in open the conversation, like a first
+        // message, and scroll away with it.
         let mut lines: Vec<Line> = BANNER
             .iter()
             .map(|row| Line::styled(*row, Style::new().fg(pink())))
@@ -1061,13 +1056,8 @@ impl App {
             None => "not signed in · /login".to_string(),
         };
         lines.push(Line::styled(format!("Local AI assistant · {} · ? for shortcuts", account), dim()));
-        lines.push(rule(area.width));
-        frame.render_widget(Paragraph::new(lines), area);
-    }
-
-    fn draw_conversation(&self, frame: &mut Frame, area: Rect) {
-        let mut lines: Vec<Line> = Vec::new();
         if !self.setup.steps.is_empty() {
+            lines.push(Line::default());
             lines.extend(self.setup.lines());
         }
         if let Some(e) = &self.setup.failure {
@@ -1075,9 +1065,7 @@ impl App {
             lines.push(error_line(e));
         }
         for entry in &self.entries {
-            if !lines.is_empty() {
-                lines.push(Line::default());
-            }
+            lines.push(Line::default());
             match entry {
                 Entry::User(text) => {
                     for (i, line) in text.lines().enumerate() {
@@ -1317,11 +1305,6 @@ fn selected_model(message: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// A dim line across the screen.
-fn rule(width: u16) -> Line<'static> {
-    Line::styled("─".repeat(width as usize), dim())
-}
-
 fn error_line(text: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled("⏺ ", Style::new().fg(Color::Red)),
@@ -1496,20 +1479,21 @@ mod tests {
     }
 
     #[test]
-    fn header_stays_put_when_the_conversation_scrolls() {
+    fn the_banner_opens_the_conversation_and_scrolls_away() {
         let mut app = app();
         app.phase = Phase::Ready;
         app.project = Some(("p1".into(), "Default".into()));
+        let text = screen(&app, 80, 24);
+        let rows: Vec<&str> = text.lines().collect();
+        // Short: the banner sits just above the prompt.
+        let banner = rows.iter().position(|r| r.starts_with("█▀ █▀▄▀█")).expect(&text);
+        assert!(rows[banner + 2].contains("not signed in"), "{}", text);
         for i in 0..40 {
             app.entries.push(Entry::Notice(format!("line {}", i)));
         }
         let text = screen(&app, 80, 24);
-        let rows: Vec<&str> = text.lines().collect();
-        assert!(rows[0].starts_with("█▀ █▀▄▀█"), "{}", text);
-        assert!(rows[2].contains("not signed in"), "{}", text);
-        assert!(rows[3].starts_with("────"), "{}", text);
+        assert!(!text.contains("█▀ █▀▄▀█"), "{}", text);
         assert!(text.contains("line 39"), "{}", text);
-        assert!(!text.contains("line 0\n"), "{}", text);
     }
 
     /// Writes the README screenshot's screen, cell by cell, to the JSON file
