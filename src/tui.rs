@@ -32,7 +32,8 @@ use std::time::{Duration, Instant};
 
 use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
 };
 use futures_util::StreamExt;
@@ -54,6 +55,8 @@ const BAR_WIDTH: usize = 30;
 /// An active step shows its elapsed time once it has run this long.
 const SHOW_ELAPSED_AFTER: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(100);
+/// The most lines the prompt grows to before it scrolls.
+const PROMPT_LINES: u16 = 6;
 /// Lines one wheel notch scrolls, and one page key.
 const WHEEL_LINES: u16 = 3;
 const PAGE_LINES: u16 = 10;
@@ -76,13 +79,28 @@ pub fn run(client: &Client, prompt: Option<String>, project: Option<String>, ses
     // Dropping a file on the terminal pastes its path; bracketed paste
     // hands the app the whole path at once.
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
+    // Where the terminal supports it, have Shift+Enter reported apart from
+    // Enter, for a new line in the prompt.
+    let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+        if enhanced {
+            let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+        }
         hook(info);
     }));
     let result = runtime.block_on(App::new(client.clone(), prompt, project, session).run(&mut terminal));
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+    if enhanced {
+        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     ratatui::restore();
     // A chat turn may still be streaming; don't wait for it.
     runtime.shutdown_background();
@@ -882,6 +900,12 @@ impl App {
                 self.cursor = 0;
             }
             KeyCode::Esc if self.turn.is_some() => self.stop_turn(),
+            // A new line in the prompt: Shift+Enter where the terminal tells
+            // it apart, Alt+Enter and Ctrl+J everywhere.
+            KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) && !self.token_entry => {
+                self.insert("\n")
+            }
+            KeyCode::Char('j') if ctrl && !self.token_entry => self.insert("\n"),
             KeyCode::Enter => self.submit(),
             KeyCode::Char('u') if ctrl => {
                 self.input.clear();
@@ -920,6 +944,10 @@ impl App {
                 self.cursor = self.input.chars().count();
                 self.scroll_back = 0;
             }
+            // In a prompt of several lines the arrows move between them; in
+            // one line they step through earlier prompts.
+            KeyCode::Up if self.input.contains('\n') => self.move_line(-1),
+            KeyCode::Down if self.input.contains('\n') => self.move_line(1),
             KeyCode::Up => self.recall(-1),
             KeyCode::Down => self.recall(1),
             KeyCode::PageUp => self.scroll(PAGE_LINES as i32),
@@ -955,8 +983,24 @@ impl App {
                     self.attachments.push(Attachment { label, path });
                 }
             }
-            None => self.insert(&text.replace(['\r', '\n'], " ")),
+            None => self.insert(&text.replace("\r\n", "\n").replace('\r', "\n")),
         }
+    }
+
+    /// Move the cursor to the same column one line up or down.
+    fn move_line(&mut self, step: isize) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let starts: Vec<usize> =
+            std::iter::once(0).chain(chars.iter().enumerate().filter(|(_, c)| **c == '\n').map(|(i, _)| i + 1)).collect();
+        let row = starts.iter().rposition(|&s| s <= self.cursor).unwrap_or(0);
+        let col = self.cursor - starts[row];
+        let target = row as isize + step;
+        if target < 0 || target as usize >= starts.len() {
+            return;
+        }
+        let start = starts[target as usize];
+        let end = starts.get(target as usize + 1).map_or(chars.len(), |s| s - 1);
+        self.cursor = (start + col).min(end);
     }
 
     fn insert(&mut self, text: &str) {
@@ -1119,7 +1163,7 @@ impl App {
             Constraint::Min(3),
             Constraint::Length(1),
             Constraint::Length(status.len().max(1) as u16),
-            Constraint::Length(3),
+            Constraint::Length(self.input_rows() + 2),
             Constraint::Length(under),
         ])
         .areas(frame.area());
@@ -1361,6 +1405,11 @@ impl App {
         frame.render_widget(paragraph.scroll((top, 0)), area);
     }
 
+    /// Lines the prompt shows: one per line typed, up to `PROMPT_LINES`.
+    fn input_rows(&self) -> u16 {
+        (self.input.split('\n').count() as u16).clamp(1, PROMPT_LINES)
+    }
+
     fn draw_input(&self, frame: &mut Frame, area: Rect) {
         // Between two rules across the screen, as in Claude Code.
         let block = Block::new().borders(Borders::TOP | Borders::BOTTOM).border_style(dim());
@@ -1375,17 +1424,29 @@ impl App {
         } else if input.is_empty() && !ready {
             Line::from(vec![prompt, Span::styled("waiting for setup…", dim())])
         } else {
-            // Keep the cursor in view: show the tail of a long prompt.
-            let before: String = input.chars().take(self.cursor).collect();
+            // One row per line typed. The cursor's line shows its tail when
+            // it's too long, so the cursor stays in view; and when there are
+            // more lines than rows, the rows follow the cursor.
             let indent = label.len() as u16;
             let room = inner.width.saturating_sub(indent + 1) as usize;
-            let offset = Span::raw(before.as_str()).width().saturating_sub(room);
-            let visible: String = input.chars().skip(offset).collect();
-            let x = inner.x + indent + Span::raw(before.as_str()).width().saturating_sub(offset) as u16;
-            if matches!(self.overlay, Overlay::None) {
-                frame.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y));
+            let before: String = input.chars().take(self.cursor).collect();
+            let row = before.matches('\n').count();
+            let col_text = before.rsplit('\n').next().unwrap_or_default();
+            let lines: Vec<&str> = input.split('\n').collect();
+            let first = (row + 1).saturating_sub(inner.height as usize);
+            let mut shown = Vec::new();
+            for (i, text) in lines.iter().enumerate().skip(first).take(inner.height as usize) {
+                let mark = if i == 0 { prompt.clone() } else { Span::raw(" ".repeat(indent as usize)) };
+                let offset = if i == row { Span::raw(col_text).width().saturating_sub(room) } else { 0 };
+                let visible: String = text.chars().skip(offset).collect();
+                shown.push(Line::from(vec![mark, Span::raw(visible)]));
+                if i == row && matches!(self.overlay, Overlay::None) {
+                    let x = inner.x + indent + Span::raw(col_text).width().saturating_sub(offset) as u16;
+                    let y = inner.y + (i - first) as u16;
+                    frame.set_cursor_position((x.min(inner.right().saturating_sub(1)), y));
+                }
             }
-            Line::from(vec![prompt, Span::raw(visible)])
+            return frame.render_widget(Paragraph::new(shown).block(block), area);
         };
         frame.render_widget(Paragraph::new(line).block(block), area);
     }
@@ -1691,6 +1752,7 @@ fn help_lines() -> Vec<Line<'static>> {
     let rows = [
         ("[?] /help", "these shortcuts"),
         ("[enter]", "send the prompt"),
+        ("[shift+enter] [alt+enter]", "new line (also [ctrl+j])"),
         ("[esc]", "interrupt the reply"),
         ("[↑] [↓]", "earlier prompts"),
         ("wheel [pgup] [pgdn]", "scroll the conversation"),
@@ -1704,7 +1766,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("[ctrl+c] /quit", "quit"),
     ];
     rows.iter()
-        .map(|(key, what)| Line::from(vec![Span::styled(format!(" {:<22}", key), key_style()), Span::raw(*what)]))
+        .map(|(key, what)| Line::from(vec![Span::styled(format!(" {:<27}", key), key_style()), Span::raw(*what)]))
         .collect()
 }
 
@@ -2052,6 +2114,39 @@ mod tests {
         // Plain text pastes as text.
         app.paste("these two");
         assert_eq!(app.input, "compare [Image 1] these two");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shift_enter_starts_a_new_line_for_the_question() {
+        let dir = std::env::temp_dir().join(format!("slp-multi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("report.pdf");
+        std::fs::write(&report, b"pdf").unwrap();
+
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        let press = |app: &mut App, code, modifiers| app.key(KeyEvent::new(code, modifiers));
+        app.paste(&report.display().to_string());
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        for c in "what does it conclude?".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(app.input, "[Doc 1] \nwhat does it conclude?\n\n");
+        assert_eq!(app.input_rows(), 4);
+
+        let text = screen(&app, 80, 24);
+        let rows: Vec<&str> = text.lines().collect();
+        let first = rows.iter().position(|r| r.starts_with("> [Doc 1]")).expect(&text);
+        assert!(rows[first + 1].starts_with("  what does it conclude?"), "{}", text);
+
+        // Up moves between the prompt's lines rather than through history.
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.cursor, "[Doc 1] \n".chars().count());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
