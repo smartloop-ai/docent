@@ -31,7 +31,10 @@
 use std::time::{Duration, Instant};
 
 use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use futures_util::StreamExt;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -51,6 +54,9 @@ const BAR_WIDTH: usize = 30;
 /// An active step shows its elapsed time once it has run this long.
 const SHOW_ELAPSED_AFTER: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(100);
+/// Lines one wheel notch scrolls, and one page key.
+const WHEEL_LINES: u16 = 3;
+const PAGE_LINES: u16 = 10;
 /// A bar turning in brackets.
 const SPINNER: [&str; 4] = ["[-]", "[\\]", "[|]", "[/]"];
 
@@ -65,7 +71,16 @@ pub fn run(client: &Client, prompt: Option<String>, project: Option<String>, ses
     let runtime = tokio::runtime::Runtime::new()
         .unwrap_or_else(|e| crate::fail(format!("Failed to start async runtime: {}", e)));
     let mut terminal = ratatui::init();
+    // The wheel scrolls the chat. Put mouse reporting back on a panic too,
+    // or the shell gets escape codes for every move.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        hook(info);
+    }));
     let result = runtime.block_on(App::new(client.clone(), prompt, project, session).run(&mut terminal));
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     // A chat turn may still be streaming; don't wait for it.
     runtime.shutdown_background();
@@ -405,6 +420,18 @@ struct App {
     history_at: Option<usize>,
     /// Lines scrolled up from the bottom of the conversation; 0 follows it.
     scroll_back: u16,
+    /// How far up the conversation goes, as of the last draw.
+    scroll_limit: std::cell::Cell<u16>,
+    /// The conversation pane as last drawn, row by row, for copying a
+    /// selection out of it.
+    shown: std::cell::RefCell<(Rect, Vec<Vec<String>>)>,
+    /// Text being selected with the mouse, in screen cells.
+    selection: Option<Selection>,
+    /// What the last selection copied, flashed in the footer for a moment.
+    copied: Option<(usize, Instant)>,
+    /// Kept for the app's life: on X11 the clipboard empties when its owner
+    /// goes away.
+    clipboard: Option<arboard::Clipboard>,
     ticks: usize,
     /// The prompt takes a token for `/login`, masked, instead of a message.
     token_entry: bool,
@@ -438,6 +465,11 @@ impl App {
             history: Vec::new(),
             history_at: None,
             scroll_back: 0,
+            scroll_limit: std::cell::Cell::new(0),
+            shown: std::cell::RefCell::new((Rect::default(), Vec::new())),
+            selection: None,
+            copied: None,
+            clipboard: None,
             ticks: 0,
             token_entry: false,
             account: None,
@@ -459,6 +491,7 @@ impl App {
             tokio::select! {
                 event = keys.next() => match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => self.key(key),
+                    Some(Ok(Event::Mouse(mouse))) if matches!(self.overlay, Overlay::None) => self.mouse(mouse),
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(format!("Failed to read input: {}", e)),
                     None => break,
@@ -684,7 +717,71 @@ impl App {
 
     // ----- keys ------------------------------------------------------------
 
+    /// The wheel scrolls; a left-button drag over the conversation selects,
+    /// and letting go copies the selection.
+    fn mouse(&mut self, mouse: MouseEvent) {
+        let at = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll(WHEEL_LINES as i32),
+            MouseEventKind::ScrollDown => self.scroll(-(WHEEL_LINES as i32)),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let area = self.shown.borrow().0;
+                self.selection = area.contains(at.into()).then_some(Selection { anchor: at, head: at });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(selection) = &mut self.selection {
+                    let area = self.shown.borrow().0;
+                    selection.head = clamp_to(area, at);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let text = self.selection.as_ref().filter(|s| s.anchor != s.head).map(|s| self.selected_text(s));
+                match text.filter(|t| !t.trim().is_empty()) {
+                    Some(text) => self.copy(text),
+                    None => self.selection = None,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The selected cells' text, a line per screen row, trailing blanks off.
+    fn selected_text(&self, selection: &Selection) -> String {
+        let shown = self.shown.borrow();
+        let (area, rows) = (&shown.0, &shown.1);
+        selection
+            .rows(*area)
+            .map(|(y, from, to)| {
+                let row = &rows[(y - area.y) as usize];
+                let line: String = row[(from - area.x) as usize..=(to - area.x) as usize].concat();
+                line.trim_end().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Put `text` on the system clipboard, or where there's none (over SSH),
+    /// ask the terminal to with OSC 52.
+    fn copy(&mut self, text: String) {
+        self.copied = Some((text.chars().count(), Instant::now()));
+        if cfg!(test) {
+            return;
+        }
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        let copied = self.clipboard.as_mut().is_some_and(|c| c.set_text(text.clone()).is_ok());
+        if !copied {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()));
+            let _ = out.flush();
+        }
+    }
+
     fn key(&mut self, key: KeyEvent) {
+        // Typing moves on from a selection.
+        self.selection = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match (key.code, ctrl) {
             (KeyCode::Char('c'), true) => {
@@ -804,10 +901,17 @@ impl App {
             }
             KeyCode::Up => self.recall(-1),
             KeyCode::Down => self.recall(1),
-            KeyCode::PageUp => self.scroll_back = self.scroll_back.saturating_add(10),
-            KeyCode::PageDown => self.scroll_back = self.scroll_back.saturating_sub(10),
+            KeyCode::PageUp => self.scroll(PAGE_LINES as i32),
+            KeyCode::PageDown => self.scroll(-(PAGE_LINES as i32)),
             _ => {}
         }
+    }
+
+    /// Scroll the conversation `lines` up (negative: down), no further than
+    /// its first line or its end.
+    fn scroll(&mut self, lines: i32) {
+        let back = (self.scroll_back as i32 + lines).clamp(0, self.scroll_limit.get() as i32);
+        self.scroll_back = back as u16;
     }
 
     fn byte_at(&self, chars: usize) -> usize {
@@ -981,6 +1085,7 @@ impl App {
         .areas(frame.area());
 
         self.draw_conversation(frame, body);
+        self.keep_shown(frame, body);
         frame.render_widget(Paragraph::new(status), status_area);
         self.draw_input(frame, input);
         if hints.is_empty() {
@@ -1121,6 +1226,23 @@ impl App {
         lines
     }
 
+    /// Remember the conversation as drawn, for copying, and highlight the
+    /// selection over it.
+    fn keep_shown(&self, frame: &mut Frame, area: Rect) {
+        let buffer = frame.buffer_mut();
+        let rows = (area.top()..area.bottom())
+            .map(|y| (area.left()..area.right()).map(|x| buffer[(x, y)].symbol().to_string()).collect())
+            .collect();
+        *self.shown.borrow_mut() = (area, rows);
+        if let Some(selection) = &self.selection {
+            for (y, from, to) in selection.rows(area) {
+                for x in from..=to {
+                    buffer[(x, y)].set_style(Style::new().add_modifier(Modifier::REVERSED));
+                }
+            }
+        }
+    }
+
     fn draw_conversation(&self, frame: &mut Frame, area: Rect) {
         // The welcome card opens the conversation, like a first message, and
         // scrolls away with it.
@@ -1164,6 +1286,7 @@ impl App {
         // sits low and grows upward, as in Claude Code.
         let area = Rect { y: area.y + area.height.saturating_sub(total), height: area.height.min(total), ..area };
         let bottom = total.saturating_sub(area.height);
+        self.scroll_limit.set(bottom);
         let top = bottom.saturating_sub(self.scroll_back);
         frame.render_widget(paragraph.scroll((top, 0)), area);
     }
@@ -1222,7 +1345,10 @@ impl App {
     /// Key hints under the prompt.
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let mut hints = vec![Span::raw("  ")];
-        if self.scroll_back > 0 {
+        if let Some((chars, _)) = self.copied.filter(|(_, at)| at.elapsed() < Duration::from_secs(2)) {
+            hints.push(Span::styled("✓ ", Style::new().fg(Color::Green)));
+            hints.push(Span::styled(format!("Copied {} characters", chars), dim()));
+        } else if self.scroll_back > 0 {
             hints.push(Span::styled(format!("↓ {} lines below  ", self.scroll_back), dim()));
             hints.extend(key_hints(&[("pgdn", "scroll down"), ("end", "latest")]));
         } else if self.token_entry {
@@ -1393,6 +1519,53 @@ fn refresh_account(client: &Client, tx: &UnboundedSender<AppEvent>, project: Opt
     }
 }
 
+/// A mouse selection: where the drag started and where it is now.
+struct Selection {
+    anchor: (u16, u16),
+    head: (u16, u16),
+}
+
+impl Selection {
+    /// Each selected row as (y, first x, last x), the way a terminal selects:
+    /// from the start to the row's end, whole rows between, then up to the
+    /// end.
+    fn rows(&self, area: Rect) -> impl Iterator<Item = (u16, u16, u16)> {
+        let (a, b) = (self.anchor, self.head);
+        let ((x0, y0), (x1, y1)) = if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) };
+        let (left, right) = (area.left(), area.right().saturating_sub(1));
+        (y0..=y1).filter(move |y| *y >= area.top() && *y < area.bottom()).map(move |y| {
+            let from = if y == y0 { x0 } else { left };
+            let to = if y == y1 { x1 } else { right };
+            (y, from.clamp(left, right), to.clamp(left, right))
+        })
+    }
+}
+
+/// `at`, moved inside `area`.
+fn clamp_to(area: Rect, at: (u16, u16)) -> (u16, u16) {
+    (
+        at.0.clamp(area.left(), area.right().saturating_sub(1)),
+        at.1.clamp(area.top(), area.bottom().saturating_sub(1)),
+    )
+}
+
+/// Standard base64, for OSC 52.
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(TABLE[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
 const COMMANDS: [(&str, &str); 9] = [
@@ -1413,7 +1586,8 @@ fn draw_help(frame: &mut Frame) {
         ("[enter]", "send the prompt"),
         ("[esc]", "interrupt the reply"),
         ("[↑] [↓]", "earlier prompts"),
-        ("[pgup] [pgdn]", "scroll the conversation"),
+        ("wheel [pgup] [pgdn]", "scroll the conversation"),
+        ("drag", "select and copy to the clipboard"),
         ("[ctrl+o] /models", "models: enable, disable, download"),
         ("[ctrl+p] /projects", "switch project"),
         ("[ctrl+g] /downloads", "setup and model downloads"),
@@ -1643,6 +1817,49 @@ mod tests {
         let prompt = rows.iter().rposition(|r| r.starts_with('>')).expect(&text) - 1;
         // A blank row and the (empty) status row between them.
         assert_eq!(prompt - at, 3, "{}", text);
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_top_and_the_end() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        for i in 0..60 {
+            app.entries.push(Entry::Notice(format!("line {}", i)));
+        }
+        screen(&app, 80, 24);
+        let limit = app.scroll_limit.get();
+        assert!(limit > 0);
+        for _ in 0..100 {
+            app.scroll(WHEEL_LINES as i32);
+        }
+        assert_eq!(app.scroll_back, limit);
+        assert!(screen(&app, 80, 24).contains("█▀ █▀▄▀█"), "the top shows the welcome card");
+        app.scroll(-1000);
+        assert_eq!(app.scroll_back, 0);
+        assert!(screen(&app, 80, 24).contains("line 59"));
+    }
+
+    #[test]
+    fn dragging_selects_and_copies_the_text() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.entries.push(Entry::Notice("first line".into()));
+        app.entries.push(Entry::Notice("second line".into()));
+        let text = screen(&app, 80, 24);
+        let rows: Vec<&str> = text.lines().collect();
+        let y0 = rows.iter().position(|r| r.contains("first line")).unwrap() as u16;
+        let y1 = rows.iter().position(|r| r.contains("second line")).unwrap() as u16;
+        let mouse = |kind, column, row| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+        // From "first" (after "⏺ ") to the end of "second".
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, y0));
+        app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 12, y1));
+        let selection = app.selection.as_ref().unwrap();
+        assert_eq!(app.selected_text(selection), "first line\n\n⏺ second line");
+        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 12, y1));
+        assert_eq!(app.copied.map(|(n, _)| n), Some(25));
+        assert!(screen(&app, 80, 24).contains("Copied 25 characters"));
+        assert_eq!(base64(b"hi!"), "aGkh");
+        assert_eq!(base64(b"hi"), "aGk=");
     }
 
     #[test]
