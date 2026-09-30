@@ -160,7 +160,11 @@ fn projects_url() -> String {
 /// Print an error and stop; used instead of panicking so failures read as
 /// CLI output rather than a Rust backtrace.
 fn fail(message: String) -> ! {
-    eprintln!("Error: {}", message);
+    if std::io::stderr().is_terminal() {
+        eprintln!("\x1b[1;31mError:\x1b[0m {}", message);
+    } else {
+        eprintln!("Error: {}", message);
+    }
     exit(1);
 }
 
@@ -368,8 +372,13 @@ fn format_bytes(bytes: u64) -> String {
 fn agent_status(client: &Client) {
     println!("Endpoint: {}", base_url());
 
+    let pid = if is_local() { framework::agent_pid() } else { None };
     let Some(health) = get_json(client, format!("{}/health", base_url())) else {
-        println!("Status:   not running");
+        match pid {
+            // The process is up but not answering: still starting, or hung.
+            Some(pid) => println!("Status:   not responding (pid {})", pid),
+            None => println!("Status:   not running"),
+        }
         exit(1);
     };
 
@@ -579,11 +588,11 @@ fn enable_model(client: &Client, project_id: &str, name: &str) {
         .unwrap_or_default();
 
     let mut list = progress::Checklist::new();
-    let download = list.add(&format!("Download {}", name));
-    let enable = list.add("Enable for project");
+    let download = list.add_download(&format!("Downloading {}", name), &base_url(), name);
+    let enable = list.add(&format!("Enabling {} for the project", name));
 
     if downloaded {
-        list.done(download, "downloaded");
+        list.done(download);
     } else {
         list.start(download);
         framework::stream_progress(
@@ -606,7 +615,9 @@ fn enable_model(client: &Client, project_id: &str, name: &str) {
     if let Err(e) = patch_project_model(client, project_id, name, true) {
         list.fail(enable, e);
     }
-    list.done(enable, "");
+    list.done(enable);
+    // Clear the progress bar before printing below it.
+    drop(list);
     println!("Model {} enabled", name);
 }
 

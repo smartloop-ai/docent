@@ -65,23 +65,30 @@ Any command that talks to the agent starts it when nothing answers on
 4. Run the agent's bootstrap, which downloads the default chat model, creates
    the default project and loads the model.
 
-Each step is skipped when its files are already there. Progress shows as a
-checklist on stderr that redraws in place, with the active download's bar in
-Smartloop pink:
+Each step is skipped when its files are already there. Progress is logged
+apt-style on stderr, the way Ubuntu installs packages: a line per step,
+`Get:`/`Fetched` lines per download, and a `Progress:` bar pinned at the
+bottom while it runs:
 
 ```
-[✓] SLP framework 1.2.7                667 MB
-[✓] Start agent                    port 38540
-[✓] Embeddings (bge-m3)                417 MB
-[•] Chat model sl-mini
-    ██████████████▋░░░░░░░░░░░░░░░   49%  377 MB/769 MB
-[ ] Default project
-[ ] Load model
-[ ] Skills and connections
+Downloading SLP framework 1.2.7 ...
+Get:1 https://dl.smartloop.ai/slp/1.2.7 darwin-arm64-slp.tar.gz [667 MB]
+Fetched 667 MB in 42s (15.8 MB/s)
+Unpacking slp (1.2.7) ...
+Setting up slp (1.2.7) ...
+Starting agent on port 38540 ...
+Downloading embeddings (bge-m3) ...
+Get:2 https://dl.smartloop.ai/embeddings bge-m3-Q4_K_M.gguf [417 MB]
+Fetched 417 MB in 26s (16.0 MB/s)
+Downloading default model ...
+31% [3 sl-mini 238 MB/769 MB]                          15.8 MB/s 33s
+Progress: [ 42%] [##############################..........................]
 ```
 
-When stderr isn't a terminal, each step prints one line as it finishes
-instead. `smartloop model enable` shows the same checklist for its download.
+It ends with `✓ Setup complete in 1min 12s` once everything is set up.
+
+When stderr isn't a terminal, only the lines print, without the bars.
+`smartloop model enable` logs its download the same way.
 
 To do this up front, or to stop the agent:
 
