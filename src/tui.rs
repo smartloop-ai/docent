@@ -37,9 +37,9 @@ use crossterm::event::{
 };
 use futures_util::StreamExt;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use reqwest::blocking::Client;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -1065,11 +1065,11 @@ impl App {
             Overlay::None => frame.render_widget(Paragraph::new(hints), footer),
             Overlay::Models { rows, selected } => self.draw_models(frame, footer, rows, *selected),
             Overlay::Help => {
-                let block = panel(" Help ", &bar_hints(&[("esc", "close")]));
+                let block = panel(&bar_hints(&[("esc", "close")]));
                 frame.render_widget(Paragraph::new(help_lines()).block(block), footer);
             }
             Overlay::Status(rows) => {
-                let block = panel(" Status ", &bar_hints(&[("esc", "close")]));
+                let block = panel(&bar_hints(&[("esc", "close")]));
                 frame.render_widget(Paragraph::new(self.status_panel_lines(rows)).block(block), footer);
             }
         }
@@ -1079,12 +1079,13 @@ impl App {
     fn panel_height(&self) -> Option<u16> {
         let rows = match &self.overlay {
             Overlay::None => return None,
-            Overlay::Models { rows: Some(Ok(list)), .. } => list.len() + 2,
+            Overlay::Models { rows: Some(Ok(list)), .. } => list.len(),
             Overlay::Models { .. } => 1,
             Overlay::Help => help_lines().len(),
             Overlay::Status(rows) => self.status_panel_lines(rows).len(),
         };
-        Some(rows as u16 + 2)
+        // And the row of keys under them.
+        Some(rows as u16 + 1)
     }
 
     /// The live line above the prompt, like Claude Code's: what's running
@@ -1361,42 +1362,50 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(hints)), area);
     }
 
+    /// The project's models as a list, like Claude Code's model picker:
+    /// the selected one marked, each with its state and what it can do.
     fn draw_models(&self, frame: &mut Frame, area: Rect, rows: &Option<Result<Vec<ModelRow>, String>>, selected: usize) {
-        let project = self.project.as_ref().map_or(String::new(), |(_, n)| n.clone());
-        let block = panel(&format!(" Models · {} ", project), &bar_hints(&[("↑↓", "select"), ("enter", "enable/disable"), ("r", "refresh"), ("esc", "close")]));
+        let block = panel(&bar_hints(&[("↑↓", "select"), ("enter", "enable/disable"), ("r", "refresh"), ("esc", "close")]));
         frame.render_widget(Clear, area);
         let list = match rows {
-            None => return frame.render_widget(Paragraph::new(format!("Loading {}", self.spinner())).block(block), area),
+            None => return frame.render_widget(Paragraph::new(format!(" Loading models {}", self.spinner())).block(block), area),
             Some(Err(e)) => return frame.render_widget(Paragraph::new(e.clone()).block(block).wrap(Wrap { trim: false }), area),
             Some(Ok(list)) => list,
         };
-        let flag = |on: bool| if on { Cell::from("✓").green() } else { Cell::from("·").dim() };
-        let body = list.iter().map(|m| {
-            let downloading = self.downloads.iter().find(|d| d.model == m.name && !d.finished);
-            let downloaded = match downloading.and_then(|d| d.list.active()) {
-                Some(StepRow { bytes: Some((done, total)), .. }) if *total > 0 => {
-                    Cell::from(format!("{}%", done * 100 / total)).fg(pink())
+        let name_width = list.iter().map(|m| m.name.chars().count()).max().unwrap_or(0) + 2;
+        let lines: Vec<Line> = list
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let chosen = i == selected;
+                let mut spans = vec![
+                    Span::styled(if chosen { "› " } else { "  " }, Style::new().fg(pink()).bold()),
+                    Span::styled(
+                        format!("{:<w$}", m.name, w = name_width),
+                        if chosen { Style::new().fg(pink()).bold() } else { Style::new() },
+                    ),
+                ];
+                let downloading = self.downloads.iter().find(|d| d.model == m.name && !d.finished);
+                let state = match downloading.and_then(|d| d.list.active()) {
+                    Some(StepRow { bytes: Some((done, total)), .. }) if *total > 0 => {
+                        Span::styled(format!("downloading {}%", done * 100 / total), Style::new().fg(pink()))
+                    }
+                    Some(_) => Span::styled(format!("downloading {}", self.spinner()), Style::new().fg(pink())),
+                    None if m.enabled => Span::styled("✓ enabled", Style::new().fg(Color::Green)),
+                    None if m.downloaded => Span::styled("downloaded", dim()),
+                    None => Span::styled("not downloaded", dim()),
+                };
+                let state_width = state.width();
+                spans.push(state);
+                spans.push(Span::raw(" ".repeat(16usize.saturating_sub(state_width))));
+                spans.push(Span::styled(m.capabilities.clone(), dim()));
+                if !m.accessible {
+                    spans.push(Span::styled("  · sign in to use", Style::new().fg(Color::Yellow)));
                 }
-                Some(_) => Cell::from(self.spinner()).fg(pink()),
-                None => flag(m.downloaded),
-            };
-            let access = if m.accessible {
-                Cell::from(m.access.clone())
-            } else {
-                Cell::from(format!("{} (sign in)", m.access)).yellow()
-            };
-            Row::new(vec![Cell::from(m.name.clone()), Cell::from(m.capabilities.clone()), access, downloaded, flag(m.enabled)])
-        });
-        let table = Table::new(
-            body,
-            [Constraint::Fill(2), Constraint::Fill(3), Constraint::Length(16), Constraint::Length(10), Constraint::Length(7)],
-        )
-        .header(Row::new(["Name", "Capabilities", "Access", "Downloaded", "Enabled"]).bold().bottom_margin(1))
-        .row_highlight_style(Style::new().bg(Color::DarkGray))
-        .highlight_symbol("▶ ")
-        .block(block);
-        let mut state = TableState::default().with_selected(Some(selected));
-        frame.render_stateful_widget(table, area, &mut state);
+                Line::from(spans)
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
     /// Who's signed in, the project and session, the agent, its model and
@@ -1603,11 +1612,10 @@ fn bar_hints(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
 }
 
 /// A panel in the dropdown under the prompt, as Claude Code draws them: no
-/// border (the prompt's rule sets it off), the title on the first row, the
-/// rows indented under it, and its keys on the last row.
-fn panel(title: &str, hint: &[Span<'static>]) -> Block<'static> {
+/// border or title (the prompt's rule sets it off, and the command just
+/// typed names it), the rows indented, and its keys on the last row.
+fn panel(hint: &[Span<'static>]) -> Block<'static> {
     Block::new()
-        .title(Line::from(title.trim().to_string()).bold().fg(pink()))
         .title_bottom(Line::from(hint.to_vec()).right_aligned())
         .padding(Padding::left(1))
 }
@@ -1833,15 +1841,14 @@ mod tests {
             ("model".into(), "sl-mini (Q4_K_M, 32768 ctx, 769 MB)".into()),
         ]));
         let text = screen(&app, 80, 24);
-        for expected in ["Status", " project   Default", " session   cli-test", " account   you@example.com", " model     sl-mini (Q4_K_M"] {
+        for expected in [" project   Default", " session   cli-test", " account   you@example.com", " model     sl-mini (Q4_K_M"] {
             assert!(text.contains(expected), "{}\n{}", expected, text);
         }
         // In the dropdown under the prompt, where the command hints show.
         let rows: Vec<&str> = text.lines().collect();
-        let top = rows.iter().position(|r| r.contains("Status")).expect(&text);
-        assert!(rows[top].starts_with("Status") && !text.contains('┌'), "{}", text);
+        let top = rows.iter().position(|r| r.starts_with("  project   Default")).expect(&text);
         assert!(rows[top - 1].starts_with('─') && rows[top - 2].starts_with('>'), "{}", text);
-        assert!(rows[top + 1].starts_with("  project   Default"), "{}", text);
+        assert!(!text.contains('┌') && !text.contains("Status"), "{}", text);
         assert!(rows[23].contains("[esc] close"), "{}", text);
     }
 
@@ -1858,6 +1865,29 @@ mod tests {
         app.input = "/new".into();
         app.submit();
         assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("Unknown command /new")));
+    }
+
+    #[test]
+    fn models_show_as_a_list() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        let model = |name: &str, downloaded, enabled| ModelRow {
+            name: name.into(),
+            capabilities: "general, vision".into(),
+            access: "free".into(),
+            accessible: true,
+            downloaded,
+            enabled,
+        };
+        app.overlay = Overlay::Models {
+            rows: Some(Ok(vec![model("gemma4-e4b", false, false), model("qwen3.5-2b", true, true)])),
+            selected: 1,
+        };
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("  gemma4-e4b  not downloaded  general, vision"), "{}", text);
+        assert!(text.contains("› qwen3.5-2b  ✓ enabled"), "{}", text);
+        assert!(!text.contains("Capabilities") && !text.contains("Models"), "{}", text);
     }
 
     #[test]
