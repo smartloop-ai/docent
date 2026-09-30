@@ -21,8 +21,8 @@
 //! for how long, and a line per running download; a finished reply keeps
 //! only the model that answered.
 //! First-run setup (framework, agent, embeddings, chat model) shows as the
-//! checklist under the banner before chat opens. Models, projects and
-//! downloads open as panels over it.
+//! checklist under the banner before chat opens. Models and status open
+//! as panels under the prompt.
 //!
 //! Blocking work (setup, the agent's REST calls, model downloads) runs on
 //! plain threads and reports through a channel, so quitting never waits for
@@ -39,7 +39,7 @@ use futures_util::StreamExt;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use reqwest::blocking::Client;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -373,8 +373,6 @@ struct Reply {
 enum Overlay {
     None,
     Models { rows: Option<Result<Vec<ModelRow>, String>>, selected: usize },
-    Projects { rows: Option<Result<Vec<serde_json::Value>, String>>, selected: usize },
-    Downloads,
     Help,
     /// `/status`: rows fill in once the agent answers.
     Status(Option<Vec<(String, String)>>),
@@ -653,9 +651,6 @@ impl App {
 
     /// Pick the project: the one asked for, else the server's current one.
     fn projects_loaded(&mut self, result: Result<Vec<serde_json::Value>, String>) {
-        if let Overlay::Projects { rows, .. } = &mut self.overlay {
-            *rows = Some(result.clone());
-        }
         if !matches!(self.phase, Phase::Connecting) {
             return;
         }
@@ -790,15 +785,12 @@ impl App {
                 return;
             }
             (KeyCode::Char('o'), true) => return self.open_models(),
-            (KeyCode::Char('p'), true) => return self.open_projects(),
-            (KeyCode::Char('g'), true) => return self.overlay = Overlay::Downloads,
             _ => {}
         }
         match self.overlay {
             Overlay::None => self.key_chat(key),
             Overlay::Models { .. } => self.key_models(key),
-            Overlay::Projects { .. } => self.key_projects(key),
-            Overlay::Downloads | Overlay::Help | Overlay::Status(_) => {
+            Overlay::Help | Overlay::Status(_) => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                     self.overlay = Overlay::None;
                 }
@@ -819,14 +811,6 @@ impl App {
         self.spawn(|client, tx| {
             let _ = tx.send(AppEvent::Status(crate::status_rows(&client)));
         });
-    }
-
-    fn open_projects(&mut self) {
-        if !matches!(self.phase, Phase::Ready) {
-            return;
-        }
-        self.overlay = Overlay::Projects { rows: None, selected: 0 };
-        self.load_projects();
     }
 
     fn key_chat(&mut self, key: KeyEvent) {
@@ -977,15 +961,16 @@ impl App {
             }
             "/quit" | "/exit" | "/q" | "exit" => self.quit = true,
             "/models" => self.open_models(),
-            "/projects" => self.open_projects(),
-            "/downloads" => self.overlay = Overlay::Downloads,
             "/help" | "/?" => self.overlay = Overlay::Help,
             "/status" => self.open_status(),
-            "/new" => {
+            // A clean slate: the conversation goes, and so does the agent's
+            // memory of it, with a new session.
+            "/clear" => {
+                self.stop_turn();
+                self.entries.clear();
                 self.session = chat::new_session_id();
-                self.entries.push(Entry::Notice("New session".to_string()));
+                self.scroll_back = 0;
             }
-            "/clear" => self.entries.clear(),
             _ if command.starts_with('/') => {
                 self.entries.push(Entry::Error(format!("Unknown command {}; try /help", command)));
             }
@@ -1047,37 +1032,18 @@ impl App {
         }
     }
 
-    fn key_projects(&mut self, key: KeyEvent) {
-        let Overlay::Projects { rows, selected } = &mut self.overlay else { return };
-        let list = rows.as_ref().and_then(|r| r.as_ref().ok()).cloned().unwrap_or_default();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.overlay = Overlay::None,
-            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1).min(list.len().saturating_sub(1)),
-            KeyCode::Char('r') => self.load_projects(),
-            KeyCode::Enter => {
-                let Some(p) = list.get(*selected) else { return };
-                let id = p["id"].as_str().unwrap_or_default().to_string();
-                let name = p["name"].as_str().unwrap_or_default().to_string();
-                self.overlay = Overlay::None;
-                if self.project.as_ref().is_some_and(|(current, _)| *current == id) {
-                    return;
-                }
-                self.stop_turn();
-                self.session = chat::new_session_id();
-                self.entries.push(Entry::Notice(format!("Switched to {} · new session", name)));
-                self.project = Some((id, name));
-            }
-            _ => {}
-        }
-    }
-
     // ----- drawing -------------------------------------------------------
 
     fn draw(&self, frame: &mut Frame) {
         let status = self.status_lines();
-        // Command hints take the footer's place while a command is typed.
+        // Command hints take the footer's place while a command is typed,
+        // and an open panel takes it in the same way, under the prompt.
         let hints = self.hint_lines();
+        let room = frame.area().height.saturating_sub(12);
+        let under = match self.panel_height() {
+            Some(height) => height.min(room),
+            None => hints.len().max(1) as u16,
+        };
         // A blank row at the top, and one between the conversation and the
         // status line, so neither sits cramped against its neighbor.
         let [_, body, _, status_area, input, footer] = Layout::vertical([
@@ -1086,7 +1052,7 @@ impl App {
             Constraint::Length(1),
             Constraint::Length(status.len().max(1) as u16),
             Constraint::Length(3),
-            Constraint::Length(hints.len().max(1) as u16),
+            Constraint::Length(under),
         ])
         .areas(frame.area());
 
@@ -1094,20 +1060,31 @@ impl App {
         self.keep_shown(frame, body);
         frame.render_widget(Paragraph::new(status), status_area);
         self.draw_input(frame, input);
-        if hints.is_empty() {
-            self.draw_footer(frame, footer);
-        } else {
-            frame.render_widget(Paragraph::new(hints), footer);
-        }
-
         match &self.overlay {
-            Overlay::None => {}
-            Overlay::Models { rows, selected } => self.draw_models(frame, rows, *selected),
-            Overlay::Projects { rows, selected } => self.draw_projects(frame, rows, *selected),
-            Overlay::Downloads => self.draw_downloads(frame),
-            Overlay::Help => draw_help(frame),
-            Overlay::Status(rows) => self.draw_status(frame, rows),
+            Overlay::None if hints.is_empty() => self.draw_footer(frame, footer),
+            Overlay::None => frame.render_widget(Paragraph::new(hints), footer),
+            Overlay::Models { rows, selected } => self.draw_models(frame, footer, rows, *selected),
+            Overlay::Help => {
+                let block = panel(" Help ", &bar_hints(&[("esc", "close")]));
+                frame.render_widget(Paragraph::new(help_lines()).block(block), footer);
+            }
+            Overlay::Status(rows) => {
+                let block = panel(" Status ", &bar_hints(&[("esc", "close")]));
+                frame.render_widget(Paragraph::new(self.status_panel_lines(rows)).block(block), footer);
+            }
         }
+    }
+
+    /// Rows an open panel needs under the prompt, border included.
+    fn panel_height(&self) -> Option<u16> {
+        let rows = match &self.overlay {
+            Overlay::None => return None,
+            Overlay::Models { rows: Some(Ok(list)), .. } => list.len() + 2,
+            Overlay::Models { .. } => 1,
+            Overlay::Help => help_lines().len(),
+            Overlay::Status(rows) => self.status_panel_lines(rows).len(),
+        };
+        Some(rows as u16 + 2)
     }
 
     /// The live line above the prompt, like Claude Code's: what's running
@@ -1173,7 +1150,6 @@ impl App {
     /// │ Here are some commands to get you started                                 │
     /// │   /login     sign in for web search and more models                       │
     /// │   /models    enable, download or turn off models                          │
-    /// │   /projects  switch to another project                                    │
     /// │   /status    account, model, agent and versions                           │
     /// │                                                                           │
     /// ╰───────────────────────────────────────────────────────────────────────────╯
@@ -1385,8 +1361,7 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(hints)), area);
     }
 
-    fn draw_models(&self, frame: &mut Frame, rows: &Option<Result<Vec<ModelRow>, String>>, selected: usize) {
-        let area = popup(frame.area(), 90, 70);
+    fn draw_models(&self, frame: &mut Frame, area: Rect, rows: &Option<Result<Vec<ModelRow>, String>>, selected: usize) {
         let project = self.project.as_ref().map_or(String::new(), |(_, n)| n.clone());
         let block = panel(&format!(" Models · {} ", project), &bar_hints(&[("↑↓", "select"), ("enter", "enable/disable"), ("r", "refresh"), ("esc", "close")]));
         frame.render_widget(Clear, area);
@@ -1424,84 +1399,18 @@ impl App {
         frame.render_stateful_widget(table, area, &mut state);
     }
 
-    fn draw_projects(&self, frame: &mut Frame, rows: &Option<Result<Vec<serde_json::Value>, String>>, selected: usize) {
-        let area = popup(frame.area(), 70, 60);
-        let block = panel(" Projects ", &bar_hints(&[("↑↓", "select"), ("enter", "switch"), ("r", "refresh"), ("esc", "close")]));
-        frame.render_widget(Clear, area);
-        let list = match rows {
-            None => return frame.render_widget(Paragraph::new(format!("Loading {}", self.spinner())).block(block), area),
-            Some(Err(e)) => return frame.render_widget(Paragraph::new(e.clone()).block(block).wrap(Wrap { trim: false }), area),
-            Some(Ok(list)) => list,
-        };
-        let current = self.project.as_ref().map(|(id, _)| id.as_str());
-        let items = list.iter().map(|p| {
-            let id = p["id"].as_str().unwrap_or_default();
-            let mut spans = vec![Span::raw(p["name"].as_str().unwrap_or_default().to_string())];
-            if Some(id) == current {
-                spans.push(Span::styled("  (this chat)", Style::new().fg(pink())));
-            } else if p["current"].as_bool().unwrap_or_default() {
-                spans.push(Span::styled("  (current)", dim()));
-            }
-            if p["system"].as_bool().unwrap_or_default() {
-                spans.push(Span::styled("  system", Style::new().fg(Color::Magenta)));
-            }
-            spans.push(Span::styled(format!("  {}", id), dim()));
-            ListItem::new(Line::from(spans))
-        });
-        let widget = List::new(items)
-            .block(block)
-            .highlight_style(Style::new().bg(Color::DarkGray))
-            .highlight_symbol("▶ ");
-        let mut state = ListState::default().with_selected(Some(selected));
-        frame.render_stateful_widget(widget, area, &mut state);
-    }
-
     /// Who's signed in, the project and session, the agent, its model and
     /// process, and the versions.
-    fn draw_status(&self, frame: &mut Frame, rows: &Option<Vec<(String, String)>>) {
+    fn status_panel_lines(&self, rows: &Option<Vec<(String, String)>>) -> Vec<Line<'static>> {
         let project = self.project.as_ref().map_or("…".to_string(), |(_, name)| name.clone());
         let mut all = vec![("project".to_string(), project), ("session".to_string(), self.session.clone())];
         match rows {
             Some(rows) => all.extend(rows.iter().cloned()),
             None => all.push(("agent".to_string(), format!("asking the agent {}", self.spinner()))),
         }
-        let lines: Vec<Line> = all
-            .into_iter()
-            .map(|(label, value)| Line::from(vec![Span::styled(format!("{:<10}", label), dim()), Span::raw(value)]))
-            .collect();
-        let screen = frame.area();
-        let width = (lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4).clamp(40, screen.width);
-        let height = (lines.len() as u16 + 2).min(screen.height);
-        let area = Rect::new(
-            screen.x + (screen.width - width) / 2,
-            screen.y + (screen.height - height) / 2,
-            width,
-            height,
-        );
-        frame.render_widget(Clear, area);
-        frame.render_widget(Paragraph::new(lines).block(panel(" Status ", &bar_hints(&[("esc", "close")]))), area);
-    }
-
-    fn draw_downloads(&self, frame: &mut Frame) {
-        let area = popup(frame.area(), 80, 60);
-        let block = panel(" Downloads ", &bar_hints(&[("esc", "close")]));
-        frame.render_widget(Clear, area);
-        let mut lines: Vec<Line> = Vec::new();
-        if !self.setup.steps.is_empty() {
-            lines.push(Line::styled("Setup", Style::new().bold()));
-            lines.extend(self.setup.lines());
-        }
-        for d in &self.downloads {
-            if !lines.is_empty() {
-                lines.push(Line::default());
-            }
-            lines.push(Line::styled(d.model.clone(), Style::new().bold()));
-            lines.extend(d.list.lines());
-        }
-        if lines.is_empty() {
-            lines.push(Line::styled("Nothing downloaded yet. Enable a model from ^O models.", dim()));
-        }
-        frame.render_widget(Paragraph::new(lines).block(block), area);
+        all.into_iter()
+            .map(|(label, value)| Line::from(vec![Span::styled(format!(" {:<10}", label), dim()), Span::raw(value)]))
+            .collect()
     }
 
     fn spinner(&self) -> &'static str {
@@ -1627,27 +1536,24 @@ fn getting_started() -> Vec<Line<'static>> {
         Line::from(Span::styled("Here are some commands to get you started", key_style())),
         command("/login", "sign in for web search and more models"),
         command("/models", "enable, download or turn off models"),
-        command("/projects", "switch to another project"),
         command("/status", "account, model, agent and versions"),
     ]
 }
 
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
-const COMMANDS: [(&str, &str); 10] = [
+const COMMANDS: [(&str, &str); 7] = [
     ("/help", "shortcuts and commands"),
-    ("/login", "sign in with a token"),
-    ("/logout", "sign out"),
+    ("/login", "login with a token"),
+    ("/logout", "log out"),
     ("/models", "enable, disable and download models"),
-    ("/projects", "switch project"),
-    ("/downloads", "setup and model downloads"),
     ("/status", "account, model, agent and versions"),
-    ("/new", "start a new session"),
-    ("/clear", "clear the screen"),
+    ("/clear", "clear the chat and start a new session"),
     ("/quit", "quit"),
 ];
 
-fn draw_help(frame: &mut Frame) {
+/// Every key and command, for the help panel.
+fn help_lines() -> Vec<Line<'static>> {
     let rows = [
         ("[?] /help", "these shortcuts"),
         ("[enter]", "send the prompt"),
@@ -1656,31 +1562,15 @@ fn draw_help(frame: &mut Frame) {
         ("wheel [pgup] [pgdn]", "scroll the conversation"),
         ("drag", "select and copy to the clipboard"),
         ("[ctrl+o] /models", "models: enable, disable, download"),
-        ("[ctrl+p] /projects", "switch project"),
-        ("[ctrl+g] /downloads", "setup and model downloads"),
         ("/status", "account, model, agent and versions"),
-        ("/login", "sign in with a token"),
-        ("/logout", "sign out"),
-        ("/new", "start a new session"),
-        ("/clear", "clear the screen"),
+        ("/login", "login with a token"),
+        ("/logout", "log out"),
+        ("/clear", "clear the chat and start a new session"),
         ("[ctrl+c] /quit", "quit"),
     ];
-    let lines: Vec<Line> = rows
-        .iter()
-        .map(|(key, what)| Line::from(vec![Span::styled(format!("{:<22}", key), key_style()), Span::raw(*what)]))
-        .collect();
-    // Just tall enough for the list, centered.
-    let screen = frame.area();
-    let height = (lines.len() as u16 + 2).min(screen.height);
-    let width = 64.min(screen.width);
-    let area = Rect::new(
-        screen.x + (screen.width - width) / 2,
-        screen.y + (screen.height - height) / 2,
-        width,
-        height,
-    );
-    frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(panel(" Help ", &bar_hints(&[("esc", "close")]))), area);
+    rows.iter()
+        .map(|(key, what)| Line::from(vec![Span::styled(format!(" {:<22}", key), key_style()), Span::raw(*what)]))
+        .collect()
 }
 
 /// A key in a hint: the terminal's own text color, bold, so it reads as
@@ -1712,28 +1602,14 @@ fn bar_hints(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
     spans
 }
 
+/// A panel in the dropdown under the prompt, as Claude Code draws them: no
+/// border (the prompt's rule sets it off), the title on the first row, the
+/// rows indented under it, and its keys on the last row.
 fn panel(title: &str, hint: &[Span<'static>]) -> Block<'static> {
-    Block::bordered()
-        .border_style(Style::new().fg(pink()))
-        .title(Line::from(title.to_string()).bold())
+    Block::new()
+        .title(Line::from(title.trim().to_string()).bold().fg(pink()))
         .title_bottom(Line::from(hint.to_vec()).right_aligned())
-}
-
-/// A box `w`% by `h`% of `area`, centered.
-fn popup(area: Rect, w: u16, h: u16) -> Rect {
-    let [_, row, _] = Layout::vertical([
-        Constraint::Percentage((100 - h) / 2),
-        Constraint::Percentage(h),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
-    let [_, cell, _] = Layout::horizontal([
-        Constraint::Percentage((100 - w) / 2),
-        Constraint::Percentage(w),
-        Constraint::Fill(1),
-    ])
-    .areas(row);
-    cell
+        .padding(Padding::left(1))
 }
 
 fn dim() -> Style {
@@ -1818,7 +1694,7 @@ mod tests {
         assert!(rows[banner + 4].contains("Here are some commands to get you started"), "{}", text);
         assert!(rows[banner + 5].contains("/login"), "{}", text);
         assert!(!text.contains("search the web"), "{}", text);
-        assert!(rows[banner - 2].starts_with('╭') && rows[banner + 10].starts_with('╰'), "{}", text);
+        assert!(rows[banner - 2].starts_with('╭') && rows[banner + 9].starts_with('╰'), "{}", text);
         for i in 0..40 {
             app.entries.push(Entry::Notice(format!("line {}", i)));
         }
@@ -1957,9 +1833,31 @@ mod tests {
             ("model".into(), "sl-mini (Q4_K_M, 32768 ctx, 769 MB)".into()),
         ]));
         let text = screen(&app, 80, 24);
-        for expected in ["Status", "project   Default", "session   cli-test", "account   you@example.com", "model     sl-mini (Q4_K_M"] {
+        for expected in ["Status", " project   Default", " session   cli-test", " account   you@example.com", " model     sl-mini (Q4_K_M"] {
             assert!(text.contains(expected), "{}\n{}", expected, text);
         }
+        // In the dropdown under the prompt, where the command hints show.
+        let rows: Vec<&str> = text.lines().collect();
+        let top = rows.iter().position(|r| r.contains("Status")).expect(&text);
+        assert!(rows[top].starts_with("Status") && !text.contains('┌'), "{}", text);
+        assert!(rows[top - 1].starts_with('─') && rows[top - 2].starts_with('>'), "{}", text);
+        assert!(rows[top + 1].starts_with("  project   Default"), "{}", text);
+        assert!(rows[23].contains("[esc] close"), "{}", text);
+    }
+
+    #[test]
+    fn clear_empties_the_chat_and_starts_a_new_session() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.entries.push(Entry::Notice("earlier".into()));
+        app.input = "/clear".into();
+        app.submit();
+        assert!(app.entries.is_empty());
+        assert_ne!(app.session, "cli-test");
+        app.input = "/new".into();
+        app.submit();
+        assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("Unknown command /new")));
     }
 
     #[test]
