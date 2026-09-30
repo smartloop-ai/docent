@@ -3,7 +3,7 @@
 //! ```text
 //! > what is the capital of France?
 //!
-//! ⏺ Paris is the capital of France.
+//! ■ Paris is the capital of France.
 //!
 //!   References
 //!   [1] https://en.wikipedia.org/wiki/Paris
@@ -51,7 +51,8 @@ use crate::{ModelRow, framework};
 
 const LABEL_WIDTH: usize = 28;
 const DETAIL_WIDTH: usize = 12;
-const BAR_WIDTH: usize = 30;
+/// Blocks in each setup step's bar.
+const BLOCKS: usize = 16;
 /// An active step shows its elapsed time once it has run this long.
 const SHOW_ELAPSED_AFTER: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(100);
@@ -304,38 +305,101 @@ impl StepList {
         self.steps.iter().find(|s| s.state == State::Active)
     }
 
-    /// The checklist's rows, with the active download's bar under its row.
-    fn lines(&self) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-        for s in &self.steps {
-            let label = format!("{:<w$}", truncate(&s.label, LABEL_WIDTH), w = LABEL_WIDTH);
-            let detail = |text: &str| Span::styled(format!(" {:>w$}", text, w = DETAIL_WIDTH), dim());
-            let mut spans = match s.state {
-                State::Done => vec![bracket("x", Color::Green), Span::raw(label), detail(&s.detail)],
-                State::Failed => vec![bracket("✗", Color::Red), Span::raw(label.trim_end().to_string())],
-                State::Pending => vec![Span::styled(format!("[ ] {}", label.trim_end()), dim())],
-                State::Active => vec![bracket("•", pink()), Span::raw(label)],
-            };
-            if s.state == State::Active && s.bytes.is_none() {
-                let took = s.started.map(|t| t.elapsed()).filter(|t| *t >= SHOW_ELAPSED_AFTER);
-                match (s.detail.is_empty(), took) {
-                    (false, Some(t)) => {
-                        spans.push(detail(&s.detail));
-                        spans.push(Span::styled(format!(" {}", format_duration(t)), dim()));
-                    }
-                    (false, None) => spans.push(detail(&s.detail)),
-                    (true, Some(t)) => spans.push(detail(&format_duration(t))),
-                    (true, None) => {}
-                }
-            }
+    /// Setup as a box, a row per step, each with a bar of blocks: filling
+    /// as a download's bytes arrive, a pulse while any other step runs,
+    /// full and green once it's done.
+    ///
+    /// ```text
+    /// ╭ Booting up …           ──────────────────────────────────╮
+    /// │                                                          │
+    /// │  [x] Start agent          ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰  port 38540   │
+    /// │  [•] Base model sl-mini   ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱  49%          │
+    /// │  [ ] Default project      ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱               │
+    /// │                                                          │
+    /// ╰──────────────────────────────── 377 MB of 769 MB · 23s ──╯
+    /// ```
+    fn card(&self, ticks: usize) -> Vec<Line<'static>> {
+        // Labels as wide as the longest, so the bars line up close to them.
+        let label_width = self.steps.iter().map(|s| s.label.chars().count()).max().unwrap_or(0).min(LABEL_WIDTH);
+        let rows: Vec<Line<'static>> = self.steps.iter().map(|s| self.card_row(s, label_width, ticks)).collect();
+        let inner = rows.iter().map(Line::width).max().unwrap_or(0) + 2;
+        let border = dim();
+
+        let title = " Booting up… ";
+        let mut lines = vec![Line::from(vec![
+            Span::styled("╭", border),
+            Span::styled(title, Style::new().bold()),
+            Span::styled(format!("{}╮", "─".repeat(inner.saturating_sub(title.chars().count()))), border),
+        ])];
+        let blank = Line::default();
+        for row in std::iter::once(&blank).chain(rows.iter()).chain(std::iter::once(&blank)) {
+            let mut spans = vec![Span::styled("│", border)];
+            spans.extend(row.spans.iter().cloned());
+            spans.push(Span::raw(" ".repeat(inner.saturating_sub(row.width()))));
+            spans.push(Span::styled("│", border));
             lines.push(Line::from(spans));
-            if let (State::Active, Some((done, total))) = (s.state, s.bytes) {
-                let mut bar = vec![Span::raw("    ")];
-                bar.extend(bar_spans(done, total, BAR_WIDTH));
-                lines.push(Line::from(bar));
-            }
         }
+        // The running download's bytes and time, or how long it all took.
+        let note = match (self.active(), self.took) {
+            (_, Some(took)) => format!(" done in {} ", format_duration(took)),
+            (Some(StepRow { bytes: Some((done, total)), started, .. }), None) if *total > 0 => format!(
+                " {} of {} · {} ",
+                format_size(*done),
+                format_size(*total),
+                format_duration(started.map_or(Duration::ZERO, |t| t.elapsed()))
+            ),
+            (Some(StepRow { started: Some(t), .. }), None) => format!(" {} ", format_duration(t.elapsed())),
+            _ => String::new(),
+        };
+        let fill = inner.saturating_sub(note.chars().count() + 2);
+        lines.push(Line::from(vec![
+            Span::styled(format!("╰{}", "─".repeat(fill)), border),
+            Span::styled(note, dim()),
+            Span::styled("──╯", border),
+        ]));
         lines
+    }
+
+    fn card_row(&self, s: &StepRow, label_width: usize, ticks: usize) -> Line<'static> {
+        let label = format!("{:<w$}", truncate(&s.label, label_width), w = label_width);
+        let (mark, label_style) = match s.state {
+            State::Done => (bracket("x", Color::Green), Style::new()),
+            State::Failed => (bracket("✗", Color::Red), Style::new()),
+            State::Active => (bracket("•", pink()), Style::new()),
+            State::Pending => (Span::styled("[ ] ", dim()), dim()),
+        };
+        let lit = |on: bool, color: Color| {
+            if on { Span::styled("▰", Style::new().fg(color)) } else { Span::styled("▱", dim()) }
+        };
+        let blocks: Vec<Span<'static>> = match (s.state, s.bytes) {
+            (State::Done, _) => (0..BLOCKS).map(|_| lit(true, Color::Green)).collect(),
+            (State::Active, Some((done, total))) if total > 0 => {
+                let lit_count = (done as f64 / total as f64 * BLOCKS as f64).round() as usize;
+                (0..BLOCKS).map(|i| lit(i < lit_count, pink())).collect()
+            }
+            // Running with nothing to count: a pulse of three blocks sweeps
+            // along the track.
+            (State::Active, _) => {
+                let at = ticks % (BLOCKS + 3);
+                (0..BLOCKS).map(|i| lit(i < at && i + 3 >= at, pink())).collect()
+            }
+            _ => (0..BLOCKS).map(|_| lit(false, pink())).collect(),
+        };
+        let detail = match (s.state, s.bytes) {
+            (State::Active, Some((done, total))) if total > 0 => format!("{}%", done * 100 / total),
+            (State::Active, _) => s
+                .started
+                .map(|t| t.elapsed())
+                .filter(|t| *t >= SHOW_ELAPSED_AFTER)
+                .map(format_duration)
+                .map_or(s.detail.clone(), |t| if s.detail.is_empty() { t } else { format!("{} {}", s.detail, t) }),
+            (State::Done, _) => s.detail.clone(),
+            _ => String::new(),
+        };
+        let mut spans = vec![Span::raw("  "), mark, Span::styled(label, label_style), Span::raw("  ")];
+        spans.extend(blocks);
+        spans.push(Span::styled(format!("  {:<w$}", detail, w = DETAIL_WIDTH), dim()));
+        Line::from(spans)
     }
 }
 
@@ -1363,7 +1427,7 @@ impl App {
         let mut lines = self.welcome(area.width);
         if !self.setup.steps.is_empty() {
             lines.push(Line::default());
-            lines.extend(self.setup.lines());
+            lines.extend(self.setup.card(self.ticks));
         }
         if let Some(e) = &self.setup.failure {
             lines.push(Line::default());
@@ -1383,11 +1447,11 @@ impl App {
                 }
                 Entry::Reply(reply) => reply_lines(reply, &mut lines),
                 Entry::Notice(text) => lines.push(Line::from(vec![
-                    Span::styled("⏺ ", Style::new().fg(Color::Green)),
+                    Span::styled("■ ", Style::new().fg(Color::Green)),
                     Span::raw(text.clone()),
                 ])),
                 Entry::Warning(text) => lines.push(Line::from(vec![
-                    Span::styled("⏺ ", Style::new().fg(Color::Yellow)),
+                    Span::styled("■ ", Style::new().fg(Color::Yellow)),
                     Span::styled(text.clone(), dim()),
                 ])),
                 Entry::Error(text) => lines.push(error_line(text)),
@@ -1556,17 +1620,17 @@ impl App {
     }
 }
 
-/// A reply as Claude Code lays one out: the answer under a `⏺`, its
+/// A reply as Claude Code lays one out: the answer under a `■` (square, like the setup blocks), its
 /// sources, then `⎿` with the model that answered and how it went.
 fn reply_lines(reply: &Reply, lines: &mut Vec<Line<'static>>) {
     for warning in &reply.warnings {
         lines.push(Line::from(vec![
-            Span::styled("⏺ ", Style::new().fg(Color::Yellow)),
+            Span::styled("■ ", Style::new().fg(Color::Yellow)),
             Span::styled(warning.clone(), dim()),
         ]));
     }
     for (i, line) in reply.text.trim_end().lines().enumerate() {
-        let mark = if i == 0 { Span::raw("⏺ ") } else { Span::raw("  ") };
+        let mark = if i == 0 { Span::raw("■ ") } else { Span::raw("  ") };
         lines.push(Line::from(vec![mark, Span::raw(line.to_string())]));
     }
     if !reply.citations.is_empty() {
@@ -1600,7 +1664,7 @@ fn selected_model(message: &str) -> Option<String> {
 
 fn error_line(text: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled("⏺ ", Style::new().fg(Color::Red)),
+        Span::styled("■ ", Style::new().fg(Color::Red)),
         Span::styled("Error: ", Style::new().fg(Color::Red).bold()),
         Span::raw(text.to_string()),
     ])
@@ -2006,11 +2070,11 @@ mod tests {
         let y0 = rows.iter().position(|r| r.contains("first line")).unwrap() as u16;
         let y1 = rows.iter().position(|r| r.contains("second line")).unwrap() as u16;
         let mouse = |kind, column, row| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
-        // From "first" (after "⏺ ") to the end of "second".
+        // From "first" (after "■ ") to the end of "second".
         app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, y0));
         app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 12, y1));
         let selection = app.selection.as_ref().unwrap();
-        assert_eq!(app.selected_text(selection), "first line\n\n⏺ second line");
+        assert_eq!(app.selected_text(selection), "first line\n\n■ second line");
         app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 12, y1));
         assert_eq!(app.copied.map(|(n, _)| n), Some(25));
         assert!(screen(&app, 80, 24).contains("Copied 25 characters"));
@@ -2173,27 +2237,29 @@ mod tests {
     }
 
     #[test]
-    fn setup_shows_the_checklist() {
+    fn setup_shows_a_box_with_a_bar_per_step() {
         let mut app = app();
         for event in [
-            StepEvent::Add("SLP framework 1.2.7".into()),
+            StepEvent::Add("Agent 1.2.7".into()),
             StepEvent::Done(0),
             StepEvent::Add("Start agent".into()),
             StepEvent::Detail(1, "port 38540".into()),
             StepEvent::Done(1),
-            StepEvent::Add("Chat model".into()),
+            StepEvent::Add("Base model".into()),
             StepEvent::Add("Default project".into()),
             StepEvent::Name(2, "sl-mini".into()),
             StepEvent::Progress(2, 377 << 20, 769 << 20),
         ] {
             app.apply(AppEvent::Setup(event));
         }
-        let text = screen(&app, 80, 24);
-        assert!(text.contains("[x] Start agent"), "{}", text);
-        assert!(text.contains("port 38540"), "{}", text);
-        assert!(text.contains("[•] Chat model sl-mini"), "{}", text);
-        assert!(text.contains("49%  377 MB/769 MB"), "{}", text);
-        assert!(text.contains("[ ] Default project"), "{}", text);
+        let text = screen(&app, 80, 30);
+        let rows: Vec<&str> = text.lines().collect();
+        let top = rows.iter().position(|r| r.starts_with("╭ Booting up…")).expect(&text);
+        assert!(rows[top + 2].contains("[x] Agent 1.2.7") && rows[top + 2].contains("▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰"), "{}", text);
+        assert!(rows[top + 3].contains("[x] Start agent") && rows[top + 3].contains("port 38540"), "{}", text);
+        assert!(rows[top + 4].contains("[•] Base model sl-mini") && rows[top + 4].contains("▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱  49%"), "{}", text);
+        assert!(rows[top + 5].contains("[ ] Default project") && rows[top + 5].contains("▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱"), "{}", text);
+        assert!(rows[top + 7].starts_with('╰') && rows[top + 7].contains("377 MB of 769 MB"), "{}", text);
     }
 
     #[test]
@@ -2221,7 +2287,7 @@ mod tests {
         let text = screen(&app, 80, 24);
         let rows: Vec<&str> = text.lines().collect();
         assert!(text.contains("> what is in my docs?"), "{}", text);
-        assert!(text.contains("⏺ Your documents cover the roadmap."), "{}", text);
+        assert!(text.contains("■ Your documents cover the roadmap."), "{}", text);
         assert!(text.contains("[1] roadmap.pdf"), "{}", text);
         assert!(text.contains("⎿  sl-mini · 12 tokens · 6.0 tok/s · 2s"), "{}", text);
         // The status line sits right above the prompt box.

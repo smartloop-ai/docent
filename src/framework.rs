@@ -433,7 +433,7 @@ pub fn prepare(list: &mut dyn Steps, client: &Client, base_url: &str, local: boo
     let mut queued = None;
     if !healthy {
         let install = (!running && !is_non_empty_file(&binary_path()))
-            .then(|| list.add(&format!("SLP framework {}", VERSION)));
+            .then(|| list.add(&format!("Agent {}", VERSION)));
         let start = list.add(if running { "Wait for agent" } else { "Start agent" });
         list.set_detail(start, &format!("port {}", port()));
         queued = Some(queue_setup(list));
@@ -477,7 +477,7 @@ impl SetupSteps {
 fn queue_setup(list: &mut dyn Steps) -> SetupSteps {
     SetupSteps {
         embeddings: list.add("Embeddings (bge-m3)"),
-        model: list.add("Chat model"),
+        model: list.add("Base model"),
         project: list.add("Default project"),
         load: list.add("Load model"),
         services: list.add("Skills and connections"),
