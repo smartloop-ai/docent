@@ -168,10 +168,10 @@ The command exits with status 1 when the agent can't be reached there.
 Start an interactive chat with the local agent:
 
 ```sh
-smartloop run
+smartloop
 ```
 
-In a terminal this opens a full-screen app, laid out like Claude Code. While
+`smartloop` on its own is short for `smartloop run`. In a terminal this opens a full-screen app, laid out like Claude Code. While
 a reply runs, a live status line above the prompt shows the agent's current
 step (web search, document lookup, model selection) and for how long, with a
 line per running download. The finished reply keeps its sources and the model
