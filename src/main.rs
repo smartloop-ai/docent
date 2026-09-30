@@ -1,14 +1,16 @@
 use std::io::{IsTerminal, Write};
 use std::process::exit;
 
-use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
 use clap::{Parser, Subcommand};
-use futures_util::StreamExt;
 use prettytable::{Attr, Cell, Row, Table, color};
 use reqwest::blocking::{Client, Response, multipart};
 
+use progress::Steps;
+
+mod chat;
 mod framework;
 mod progress;
+mod tui;
 
 const LOGO: &str = r#"
 █▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█
@@ -65,6 +67,10 @@ enum Commands {
         /// Session ID to resume; a fresh one is created when omitted
         #[arg(long, short)]
         session: Option<String>,
+        /// Chat line by line instead of in the full-screen app; the default
+        /// when stdin or stdout isn't a terminal
+        #[arg(long)]
+        plain: bool,
     },
 }
 
@@ -129,7 +135,7 @@ enum ProjectCommands {
 }
 
 /// Base URL of the Smartloop agent, overridable for non-default installs.
-fn base_url() -> String {
+pub fn base_url() -> String {
     let base = std::env::var("SMARTLOOP_API_URL")
         .unwrap_or_else(|_| format!("http://localhost:{}", framework::port()));
     base.trim_end_matches('/').to_string()
@@ -137,7 +143,7 @@ fn base_url() -> String {
 
 /// True when the CLI talks to the agent it manages itself: the default local
 /// endpoint rather than a `SMARTLOOP_API_URL` someone else runs.
-fn is_local() -> bool {
+pub fn is_local() -> bool {
     std::env::var("SMARTLOOP_API_URL").is_err()
 }
 
@@ -149,7 +155,7 @@ fn agent_client() -> Client {
     client
 }
 
-fn api_url() -> String {
+pub fn api_url() -> String {
     format!("{}/v1", base_url())
 }
 
@@ -159,7 +165,7 @@ fn projects_url() -> String {
 
 /// Print an error and stop; used instead of panicking so failures read as
 /// CLI output rather than a Rust backtrace.
-fn fail(message: String) -> ! {
+pub fn fail(message: String) -> ! {
     if std::io::stderr().is_terminal() {
         eprintln!("\x1b[1;31mError:\x1b[0m {}", message);
     } else {
@@ -213,22 +219,14 @@ fn print_projects(projects: &[serde_json::Value]) {
 }
 
 fn fetch_projects(client: &Client) -> Vec<serde_json::Value> {
-    let response = client
-        .get(projects_url())
-        .send()
-        .unwrap_or_else(|e| fail(format!("Failed to list projects: {}", e)));
+    try_fetch_projects(client).unwrap_or_else(|e| fail(e))
+}
 
-    if !response.status().is_success() {
-        fail(error_message("list projects", response));
-    }
-
-    let mut data: serde_json::Value = response
-        .json()
-        .unwrap_or_else(|e| fail(format!("Failed to parse response as JSON: {}", e)));
-
+pub fn try_fetch_projects(client: &Client) -> Result<Vec<serde_json::Value>, String> {
+    let mut data = request_json(client, projects_url(), "list projects")?;
     match data["projects"].take() {
-        serde_json::Value::Array(projects) => projects,
-        _ => fail("Expected projects to be an array".to_string()),
+        serde_json::Value::Array(projects) => Ok(projects),
+        _ => Err("Expected projects to be an array".to_string()),
     }
 }
 
@@ -491,35 +489,80 @@ fn project_models_url(project_id: &str) -> String {
 }
 
 fn get_json_or_fail(client: &Client, url: String, action: &str) -> serde_json::Value {
+    request_json(client, url, action).unwrap_or_else(|e| fail(e))
+}
+
+fn request_json(client: &Client, url: String, action: &str) -> Result<serde_json::Value, String> {
     let response = client
         .get(url)
         .send()
-        .unwrap_or_else(|e| fail(format!("Failed to {}: {}", action, e)));
+        .map_err(|e| format!("Failed to {}: {}", action, e))?;
     if !response.status().is_success() {
-        fail(error_message(action, response));
+        return Err(error_message(action, response));
     }
     response
         .json()
-        .unwrap_or_else(|e| fail(format!("Failed to parse response as JSON: {}", e)))
+        .map_err(|e| format!("Failed to parse response as JSON: {}", e))
 }
 
 /// The project's registered models, keyed by name: the downloaded/enabled
 /// state the catalog doesn't carry.
-fn project_model_state(client: &Client, project_id: &str) -> std::collections::HashMap<String, serde_json::Value> {
-    get_json_or_fail(client, project_models_url(project_id), "list project models")
+fn project_model_state(
+    client: &Client,
+    project_id: &str,
+) -> Result<std::collections::HashMap<String, serde_json::Value>, String> {
+    Ok(request_json(client, project_models_url(project_id), "list project models")?
         .as_array()
         .cloned()
         .unwrap_or_default()
         .into_iter()
         .map(|m| (m["model_name"].as_str().unwrap_or_default().to_string(), m))
-        .collect()
+        .collect())
+}
+
+/// One model as `model list` and the TUI show it.
+#[derive(Debug, Clone)]
+pub struct ModelRow {
+    pub name: String,
+    pub capabilities: String,
+    pub access: String,
+    /// False when the model needs a sign-in first.
+    pub accessible: bool,
+    pub downloaded: bool,
+    pub enabled: bool,
 }
 
 /// The catalog (`/v1/models`) joined with the project's state. A model the
 /// project has never registered is neither downloaded nor enabled for it.
+pub fn model_rows(client: &Client, project_id: &str) -> Result<Vec<ModelRow>, String> {
+    let catalog = request_json(client, format!("{}/models", api_url()), "list models")?;
+    let state = project_model_state(client, project_id)?;
+    Ok(catalog
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|model| {
+            let name = model["name"].as_str().unwrap_or_default().to_string();
+            let entry = state.get(&name);
+            let flag = |key: &str| entry.and_then(|m| m[key].as_bool()).unwrap_or_default();
+            ModelRow {
+                capabilities: model["capabilities"]
+                    .as_array()
+                    .map(|c| c.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+                    .unwrap_or_default(),
+                access: model["access_level"].as_str().unwrap_or_default().to_string(),
+                accessible: model["is_accessible"].as_bool() != Some(false),
+                downloaded: flag("downloaded"),
+                enabled: flag("enabled"),
+                name,
+            }
+        })
+        .collect())
+}
+
 fn list_models(client: &Client, project_id: &str) {
-    let catalog = get_json_or_fail(client, format!("{}/models", api_url()), "list models");
-    let state = project_model_state(client, project_id);
+    let rows = model_rows(client, project_id).unwrap_or_else(|e| fail(e));
 
     let flag = |on: bool| {
         if on {
@@ -538,25 +581,18 @@ fn list_models(client: &Client, project_id: &str) {
         Cell::new("Enabled"),
     ]));
 
-    for model in catalog.as_array().cloned().unwrap_or_default() {
-        let name = model["name"].as_str().unwrap_or_default();
-        let entry = state.get(name);
-        let capabilities = model["capabilities"]
-            .as_array()
-            .map(|c| c.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
-            .unwrap_or_default();
-        let access = model["access_level"].as_str().unwrap_or_default();
-        let access = if model["is_accessible"].as_bool() == Some(false) {
-            Cell::new(&format!("{} (sign in)", access)).with_style(Attr::ForegroundColor(color::YELLOW))
+    for row in &rows {
+        let access = if row.accessible {
+            Cell::new(&row.access)
         } else {
-            Cell::new(access)
+            Cell::new(&format!("{} (sign in)", row.access)).with_style(Attr::ForegroundColor(color::YELLOW))
         };
         table.add_row(Row::new(vec![
-            Cell::new(name),
-            Cell::new(&capabilities),
+            Cell::new(&row.name),
+            Cell::new(&row.capabilities),
             access,
-            flag(entry.and_then(|m| m["downloaded"].as_bool()).unwrap_or_default()),
-            flag(entry.and_then(|m| m["enabled"].as_bool()).unwrap_or_default()),
+            flag(row.downloaded),
+            flag(row.enabled),
         ]));
     }
 
@@ -564,7 +600,7 @@ fn list_models(client: &Client, project_id: &str) {
 }
 
 /// PATCH a project's model entry; the server canonicalizes the name.
-fn patch_project_model(client: &Client, project_id: &str, name: &str, enabled: bool) -> Result<(), String> {
+pub fn patch_project_model(client: &Client, project_id: &str, name: &str, enabled: bool) -> Result<(), String> {
     let action = if enabled { "enable model" } else { "disable model" };
     let response = client
         .patch(format!("{}/{}", project_models_url(project_id), name))
@@ -582,15 +618,24 @@ fn patch_project_model(client: &Client, project_id: &str, name: &str, enabled: b
 /// and only then is the model switched on, so it is never enabled without
 /// weights.
 fn enable_model(client: &Client, project_id: &str, name: &str) {
-    let downloaded = project_model_state(client, project_id)
-        .get(name)
-        .and_then(|m| m["downloaded"].as_bool())
-        .unwrap_or_default();
-
     let mut list = progress::Checklist::new();
+    enable_steps(&mut list, client, project_id, name);
+    // Clear the progress bar before printing below it.
+    drop(list);
+    println!("Model {} enabled", name);
+}
+
+/// The steps of enabling `name`, reported on `list`: the checklist, or the
+/// TUI's downloads panel.
+pub fn enable_steps(list: &mut dyn Steps, client: &Client, project_id: &str, name: &str) {
     let download = list.add(&format!("Download {}", name));
     let enable = list.add("Enable for project");
 
+    let downloaded = project_model_state(client, project_id)
+        .unwrap_or_else(|e| list.fail(download, e))
+        .get(name)
+        .and_then(|m| m["downloaded"].as_bool())
+        .unwrap_or_default();
     if downloaded {
         list.set_detail(download, "downloaded");
         list.done(download);
@@ -600,7 +645,7 @@ fn enable_model(client: &Client, project_id: &str, name: &str) {
             &base_url(),
             "/v1/init",
             serde_json::json!({ "model_name": name, "project_id": project_id }),
-            &mut list,
+            list,
             download,
             &|status| match status {
                 "downloading" => framework::Stage::Start(download),
@@ -617,15 +662,14 @@ fn enable_model(client: &Client, project_id: &str, name: &str) {
         list.fail(enable, e);
     }
     list.done(enable);
-    // Clear the progress bar before printing below it.
-    drop(list);
-    println!("Model {} enabled", name);
 }
 
 fn disable_model(client: &Client, project_id: &str, name: &str) {
     // A model the project never registered has nothing to switch off; the
     // PATCH would answer 404 for it.
-    let registered = project_model_state(client, project_id).contains_key(name);
+    let registered = project_model_state(client, project_id)
+        .unwrap_or_else(|e| fail(e))
+        .contains_key(name);
     let catalog_has = get_json_or_fail(client, format!("{}/models", api_url()), "list models")
         .as_array()
         .is_some_and(|c| c.iter().any(|m| m["name"] == name));
@@ -638,8 +682,7 @@ fn disable_model(client: &Client, project_id: &str, name: &str) {
 }
 
 /// Store a pasted token with the agent, which owns the credential store and
-/// uses it for every platform call. Sent as a developer token, the kind meant
-/// for the CLI and scripts.
+/// uses it for every platform call.
 fn login(client: &Client, token: Option<String>) {
     let token = token.unwrap_or_else(|| {
         if !std::io::stdin().is_terminal() {
@@ -652,49 +695,74 @@ fn login(client: &Client, token: Option<String>) {
         rpassword::prompt_password("Paste your token: ")
             .unwrap_or_else(|e| fail(format!("Failed to read token: {}", e)))
     });
+    match try_login(client, &token) {
+        Ok(who) => println!("{}", who),
+        Err(e) => fail(e),
+    }
+}
+
+/// Send `token` to the agent as a developer token, the kind meant for the
+/// CLI and scripts. Returns "Logged in as …" for the user it resolves to.
+pub fn try_login(client: &Client, token: &str) -> Result<String, String> {
     let token = token.trim();
     if token.is_empty() {
-        fail("No token given".to_string());
+        return Err("No token given".to_string());
     }
 
     let response = client
         .post(format!("{}/auth/token", api_url()))
         .json(&serde_json::json!({ "token": token, "type": "developer_token" }))
         .send()
-        .unwrap_or_else(|e| fail(format!("Failed to log in: {}", e)));
+        .map_err(|e| format!("Failed to log in: {}", e))?;
     if !response.status().is_success() {
-        fail(error_message("log in", response));
+        return Err(error_message("log in", response));
     }
 
     let status: serde_json::Value = response
         .json()
-        .unwrap_or_else(|e| fail(format!("Failed to parse response as JSON: {}", e)));
+        .map_err(|e| format!("Failed to parse response as JSON: {}", e))?;
 
     // The agent resolves the user with the token; no user means the platform
     // refused it.
     match status["user"]["email"].as_str() {
-        Some(email) => match status["user"]["name"].as_str() {
-            Some(name) if !name.is_empty() => println!("Logged in as {} <{}>", name, email),
-            _ => println!("Logged in as {}", email),
-        },
+        Some(email) => Ok(match status["user"]["name"].as_str() {
+            Some(name) if !name.is_empty() => format!("Logged in as {} <{}>", name, email),
+            _ => format!("Logged in as {}", email),
+        }),
         None => {
             let _ = client
                 .delete(format!("{}/auth/token?type=developer_token", api_url()))
                 .send();
-            fail("The token was not accepted".to_string());
+            Err("The token was not accepted".to_string())
         }
     }
 }
 
 fn logout(client: &Client) {
+    try_logout(client).unwrap_or_else(|e| fail(e));
+    println!("Logged out");
+}
+
+/// Who the agent is signed in as, from `/v1/auth/status`: "Name <email>",
+/// or None when it isn't.
+pub fn signed_in_as(client: &Client) -> Result<Option<String>, String> {
+    let status = request_json(client, format!("{}/auth/status", api_url()), "read sign-in status")?;
+    let user = &status["user"];
+    Ok(user["email"].as_str().map(|email| match user["name"].as_str() {
+        Some(name) if !name.is_empty() => format!("{} <{}>", name, email),
+        _ => email.to_string(),
+    }))
+}
+
+pub fn try_logout(client: &Client) -> Result<(), String> {
     let response = client
         .delete(format!("{}/auth/token", api_url()))
         .send()
-        .unwrap_or_else(|e| fail(format!("Failed to log out: {}", e)));
+        .map_err(|e| format!("Failed to log out: {}", e))?;
     if !response.status().is_success() {
-        fail(error_message("log out", response));
+        return Err(error_message("log out", response));
     }
-    println!("Logged out");
+    Ok(())
 }
 
 fn delete_project(client: &Client, id: String) {
@@ -708,271 +776,6 @@ fn delete_project(client: &Client, id: String) {
     }
 
     println!("Project deleted successfully");
-}
-
-/// ANSI color for a `chat.status` step name, grouped by what the step is
-/// doing rather than its exact label (the server's step vocabulary isn't a
-/// fixed contract, so unrecognized steps still get a sensible default).
-fn step_color(step: &str) -> &'static str {
-    match step {
-        "tools" | "web_search" | "explore" => "\x1b[36m", // cyan
-        "plan" => "\x1b[35m",                             // magenta
-        "model" => "\x1b[33m",                            // yellow
-        "preparing" | "streaming" => "\x1b[32m",          // green
-        "error" => "\x1b[31m",                            // red
-        _ => "\x1b[34m",                                  // blue
-    }
-}
-
-/// Print a `[step] message` progress line on stderr, coloring the step tag
-/// when stderr is a terminal and leaving plain text otherwise (piped output,
-/// redirected logs).
-fn print_status(step: &str, message: &str) {
-    if std::io::stderr().is_terminal() {
-        eprintln!(
-            "\x1b[2m[\x1b[0m{}{}\x1b[0m\x1b[2m]\x1b[0m {}",
-            step_color(step),
-            step,
-            message
-        );
-    } else {
-        eprintln!("[{}] {}", step, message);
-    }
-}
-
-/// What to show for one citation, as the studio app labels its reference
-/// pills: a web source by its URL, a document by the path the agent gave or
-/// else its name.
-fn citation_label(citation: &serde_json::Value) -> Option<String> {
-    let field = |keys: &[&str]| {
-        keys.iter()
-            .filter_map(|k| citation[*k].as_str())
-            .map(str::trim)
-            .find(|v| !v.is_empty())
-            .map(str::to_string)
-    };
-    let name = field(&["document_name", "document_id"]);
-    let url = field(&["url", "link", "source_url", "href", "web_url"]);
-
-    match (url, name) {
-        (Some(url), Some(name)) if name != url && !name.starts_with("http") => {
-            Some(format!("{} ({})", name, url))
-        }
-        (Some(url), _) => Some(url),
-        (None, name) => field(&["file_path", "path", "source_path"]).or(name),
-    }
-}
-
-/// Print the answer's sources under it as a numbered "References" list. On
-/// stdout, like the answer, so piping a reply keeps its sources.
-fn print_citations(out: &mut impl Write, citations: &[serde_json::Value]) {
-    let labels: Vec<String> = citations.iter().filter_map(citation_label).collect();
-    if labels.is_empty() {
-        return;
-    }
-
-    let styled = std::io::stdout().is_terminal();
-    let (dim, reset) = if styled { ("\x1b[2m", "\x1b[0m") } else { ("", "") };
-    let _ = writeln!(out, "\n{}References{}", dim, reset);
-    for (i, label) in labels.iter().enumerate() {
-        let _ = writeln!(out, "{}[{}]{} {}", dim, i + 1, reset, label);
-    }
-    let _ = out.flush();
-}
-
-/// Build the async SSE client used for chat streaming. Uses `async-openai`'s
-/// `eventsource_stream`-based SSE parser (the same approach real OpenAI SDKs
-/// use) instead of a hand-rolled line reader over a raw socket.
-fn openai_client() -> OpenAIClient<OpenAIConfig> {
-    OpenAIClient::with_config(
-        OpenAIConfig::new()
-            .with_api_base(api_url())
-            .with_api_key("not-needed"),
-    )
-}
-
-/// Stream one chat turn from the service's SSE endpoint, printing content the
-/// moment it arrives. Progress/status events are shown on stderr so they do
-/// not corrupt the answer. Returns an error message when the stream drops
-/// mid-way instead of exiting, so an interactive session can keep going after
-/// a server hiccup. Prints a token/throughput summary on stderr at [DONE].
-///
-/// Long-running tool steps can leave the connection idle long enough for the
-/// server (or a proxy in front of it) to drop it, which surfaces as a stream
-/// error before any content has streamed. Retry once in that case since a
-/// fresh connection usually succeeds.
-async fn run_turn(
-    client: &OpenAIClient<OpenAIConfig>,
-    message: &str,
-    project_id: &str,
-    session_id: &str,
-) -> Result<(), String> {
-    match run_turn_once(client, message, project_id, session_id).await {
-        Ok(_) => Ok(()),
-        Err((e, tokens)) if tokens == 0 => {
-            print_status("error", &format!("connection dropped, retrying: {}", e));
-            run_turn_once(client, message, project_id, session_id)
-                .await
-                .map_err(|(e, _)| e)
-        }
-        Err((e, _)) => Err(e),
-    }
-}
-
-async fn run_turn_once(
-    client: &OpenAIClient<OpenAIConfig>,
-    message: &str,
-    project_id: &str,
-    session_id: &str,
-) -> Result<(), (String, u64)> {
-    // The server-side orchestrator always picks the model that actually
-    // serves the turn; "sl-mini" here just names the entry point it routes
-    // through, not a choice the caller gets to make.
-    let body = serde_json::json!({
-        "model": "sl-mini",
-        "messages": [{"role": "user", "content": message}],
-        "session_id": session_id,
-        "project_id": project_id,
-        "stream": true,
-    });
-
-    let started = std::time::Instant::now();
-    let mut stream = client
-        .chat()
-        .create_stream_byot::<serde_json::Value, serde_json::Value>(body)
-        .await
-        .map_err(|e| (format!("Failed to run: {}", e), 0))?;
-
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let mut tokens: u64 = 0;
-    // Whether the answer so far ends in a newline. A status line printed
-    // mid-answer (e.g. "[streaming] Response complete" right after the last
-    // token) must start on its own line rather than trail the text.
-    let mut at_line_start = true;
-    let mut citations: Vec<serde_json::Value> = Vec::new();
-
-    while let Some(event) = stream.next().await {
-        let event = event.map_err(|e| (format!("Failed to read stream: {}", e), tokens))?;
-
-        match event["object"].as_str() {
-            Some("chat.completion.chunk") => {
-                if let Some(content) = event["choices"][0]["delta"]["content"].as_str() {
-                    tokens += 1;
-                    let _ = out.write_all(content.as_bytes());
-                    let _ = out.flush();
-                    if !content.is_empty() {
-                        at_line_start = content.ends_with('\n');
-                    }
-                }
-                if event["choices"][0]["finish_reason"].is_string() {
-                    break;
-                }
-            }
-            // Sources the answer actually used, sent once after the last
-            // token and before the final chunk.
-            Some("chat.citations") => {
-                if let Some(list) = event["citations"].as_array() {
-                    citations = list.clone();
-                }
-            }
-            Some("chat.status") => match event["message"].as_str() {
-                Some(message) if !message.trim().is_empty() => {
-                    if !at_line_start {
-                        let _ = writeln!(out);
-                        let _ = out.flush();
-                        at_line_start = true;
-                    }
-                    print_status(event["step"].as_str().unwrap_or_default(), message.trim());
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-    }
-
-    if !at_line_start {
-        let _ = writeln!(out);
-    }
-    print_citations(&mut out, &citations);
-    let elapsed = started.elapsed().as_secs_f64();
-    let tokens_per_sec = if elapsed > 0.0 && tokens > 0 {
-        tokens as f64 / elapsed
-    } else {
-        0.0
-    };
-    print_status(
-        "stats",
-        &format!("{} tokens, {:.1} tok/s, {:.0}s", tokens, tokens_per_sec, elapsed),
-    );
-
-    Ok(())
-}
-
-/// Interactive chat with the local agent: turn a reply, then keep reading new
-/// prompts from stdin until EOF, `/quit`, or `exit`. One `session_id` underpins
-/// the whole conversation, so the service keeps the context across turns.
-async fn run_chat(
-    client: &OpenAIClient<OpenAIConfig>,
-    first_prompt: Option<String>,
-    project_id: String,
-    session: Option<String>,
-) {
-    let session_id = session.unwrap_or_else(|| {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        format!(
-            "cli-{}-{}",
-            nanos,
-            std::process::id()
-        )
-    });
-    eprintln!("session: {}", session_id);
-
-    let stdin = std::io::stdin();
-
-    if let Some(prompt) = first_prompt.filter(|p| !p.trim().is_empty()) {
-        println!("> {}", prompt);
-        if let Err(e) = run_turn(client, &prompt, &project_id, &session_id).await {
-            if std::io::stdin().is_terminal() {
-                eprintln!("{}", e);
-            } else {
-                fail(e);
-            }
-        }
-    }
-
-    loop {
-        print!("> ");
-        let _ = std::io::stdout().flush();
-
-        let mut input = String::new();
-        if stdin
-            .read_line(&mut input)
-            .unwrap_or_else(|e| fail(format!("Failed to read input: {}", e)))
-            == 0
-        {
-            break;
-        }
-
-        let input = input.trim();
-        if input.is_empty() {
-            continue;
-        }
-        if matches!(input, "/quit" | "/exit" | "/q" | "exit" | "Exit") {
-            break;
-        }
-
-        if let Err(e) = run_turn(client, input, &project_id, &session_id).await {
-            if std::io::stdin().is_terminal() {
-                eprintln!("{}", e);
-            } else {
-                fail(e);
-            }
-        }
-    }
 }
 
 fn main() {
@@ -1023,15 +826,22 @@ fn main() {
             }
             AgentCommands::Stop => framework::stop(),
         },
-        Commands::Run { prompt, project, session } => {
+        Commands::Run { prompt, project, session, plain } => {
+            let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+            if terminal && !plain {
+                // The app shows setup itself, so the agent may still be down.
+                let client = Client::new();
+                tui::run(&client, prompt, project, session);
+                return;
+            }
             // Resolved before the async runtime starts: the blocking client
             // must not run inside it.
             let client = agent_client();
             let project = project.unwrap_or_else(|| select_project(&client));
             let runtime = tokio::runtime::Runtime::new()
                 .unwrap_or_else(|e| fail(format!("Failed to start async runtime: {}", e)));
-            let chat = openai_client();
-            runtime.block_on(run_chat(&chat, prompt, project, session));
+            let chat = chat::openai_client(api_url());
+            runtime.block_on(chat::run_plain(&chat, prompt, project, session));
         }
     }
 }

@@ -17,7 +17,7 @@ use reqwest::blocking::Client;
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, Signal, System, UpdateKind};
 
 use crate::fail;
-use crate::progress::{Checklist, format_size};
+use crate::progress::{Checklist, Steps, format_size};
 
 /// SLP framework version this CLI installs and runs.
 pub const VERSION: &str = "1.2.7";
@@ -84,16 +84,16 @@ fn archive_url() -> String {
 }
 
 /// Download and extract the framework unless this version is already present,
-/// as one step on `list`. Returns the binary path.
-fn ensure_installed(list: &mut Checklist) -> PathBuf {
+/// as `step` on `list`. Returns the binary path.
+fn ensure_installed(list: &mut dyn Steps, step: usize) -> PathBuf {
     let binary = binary_path();
     if is_non_empty_file(&binary) {
+        list.done(step);
         return binary;
     }
 
     let url = archive_url();
     let file_name = url.rsplit_once('/').map_or("slp-archive", |(_, f)| f);
-    let step = list.add(&format!("SLP framework {}", VERSION));
     list.start(step);
 
     let root = install_dir();
@@ -188,11 +188,11 @@ fn write_markers(root: &Path) {
 /// Download `url` to `dest` through `<dest>.part`. A stalled or dropped
 /// connection is retried, resuming from the bytes already on disk with a
 /// Range request; so is a `.part` left by an earlier run.
-fn download(url: &str, dest: &Path, list: &mut Checklist, step: usize) -> Result<u64, String> {
+fn download(url: &str, dest: &Path, list: &mut dyn Steps, step: usize) -> Result<u64, String> {
     download_with(url, dest, list, step, STALL_TIMEOUT)
 }
 
-fn download_with(url: &str, dest: &Path, list: &mut Checklist, step: usize, stall: Duration) -> Result<u64, String> {
+fn download_with(url: &str, dest: &Path, list: &mut dyn Steps, step: usize, stall: Duration) -> Result<u64, String> {
     // Blocking reqwest applies this to each read, so it catches a stall
     // without limiting how long the whole download may take.
     let client = Client::builder()
@@ -259,7 +259,7 @@ impl Fetch {
         client: &Client,
         url: &str,
         partial: &Path,
-        list: &mut Checklist,
+        list: &mut dyn Steps,
         step: usize,
         stall: Duration,
     ) -> Result<(), Failure> {
@@ -400,13 +400,21 @@ fn is_healthy(client: &Client, base_url: &str) -> bool {
 ///
 /// Returns whether it had anything to do.
 pub fn ensure_running(client: &Client, base_url: &str, local: bool) -> bool {
+    let mut list = Checklist::new();
+    prepare(&mut list, client, base_url, local).unwrap_or_else(|e| fail(e));
+    list.summary("Setup complete")
+}
+
+/// The work behind `ensure_running`, reported on `list`: the checklist on
+/// stderr, or the TUI's setup view. Fails with a message only when a remote
+/// agent doesn't answer; a failed step stops through `list`.
+pub fn prepare(list: &mut dyn Steps, client: &Client, base_url: &str, local: bool) -> Result<(), String> {
     if !local {
         if !is_healthy(client, base_url) {
-            fail(format!("No agent is running at {}", base_url));
+            return Err(format!("No agent is running at {}", base_url));
         }
-        return false;
+        return Ok(());
     }
-    let mut list = Checklist::new();
     let home = install_dir();
     if !home.exists()
         && let Some(pid) = agent_pid()
@@ -419,22 +427,61 @@ pub fn ensure_running(client: &Client, base_url: &str, local: bool) -> bool {
     }
     let running = agent_pid().is_some();
     let healthy = is_healthy(client, base_url);
-    if running {
-        if !healthy {
-            let step = list.add("Wait for agent");
-            list.set_detail(step, &format!("port {}", port()));
-            list.start(step);
-            await_agent(&mut list, step, client, base_url, None);
+    // With the agent down, queue every step now so the whole list shows from
+    // the start; which setup steps have work to do is only known once the
+    // agent answers.
+    let mut queued = None;
+    if !healthy {
+        let install = (!running && !is_non_empty_file(&binary_path()))
+            .then(|| list.add(&format!("SLP framework {}", VERSION)));
+        let start = list.add(if running { "Wait for agent" } else { "Start agent" });
+        list.set_detail(start, &format!("port {}", port()));
+        queued = Some(queue_setup(list));
+        if running {
+            list.start(start);
+            await_agent(list, start, client, base_url, None);
+        } else {
+            // Something other than an `slp` process may serve the port (a
+            // dev build, say); only start one when nothing answers either.
+            launch(list, install, start, client, base_url);
         }
-    } else if !healthy {
-        // Something other than an `slp` process may serve the port (a dev
-        // build, say); only start one when nothing answers either.
-        launch(&mut list, client, base_url);
     }
     if needs_setup(client, base_url) {
-        setup(&mut list, client, base_url);
+        let steps = queued.unwrap_or_else(|| queue_setup(list));
+        setup(list, &steps, client, base_url);
+    } else if let Some(steps) = queued {
+        for step in steps.all() {
+            list.set_detail(step, "ready");
+            list.done(step);
+        }
     }
-    list.summary("Setup complete")
+    Ok(())
+}
+
+/// The steps `setup` works through, queued before it runs.
+#[derive(Clone, Copy)]
+struct SetupSteps {
+    embeddings: usize,
+    model: usize,
+    project: usize,
+    load: usize,
+    services: usize,
+}
+
+impl SetupSteps {
+    fn all(&self) -> [usize; 5] {
+        [self.embeddings, self.model, self.project, self.load, self.services]
+    }
+}
+
+fn queue_setup(list: &mut dyn Steps) -> SetupSteps {
+    SetupSteps {
+        embeddings: list.add("Embeddings (bge-m3)"),
+        model: list.add("Chat model"),
+        project: list.add("Default project"),
+        load: list.add("Load model"),
+        services: list.add("Skills and connections"),
+    }
 }
 
 /// `smartloop agent start`: bring the local agent up and ready, or say it
@@ -465,12 +512,8 @@ fn needs_setup(client: &Client, base_url: &str) -> bool {
 /// First-run setup: make sure the workspace exists, fetch the embedding model
 /// document search needs, then let `/v1/bootstrap` download the chat model,
 /// create the default project and load it.
-fn setup(list: &mut Checklist, client: &Client, base_url: &str) {
-    let embeddings = list.add("Embeddings (bge-m3)");
-    let model = list.add("Chat model");
-    let project = list.add("Default project");
-    let load = list.add("Load model");
-    let services = list.add("Skills and connections");
+fn setup(list: &mut dyn Steps, steps: &SetupSteps, client: &Client, base_url: &str) {
+    let SetupSteps { embeddings, model, project, load, services } = *steps;
 
     // A plain read that creates the workspace when there isn't one.
     let _ = client.get(format!("{}/v1/models/workspace", base_url)).send();
@@ -537,7 +580,7 @@ fn workspace_dir() -> Option<PathBuf> {
 /// looks for it (AppSettings.embedding_gguf_file / embedding_gguf_base_url).
 /// Without it the agent downloads it on first index and falls back to TF-IDF
 /// retrieval until then.
-fn ensure_embeddings(list: &mut Checklist, step: usize, workspace: &Path) {
+fn ensure_embeddings(list: &mut dyn Steps, step: usize, workspace: &Path) {
     let (source, file) = embedding_source();
     let dir = workspace.join("models").join("embeddings");
     let target = dir.join(&file);
@@ -587,7 +630,7 @@ pub fn stream_progress(
     base_url: &str,
     path: &str,
     body: serde_json::Value,
-    list: &mut Checklist,
+    list: &mut dyn Steps,
     download: usize,
     stage: &dyn Fn(&str) -> Stage,
 ) {
@@ -687,13 +730,14 @@ fn model_name_in(message: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Install the framework if needed and start `slp agent start` detached from
-/// this process, logging to `~/.smartloop/server.log`, then wait until
-/// `/health` answers.
-fn launch(list: &mut Checklist, client: &Client, base_url: &str) {
-    let binary = ensure_installed(list);
-    let step = list.add("Start agent");
-    list.set_detail(step, &format!("port {}", port()));
+/// Install the framework as step `install`, when it's missing, then start
+/// `slp agent start` as `step`, detached from this process and logging to
+/// `~/.smartloop/server.log`, and wait until `/health` answers.
+fn launch(list: &mut dyn Steps, install: Option<usize>, step: usize, client: &Client, base_url: &str) {
+    let binary = match install {
+        Some(install) => ensure_installed(list, install),
+        None => binary_path(),
+    };
     list.start(step);
 
     let home = install_dir();
@@ -729,7 +773,7 @@ fn launch(list: &mut Checklist, client: &Client, base_url: &str) {
 /// Wait until the agent answers `/health`, failing as soon as no agent
 /// process is left to wait on. `child` is the agent this CLI just spawned.
 fn await_agent(
-    list: &mut Checklist,
+    list: &mut dyn Steps,
     step: usize,
     client: &Client,
     base_url: &str,
