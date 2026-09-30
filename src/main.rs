@@ -26,8 +26,9 @@ const LOGO: &str = r#"
 )]
 
 struct Args {
+    /// Without one, `smartloop` opens the chat, as `smartloop run` does.
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -833,7 +834,9 @@ fn delete_project(client: &Client, id: String) {
 fn main() {
     let args = Args::parse();
 
-    match args.command {
+    // Bare `smartloop` is `smartloop run`.
+    let command = args.command.unwrap_or(Commands::Run { prompt: None, project: None, session: None, plain: false });
+    match command {
         Commands::Login { token } => login(&agent_client(), token),
         Commands::Logout => logout(&agent_client()),
         Commands::Project { command } => {
