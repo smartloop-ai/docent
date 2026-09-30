@@ -102,8 +102,6 @@ enum AppEvent {
     DownloadDone(usize),
     Notice(String),
     Error(String),
-    /// Who the agent is signed in as, after startup or `/login`/`/logout`.
-    Account(Option<String>),
 }
 
 /// One `Steps` call, carried from a worker thread to the app.
@@ -435,8 +433,6 @@ struct App {
     ticks: usize,
     /// The prompt takes a token for `/login`, masked, instead of a message.
     token_entry: bool,
-    /// Who the agent is signed in as; None until known or when signed out.
-    account: Option<String>,
     /// The highlighted slash-command hint while typing a command.
     hint_at: usize,
     quit: bool,
@@ -472,7 +468,6 @@ impl App {
             clipboard: None,
             ticks: 0,
             token_entry: false,
-            account: None,
             hint_at: 0,
             quit: false,
         }
@@ -606,7 +601,6 @@ impl App {
                 }
                 self.phase = Phase::Connecting;
                 self.load_projects();
-                self.load_account();
             }
             AppEvent::SetupDone(Err(e)) => self.setup.failure = Some(e),
             AppEvent::Projects(result) => self.projects_loaded(result),
@@ -645,7 +639,6 @@ impl App {
                 self.load_models();
             }
             AppEvent::Notice(text) => self.entries.push(Entry::Notice(text)),
-            AppEvent::Account(account) => self.account = account,
             AppEvent::Error(text) => self.entries.push(Entry::Error(text)),
         }
     }
@@ -964,7 +957,7 @@ impl App {
                         Ok(()) => AppEvent::Notice("Logged out".to_string()),
                         Err(e) => AppEvent::Error(e),
                     });
-                    refresh_account(&client, &tx, project);
+                    refresh_models(&client, &tx, project);
                 })
             }
             "/quit" | "/exit" | "/q" | "exit" => self.quit = true,
@@ -1005,13 +998,10 @@ impl App {
                 Ok(who) => AppEvent::Notice(who),
                 Err(e) => AppEvent::Error(e),
             });
-            refresh_account(&client, &tx, project);
+            refresh_models(&client, &tx, project);
         });
     }
 
-    fn load_account(&self) {
-        self.spawn(|client, tx| refresh_account(&client, &tx, None));
-    }
 
     fn key_models(&mut self, key: KeyEvent) {
         let Overlay::Models { rows, selected } = &mut self.overlay else { return };
@@ -1153,28 +1143,27 @@ impl App {
         lines
     }
 
-    /// The welcome card: the logo on the left, and on the right who's
-    /// signed in, the project, the agent and the versions.
+    /// The welcome card: the logo on the left, and on the right the
+    /// project, the agent and the versions.
     ///
     /// ```text
-    /// ╭──────────────────────────────────────────────────────────────╮
-    /// │                                                              │
-    /// │  █▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█   account  you@...    │
-    /// │  ▄█ █ ▀ █ █▀█ █▀▄  █  █▄▄ █▄█ █▄█ █▀▀   project  general_chat│
-    /// │  Local AI assistant                     agent    localhost…  │
-    /// │                                         version  cli 1.0.11  │
-    /// ╰──────────────────────────────────────────────────────────────╯
+    /// ╭───────────────────────────────────────────────────────────────────────────╮
+    /// │                                                                           │
+    /// │ █▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█    project  general_chat               │
+    /// │ ▄█ █ ▀ █ █▀█ █▀▄  █  █▄▄ █▄█ █▄█ █▀▀    agent    http://localhost:38540/v1  │
+    /// │ Local AI assistant · ? for shortcuts    version  CLI 1.0.14 · agent 1.2.7   │
+    /// │                                                                           │
+    /// ╰───────────────────────────────────────────────────────────────────────────╯
     /// ```
     fn welcome(&self, width: u16) -> Vec<Line<'static>> {
         let width = width as usize;
         let border = dim();
-        let account = self.account.clone().unwrap_or_else(|| "not signed in · /login".to_string());
         let project = self.project.as_ref().map_or("…".to_string(), |(_, name)| name.clone());
         let right = [
-            ("account", account),
             ("project", project),
-            ("agent", crate::base_url().trim_start_matches("http://").to_string()),
-            ("version", format!("cli {} · SLP {}", env!("CARGO_PKG_VERSION"), framework::VERSION)),
+            // The endpoint the chat and every call go to.
+            ("agent", crate::api_url()),
+            ("version", format!("CLI {} · agent {}", env!("CARGO_PKG_VERSION"), framework::VERSION)),
         ];
         // Styled per span: the rows are taken apart into spans below.
         let mut left: Vec<Line<'static>> = BANNER
@@ -1190,6 +1179,8 @@ impl App {
                 Span::raw(value.to_string()),
             ])
         };
+        // Room inside the border at most; the card itself is only as wide as
+        // what it holds.
         let inner = width.saturating_sub(4);
         // Two columns when there's room, else the details under the logo.
         let body: Vec<Line<'static>> = if inner >= left_width + 30 {
@@ -1212,7 +1203,10 @@ impl App {
             body
         };
 
-        let mut lines = vec![Line::styled(format!("╭{}╮", "─".repeat(width.saturating_sub(2))), border)];
+        // Shrunk to its content, with two columns of margin on the right.
+        let inner = (body.iter().map(Line::width).max().unwrap_or(0) + 2).min(inner);
+        let rule = "─".repeat(inner + 2);
+        let mut lines = vec![Line::styled(format!("╭{}╮", rule), border)];
         let blank = Line::default();
         for line in std::iter::once(&blank).chain(body.iter()).chain(std::iter::once(&blank)) {
             let used = line.width().min(inner);
@@ -1222,7 +1216,7 @@ impl App {
             spans.push(Span::styled(" │", border));
             lines.push(Line::from(spans));
         }
-        lines.push(Line::styled(format!("╰{}╯", "─".repeat(width.saturating_sub(2))), border));
+        lines.push(Line::styled(format!("╰{}╯", rule), border));
         lines
     }
 
@@ -1508,12 +1502,9 @@ fn error_line(text: &str) -> Line<'static> {
     ])
 }
 
-/// Re-read who the agent is signed in as and, with a project, its models:
-/// signing in or out changes which ones are accessible.
-fn refresh_account(client: &Client, tx: &UnboundedSender<AppEvent>, project: Option<(String, String)>) {
-    if let Ok(account) = crate::signed_in_as(client) {
-        let _ = tx.send(AppEvent::Account(account));
-    }
+/// Re-read the project's models: signing in or out changes which ones are
+/// accessible.
+fn refresh_models(client: &Client, tx: &UnboundedSender<AppEvent>, project: Option<(String, String)>) {
     if let Some((id, _)) = project {
         let _ = tx.send(AppEvent::Models(crate::model_rows(client, &id)));
     }
@@ -1737,10 +1728,16 @@ mod tests {
         let rows: Vec<&str> = text.lines().collect();
         // Short: the banner sits just above the prompt.
         let banner = rows.iter().position(|r| r.contains("█▀ █▀▄▀█")).expect(&text);
-        assert!(rows[banner].contains("account  not signed in"), "{}", text);
-        assert!(rows[banner + 1].contains("project  Default"), "{}", text);
-        assert!(rows[banner + 3].contains(&format!("version  cli {}", env!("CARGO_PKG_VERSION"))), "{}", text);
-        assert!(rows[banner - 2].starts_with('╭') && rows[banner + 5].starts_with('╰'), "{}", text);
+        assert!(rows[banner].contains("project  Default"), "{}", text);
+        assert!(rows[banner + 1].contains("agent    http://localhost:"), "{}", text);
+        assert!(rows[banner + 1].contains("/v1"), "{}", text);
+        assert!(rows[banner + 2].contains(&format!("version  CLI {} · agent", env!("CARGO_PKG_VERSION"))), "{}", text);
+        assert!(!text.contains("account"), "{}", text);
+        // Only as wide as what it holds, not the screen.
+        let wide = screen(&app, 120, 24);
+        let top = wide.lines().find(|r| r.starts_with('╭')).expect(&wide);
+        assert!(top.ends_with('╮') && top.chars().count() < 100, "{}", wide);
+        assert!(rows[banner - 2].starts_with('╭') && rows[banner + 4].starts_with('╰'), "{}", text);
         for i in 0..40 {
             app.entries.push(Entry::Notice(format!("line {}", i)));
         }
@@ -1759,7 +1756,6 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         app.project = Some(("p1".into(), "general_chat".into()));
-        app.account = Some("you@example.com".into());
         app.entries.push(Entry::User("What are three things to do in Madrid? Keep it short.".into()));
         app.entries.push(Entry::Reply(Reply {
             warnings: Vec::new(),

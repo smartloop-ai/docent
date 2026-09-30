@@ -743,17 +743,6 @@ fn logout(client: &Client) {
     println!("Logged out");
 }
 
-/// Who the agent is signed in as, from `/v1/auth/status`: "Name <email>",
-/// or None when it isn't.
-pub fn signed_in_as(client: &Client) -> Result<Option<String>, String> {
-    let status = request_json(client, format!("{}/auth/status", api_url()), "read sign-in status")?;
-    let user = &status["user"];
-    Ok(user["email"].as_str().map(|email| match user["name"].as_str() {
-        Some(name) if !name.is_empty() => format!("{} <{}>", name, email),
-        _ => email.to_string(),
-    }))
-}
-
 pub fn try_logout(client: &Client) -> Result<(), String> {
     let response = client
         .delete(format!("{}/auth/token", api_url()))
