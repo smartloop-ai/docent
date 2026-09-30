@@ -313,6 +313,30 @@ fn create_project(client: &Client, name: String, description: Option<String>) {
     report_created(response, "Project created");
 }
 
+/// Upload a file for a chat message to reference: the agent turns documents
+/// into markdown and returns the asset's id for `message.attachments`.
+pub fn upload_asset(client: &Client, path: &std::path::Path) -> Result<String, String> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+    let form = multipart::Form::new()
+        .file("file", path)
+        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let response = client
+        .post(format!("{}/assets", api_url()))
+        .multipart(form)
+        .send()
+        .map_err(|e| format!("Failed to upload {}: {}", name, e))?;
+    if !response.status().is_success() {
+        return Err(error_message(&format!("upload {}", name), response));
+    }
+    let asset: serde_json::Value = response
+        .json()
+        .map_err(|e| format!("Failed to parse response as JSON: {}", e))?;
+    asset["asset_id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("The agent returned no asset id for {}", name))
+}
+
 /// Create a project from a zip archive produced by an earlier export.
 fn import_project(client: &Client, path: String, name: Option<String>) {
     let mut form = multipart::Form::new()

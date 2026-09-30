@@ -67,15 +67,16 @@ pub fn new_session_id() -> String {
 pub async fn stream_turn(
     client: &OpenAIClient<OpenAIConfig>,
     message: &str,
+    attachments: &[String],
     project_id: &str,
     session_id: &str,
     on: &mut (dyn FnMut(ChatEvent) + Send),
 ) -> Result<TurnStats, String> {
-    match stream_turn_once(client, message, project_id, session_id, on).await {
+    match stream_turn_once(client, message, attachments, project_id, session_id, on).await {
         Ok(stats) => Ok(stats),
         Err((e, tokens)) if tokens == 0 => {
             on(ChatEvent::Retrying(e));
-            stream_turn_once(client, message, project_id, session_id, on)
+            stream_turn_once(client, message, attachments, project_id, session_id, on)
                 .await
                 .map_err(|(e, _)| e)
         }
@@ -86,6 +87,7 @@ pub async fn stream_turn(
 async fn stream_turn_once(
     client: &OpenAIClient<OpenAIConfig>,
     message: &str,
+    attachments: &[String],
     project_id: &str,
     session_id: &str,
     on: &mut (dyn FnMut(ChatEvent) + Send),
@@ -93,9 +95,15 @@ async fn stream_turn_once(
     // The server-side orchestrator always picks the model that actually
     // serves the turn; "sl-mini" here just names the entry point it routes
     // through, not a choice the caller gets to make.
+    // Files uploaded as assets ride along by id; the agent puts their
+    // contents in front of the message.
+    let mut user = serde_json::json!({"role": "user", "content": message});
+    if !attachments.is_empty() {
+        user["attachments"] = serde_json::json!(attachments);
+    }
     let body = serde_json::json!({
         "model": "sl-mini",
-        "messages": [{"role": "user", "content": message}],
+        "messages": [user],
         "session_id": session_id,
         "project_id": project_id,
         "stream": true,
@@ -247,7 +255,7 @@ async fn print_turn(
             ChatEvent::Retrying(e) => print_status("error", &format!("connection dropped, retrying: {}", e)),
         }
     };
-    let stats = stream_turn(client, message, project_id, session_id, &mut on).await?;
+    let stats = stream_turn(client, message, &[], project_id, session_id, &mut on).await?;
 
     let mut out = std::io::stdout().lock();
     if !at_line_start {
