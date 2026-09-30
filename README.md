@@ -202,7 +202,9 @@ terminal's OSC 52 support). Hold Option (macOS) or Shift (most Linux
 terminals) for the terminal's own selection instead. Drop a file on the terminal (or paste
 its path) to attach it: it shows in the prompt as `[Image 1]` or `[Doc 1]`,
 Backspace removes it, and it's uploaded with the message so the answer can
-draw on it. Documents (PDF, Word, PowerPoint, Excel, CSV, text) are read as
+draw on it. Shift+Enter starts a new line, say for the question under an
+attachment, where the terminal reports it; Alt+Enter and Ctrl+J work in any
+terminal. The prompt grows to six lines. Documents (PDF, Word, PowerPoint, Excel, CSV, text) are read as
 text. `Ctrl+O` lists the project's models, where Enter
 enables one (downloading it first, with its progress in the status pane) or
 disables it. Typing `/` lists the commands under the prompt, narrowing
