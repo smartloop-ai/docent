@@ -213,11 +213,15 @@ terminal. The prompt grows to six lines; while empty it reads "Ask anything, or 
 (PDF, Word .docx, PowerPoint .pptx, Excel .xlsx, CSV, text, HTML, JSON) are read as
 text. Any other file, a HEIC photo or an old .doc say, is turned away with a note in the chat. `Ctrl+O` lists the project's models, where Enter
 enables one (downloading it first, with its progress in the status pane) or
-disables it. Typing `/` lists the commands under the prompt, narrowing
+disables it. `Ctrl+S` turns web search on or off for the project, as
+Cmd/Ctrl+Alt+S does in the studio app. Typing `/` lists the commands under the prompt, narrowing
 as you type: ↑/↓ picks one, Tab completes it and Enter runs it. Commands: `/login` (sign in
 in the browser; `/login --token` pastes a token, masked, instead), `/logout`, `/models`,
-`/status` (account, model, agent and versions), `/clear` (clear the chat and start a new session), `/help` and
-`/quit`. On exit the session id is printed, to resume with `--session`.
+`/status` (account, model, agent and versions), `/usage` (web searches left this month as a
+bar, plus the last 7 days' tokens and the estimated cost saved against a hosted model), `/upgrade` (opens https://app.smartloop.ai/upgrade; the Pro plan unlocks 1,000 web
+searches a month, and a subscribed account manages billing there), `/clear` (clear the chat and start a new session), `/help` and
+`/quit`. Once 70% of the month's web searches are used, the footer says how much of
+the allocated AI search budget is gone and how many are left, and points at `/upgrade`. On exit the session id is printed, to resume with `--session`.
 
 Pass an initial prompt to send immediately:
 

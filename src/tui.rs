@@ -47,6 +47,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::chat::{self, ChatEvent, TurnStats};
 use crate::progress::{self, Steps, format_duration, format_size};
+use crate::usage::{SearchUsage, TokenStats};
 use crate::{ModelRow, framework};
 
 const LABEL_WIDTH: usize = 28;
@@ -61,6 +62,8 @@ const PROMPT_LINES: u16 = 6;
 /// Lines one wheel notch scrolls, and one page key.
 const WHEEL_LINES: u16 = 3;
 const PAGE_LINES: u16 = 10;
+/// Cells in `/usage`'s bar.
+const USAGE_BAR: usize = 30;
 /// A bar turning in brackets.
 const SPINNER: [&str; 4] = ["[-]", "[\\]", "[|]", "[/]"];
 
@@ -124,6 +127,11 @@ enum AppEvent {
     Notice(String),
     Error(String),
     Status(Vec<(String, String)>),
+    /// The account's web search usage; `None` when signed out.
+    Usage(Option<SearchUsage>),
+    /// The project's web search switch, read or just toggled; `toggled`
+    /// says whether to announce it.
+    WebSearch { enabled: bool, toggled: bool },
 }
 
 /// One `Steps` call, carried from a worker thread to the app.
@@ -460,6 +468,9 @@ enum Overlay {
     Help,
     /// `/status`: rows fill in once the agent answers.
     Status(Option<Vec<(String, String)>>),
+    /// `/usage`: this month's web search allowance, re-read on opening
+    /// (`loading` until the platform answers), and the week's tokens.
+    Usage { loading: bool, tokens: TokenStats },
 }
 
 enum Phase {
@@ -523,6 +534,10 @@ struct App {
     attachments: Vec<Attachment>,
     /// The highlighted slash-command hint while typing a command.
     hint_at: usize,
+    /// This month's web search usage, shown in the footer once known.
+    search: Option<SearchUsage>,
+    /// The project's web search switch (ctrl+s), once read.
+    web_search: Option<bool>,
     quit: bool,
 }
 
@@ -558,6 +573,8 @@ impl App {
             token_entry: false,
             attachments: Vec::new(),
             hint_at: 0,
+            search: None,
+            web_search: None,
             quit: false,
         }
     }
@@ -614,6 +631,14 @@ impl App {
     fn load_projects(&self) {
         self.spawn(|client, tx| {
             let _ = tx.send(AppEvent::Projects(crate::try_fetch_projects(&client)));
+        });
+    }
+
+    /// Re-read the web search usage from the platform. Also the last step
+    /// of each turn, which may have spent a search.
+    fn load_usage(&self) {
+        self.spawn(|client, tx| {
+            let _ = tx.send(AppEvent::Usage(crate::usage::fetch(&client)));
         });
     }
 
@@ -704,6 +729,7 @@ impl App {
                 }
                 self.phase = Phase::Connecting;
                 self.load_projects();
+                self.load_usage();
             }
             AppEvent::SetupDone(Err(e)) => self.setup.failure = Some(e),
             AppEvent::Projects(result) => self.projects_loaded(result),
@@ -724,6 +750,7 @@ impl App {
                         Err(e) => reply.ended = Some(e),
                     }
                 }
+                self.load_usage();
             }
             AppEvent::Download(id, StepEvent::Warn(text)) => {
                 let model = self.downloads[id].model.clone();
@@ -748,6 +775,19 @@ impl App {
                 }
             }
             AppEvent::Error(text) => self.entries.push(Entry::Error(text)),
+            AppEvent::Usage(usage) => {
+                self.search = usage;
+                if let Overlay::Usage { loading, .. } = &mut self.overlay {
+                    *loading = false;
+                }
+            }
+            AppEvent::WebSearch { enabled, toggled } => {
+                self.web_search = Some(enabled);
+                if toggled {
+                    let text = if enabled { "Web search on" } else { "Web search off; ctrl+s turns it back on" };
+                    self.entries.push(Entry::Notice(text.to_string()));
+                }
+            }
         }
     }
 
@@ -780,6 +820,7 @@ impl App {
         match chosen {
             Some(project) => {
                 self.project = Some(project);
+                self.load_web_search();
                 if let Some(prompt) = self.pending_prompt.take() {
                     self.send_turn(prompt.clone(), prompt, Vec::new());
                 }
@@ -887,12 +928,13 @@ impl App {
                 return;
             }
             (KeyCode::Char('o'), true) => return self.open_models(),
+            (KeyCode::Char('s'), true) => return self.toggle_web_search(),
             _ => {}
         }
         match self.overlay {
             Overlay::None => self.key_chat(key),
             Overlay::Models { .. } => self.key_models(key),
-            Overlay::Help | Overlay::Status(_) => {
+            Overlay::Help | Overlay::Status(_) | Overlay::Usage { .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                     self.overlay = Overlay::None;
                 }
@@ -912,6 +954,37 @@ impl App {
         self.overlay = Overlay::Status(None);
         self.spawn(|client, tx| {
             let _ = tx.send(AppEvent::Status(crate::status_rows(&client)));
+        });
+    }
+
+    fn open_usage(&mut self) {
+        self.overlay = Overlay::Usage { loading: true, tokens: TokenStats::load() };
+        self.load_usage();
+    }
+
+    /// ctrl+s: flip the project's web search switch, as the studio app's
+    /// Cmd/Ctrl+Alt+S does.
+    fn toggle_web_search(&mut self) {
+        let Some((project, _)) = self.project.clone() else { return };
+        let current = self.web_search;
+        self.spawn(move |client, tx| {
+            let current = match current {
+                Some(on) => Ok(on),
+                None => crate::web_search_enabled(&client, &project),
+            };
+            let _ = tx.send(match current.and_then(|on| crate::set_web_search(&client, &project, !on)) {
+                Ok(enabled) => AppEvent::WebSearch { enabled, toggled: true },
+                Err(e) => AppEvent::Error(e),
+            });
+        });
+    }
+
+    fn load_web_search(&self) {
+        let Some((project, _)) = self.project.clone() else { return };
+        self.spawn(move |client, tx| {
+            if let Ok(enabled) = crate::web_search_enabled(&client, &project) {
+                let _ = tx.send(AppEvent::WebSearch { enabled, toggled: false });
+            }
         });
     }
 
@@ -1133,12 +1206,18 @@ impl App {
                         Err(e) => AppEvent::Error(e),
                     });
                     refresh_models(&client, &tx, project);
+                    let _ = tx.send(AppEvent::Usage(crate::usage::fetch(&client)));
                 })
             }
             "/quit" | "/exit" | "/q" | "exit" => self.quit = true,
             "/models" => self.open_models(),
             "/help" | "/?" => self.overlay = Overlay::Help,
             "/status" => self.open_status(),
+            "/usage" => self.open_usage(),
+            "/upgrade" => {
+                crate::open_browser(crate::UPGRADE_URL);
+                self.entries.push(Entry::Notice(format!("Opening {} in the browser", crate::UPGRADE_URL)));
+            }
             // A clean slate: the conversation goes, and so does the agent's
             // memory of it, with a new session.
             "/clear" => {
@@ -1185,6 +1264,7 @@ impl App {
                 Err(e) => AppEvent::Error(e),
             });
             refresh_models(&client, &tx, project);
+            let _ = tx.send(AppEvent::Usage(crate::usage::fetch(&client)));
         });
     }
 
@@ -1203,6 +1283,7 @@ impl App {
                 Err(e) => AppEvent::Error(e),
             });
             refresh_models(&client, &tx, project);
+            let _ = tx.send(AppEvent::Usage(crate::usage::fetch(&client)));
         });
     }
 
@@ -1274,6 +1355,10 @@ impl App {
                 let block = panel(&bar_hints(&[("esc", "close")]));
                 frame.render_widget(Paragraph::new(self.status_panel_lines(rows)).block(block), footer);
             }
+            Overlay::Usage { loading, tokens } => {
+                let block = panel(&bar_hints(&[("esc", "close")]));
+                frame.render_widget(Paragraph::new(self.usage_panel_lines(*loading, tokens)).block(block), footer);
+            }
         }
     }
 
@@ -1285,6 +1370,7 @@ impl App {
             Overlay::Models { .. } => 1,
             Overlay::Help => help_lines().len(),
             Overlay::Status(rows) => self.status_panel_lines(rows).len(),
+            Overlay::Usage { loading, tokens } => self.usage_panel_lines(*loading, tokens).len(),
         };
         // And the row of keys under them.
         Some(rows as u16 + 1)
@@ -1579,11 +1665,48 @@ impl App {
             hints.extend(key_hints(&[("pgdn", "scroll down"), ("end", "latest")]));
         } else if self.token_entry {
             hints.extend(key_hints(&[("enter", "sign in"), ("esc", "cancel")]));
+        } else if let Some(warning) = self.search_warning(area.width.saturating_sub(2) as usize) {
+            // Takes the key hints' place, so a narrow terminal can't hide it.
+            hints.extend(warning);
         } else {
             // The rest live under help, as in Claude Code.
             hints.extend(key_hints(&[("enter", "send"), ("esc", "interrupt"), ("?", "shortcuts")]));
         }
         frame.render_widget(Paragraph::new(Line::from(hints)), area);
+    }
+
+    /// From 70% of the month's web searches, the footer says how much of the
+    /// budget is gone, and where to get more. It stays one row: the longest
+    /// wording that fits in `width` cells, down to a few words.
+    fn search_warning(&self, width: usize) -> Option<Vec<Span<'static>>> {
+        let usage = self.search.as_ref().filter(|u| u.nearly_exhausted())?;
+        let (percent, left) = (usage.percent_used(), usage.remaining().unwrap_or_default());
+        let searches = if left == 1 { "search" } else { "searches" };
+        let wordings = if usage.exhausted() {
+            vec![
+                "You are out of AI search credits for this month".to_string(),
+                "Out of AI search credits".to_string(),
+                "Out of search credits".to_string(),
+            ]
+        } else {
+            vec![
+                format!("You have used {}% of your allocated AI search budget · {} {} left", percent, left, searches),
+                format!("{}% of AI search budget used · {} left", percent, left),
+                format!("AI search {}% used", percent),
+            ]
+        };
+        let upgrade = if usage.plan == "free" { " · /upgrade".chars().count() } else { 0 };
+        let text = wordings
+            .iter()
+            .find(|w| 2 + w.chars().count() + upgrade <= width)
+            .unwrap_or(&wordings[wordings.len() - 1])
+            .clone();
+        let mut spans = vec![Span::styled("⚠ ", Style::new().fg(Color::Yellow)), Span::styled(text, Style::new().fg(Color::Yellow))];
+        if upgrade > 0 {
+            spans.push(Span::styled(" · ", dim()));
+            spans.push(Span::styled("/upgrade", key_style()));
+        }
+        Some(spans)
     }
 
     /// The project's models as a list, like Claude Code's model picker:
@@ -1644,6 +1767,99 @@ impl App {
         all.into_iter()
             .map(|(label, value)| Line::from(vec![Span::styled(format!(" {:<10}", label), dim()), Span::raw(value)]))
             .collect()
+    }
+
+    /// `/usage`: how many web searches are left this month, as a bar that
+    /// empties as they're spent, then the week's tokens and what they'd
+    /// have cost on a hosted model, as on the web app's dashboard.
+    ///
+    /// ```text
+    ///  Web search  ███████████████████████░░░░░░░  38 left of 50
+    ///              12 used · free plan · resets 2026-11-01
+    ///              /upgrade to Pro for 1,000 searches a month
+    ///
+    ///  Tokens      45,210 in the last 7 days  ▁▁▃▂█▅▁
+    ///              40,120 in · 5,090 out · on this machine
+    ///
+    ///  Cost saved  $0.1512 in the last 7 days
+    ///              vs. a hosted frontier model at $2.50/M in, $10/M out
+    /// ```
+    fn usage_panel_lines(&self, loading: bool, tokens: &TokenStats) -> Vec<Line<'static>> {
+        let mut lines = self.search_usage_lines(loading);
+        let label = |text: &str| Span::styled(format!(" {:<12}", text), dim());
+        let indent = || Span::raw(format!(" {:<12}", ""));
+        let days = format!(" in the last {} days", crate::usage::TOKEN_DAYS);
+        // A blank line between sections, so each reads on its own.
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            label("Tokens"),
+            Span::styled(crate::usage::thousands(tokens.total()), key_style()),
+            Span::styled(days.clone(), dim()),
+            Span::raw(format!("  {}", tokens.sparkline())),
+        ]));
+        lines.push(Line::from(vec![
+            indent(),
+            Span::styled(
+                format!(
+                    "{} in · {} out · on this machine",
+                    crate::usage::thousands(tokens.prompt()),
+                    crate::usage::thousands(tokens.completion())
+                ),
+                dim(),
+            ),
+        ]));
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            label("Cost saved"),
+            Span::styled(format!("${:.4}", tokens.saved()), key_style()),
+            Span::styled(days, dim()),
+        ]));
+        lines.push(Line::from(vec![
+            indent(),
+            Span::styled("vs. a hosted frontier model at $2.50/M in, $10/M out", dim()),
+        ]));
+        lines
+    }
+
+    fn search_usage_lines(&self, loading: bool) -> Vec<Line<'static>> {
+        let label = || Span::styled(format!(" {:<12}", "Web search"), dim());
+        let indent = || Span::raw(format!(" {:<12}", ""));
+        let switch = (self.web_search == Some(false)).then(|| {
+            Line::from(vec![indent(), Span::styled("off for this project · ctrl+s turns it on", dim())])
+        });
+        let Some(usage) = self.search.as_ref() else {
+            let text = if loading {
+                format!("asking api.smartloop.ai {}", self.spinner())
+            } else {
+                "sign in with /login to see your usage".to_string()
+            };
+            return std::iter::once(Line::from(vec![label(), Span::styled(text, dim())])).chain(switch).collect();
+        };
+        let mut lines = Vec::new();
+        match (usage.limit, usage.remaining()) {
+            (Some(limit), Some(left)) => {
+                // The terminal's own text color, so the bar reads on a light
+                // theme as well as a dark one.
+                let fraction = if limit == 0 { 0.0 } else { left as f64 / limit as f64 };
+                lines.push(Line::from(vec![
+                    label(),
+                    Span::raw(progress::bar(fraction, USAGE_BAR)),
+                    Span::styled(format!("  {} left", left), key_style()),
+                    Span::styled(format!(" of {}", limit), dim()),
+                ]));
+            }
+            _ => lines.push(Line::from(vec![label(), Span::styled("unlimited", key_style())])),
+        }
+        lines.push(Line::from(vec![indent(), Span::styled(usage.detail(), dim())]));
+        if usage.plan == "free" {
+            lines.push(Line::from(vec![
+                indent(),
+                Span::styled("/upgrade", key_style()),
+                Span::styled(" to Pro for 1,000 searches a month", dim()),
+            ]));
+        }
+        lines.extend(switch);
+        lines
     }
 
     fn spinner(&self) -> &'static str {
@@ -1839,12 +2055,14 @@ fn is_document(path: &std::path::Path) -> bool {
 
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
-const COMMANDS: [(&str, &str); 7] = [
+const COMMANDS: [(&str, &str); 9] = [
     ("/help", "shortcuts and commands"),
     ("/login", "sign in in the browser (--token to paste one)"),
     ("/logout", "log out"),
     ("/models", "enable, disable and download models"),
     ("/status", "account, model, agent and versions"),
+    ("/usage", "web searches left, tokens and cost saved"),
+    ("/upgrade", "Pro plan: 1,000 web searches a month"),
     ("/clear", "clear the chat and start a new session"),
     ("/quit", "quit"),
 ];
@@ -1861,9 +2079,12 @@ fn help_lines() -> Vec<Line<'static>> {
         ("drag", "select and copy to the clipboard"),
         ("drop a file", "attach an image or document as [Image 1] or [Doc 1]"),
         ("[ctrl+o] /models", "models: enable, disable, download"),
+        ("[ctrl+s]", "turn web search on or off for the project"),
         ("/status", "account, model, agent and versions"),
         ("/login", "sign in in the browser (--token to paste one)"),
         ("/logout", "log out"),
+        ("/usage", "web searches left, tokens and cost saved"),
+        ("/upgrade", "Pro plan: 1,000 web searches a month"),
         ("/clear", "clear the chat and start a new session"),
         ("[ctrl+c] /quit", "quit"),
     ];
@@ -2118,6 +2339,66 @@ mod tests {
         assert!(screen(&app, 80, 24).contains("Copied 25 characters"));
         assert_eq!(base64(b"hi!"), "aGkh");
         assert_eq!(base64(b"hi"), "aGk=");
+    }
+
+    #[test]
+    fn footer_warns_from_70_percent_of_searches() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        let usage = |used| SearchUsage { used, limit: Some(50), plan: "free".into(), resets_on: None };
+        app.apply(AppEvent::Usage(Some(usage(34))));
+        assert!(!screen(&app, 100, 24).contains("AI search budget"));
+        app.apply(AppEvent::Usage(Some(usage(35))));
+        let text = screen(&app, 100, 24);
+        assert!(text.contains("You have used 70% of your allocated AI search budget · 15 searches left · /upgrade"), "{}", text);
+        // The free plan's 4 of 5: in full where it fits.
+        let five = SearchUsage { used: 4, limit: Some(5), plan: "free".into(), resets_on: None };
+        app.apply(AppEvent::Usage(Some(five)));
+        let text = screen(&app, 100, 24);
+        assert!(text.contains("You have used 80% of your allocated AI search budget · 1 search left · /upgrade"), "{}", text);
+        // Narrower windows get shorter wording rather than a cut-off line.
+        let text = screen(&app, 60, 24);
+        assert!(text.contains("⚠ 80% of AI search budget used · 1 left · /upgrade"), "{}", text);
+        let text = screen(&app, 40, 24);
+        assert!(text.contains("⚠ AI search 80% used · /upgrade"), "{}", text);
+        app.apply(AppEvent::Usage(Some(usage(50))));
+        assert!(screen(&app, 120, 24).contains("⚠ You are out of AI search credits for this month · /upgrade"));
+        assert!(screen(&app, 40, 24).contains("⚠ Out of AI search credits · /upgrade"));
+    }
+
+    #[test]
+    fn usage_shows_whats_left_as_a_bar() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.overlay = Overlay::Usage { loading: true, tokens: TokenStats { days: vec![(0, 0), (0, 0), (0, 0), (0, 0), (500, 50), (0, 0), (1_000_000, 100_000)] } };
+        assert!(screen(&app, 80, 24).contains("asking api.smartloop.ai"));
+        app.apply(AppEvent::Usage(Some(SearchUsage {
+            used: 12,
+            limit: Some(50),
+            plan: "free".into(),
+            resets_on: Some("2026-11-01".into()),
+        })));
+        let text = screen(&app, 80, 24);
+        for expected in [
+            "Web search",
+            "38 left of 50",
+            "12 used · free plan · resets 2026-11-01",
+            "/upgrade to Pro for 1,000 searches a month",
+            "Tokens      1,100,550 in the last 7 days  ▁▁▁▁▂▁█",
+            "1,000,500 in · 100,050 out · on this machine",
+            "Cost saved  $3.5018 in the last 7 days",
+        ] {
+            assert!(text.contains(expected), "{}\n{}", expected, text);
+        }
+        // ctrl+s turned search off: say so, and how to turn it back on.
+        app.apply(AppEvent::WebSearch { enabled: false, toggled: true });
+        let text = screen(&app, 80, 30);
+        assert!(text.contains("off for this project · ctrl+s turns it on"), "{}", text);
+        // Signed out: nothing to show but how to sign in.
+        app.apply(AppEvent::Usage(None));
+        assert!(screen(&app, 80, 24).contains("sign in with /login"));
     }
 
     #[test]

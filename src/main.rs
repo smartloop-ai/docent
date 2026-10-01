@@ -11,6 +11,7 @@ mod chat;
 mod framework;
 mod progress;
 mod tui;
+mod usage;
 
 const LOGO: &str = r#"
 █▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█
@@ -639,6 +640,28 @@ pub fn patch_project_model(client: &Client, project_id: &str, name: &str, enable
     Ok(())
 }
 
+/// Whether web search is on for the project: the agent's own per-project
+/// switch, which the studio app toggles with Cmd/Ctrl+Alt+S.
+pub fn web_search_enabled(client: &Client, project_id: &str) -> Result<bool, String> {
+    let reply = request_json(client, format!("{}/{}/websearch", projects_url(), project_id), "read web search")?;
+    Ok(reply["enabled"].as_bool().unwrap_or_default())
+}
+
+/// Turn web search on or off for the project; returns the new state.
+pub fn set_web_search(client: &Client, project_id: &str, enabled: bool) -> Result<bool, String> {
+    let action = if enabled { "turn on web search" } else { "turn off web search" };
+    let response = client
+        .patch(format!("{}/{}/websearch", projects_url(), project_id))
+        .json(&serde_json::json!({ "enabled": enabled }))
+        .send()
+        .map_err(|e| format!("Failed to {}: {}", action, e))?;
+    if !response.status().is_success() {
+        return Err(error_message(action, response));
+    }
+    let reply: serde_json::Value = response.json().map_err(|e| format!("Failed to {}: {}", action, e))?;
+    Ok(reply["enabled"].as_bool().unwrap_or(enabled))
+}
+
 /// Same sequence as the studio app's model toggle: weights are fetched
 /// through `/v1/init` (scoped to the project) when they aren't on disk yet,
 /// and only then is the model switched on, so it is never enabled without
@@ -783,7 +806,7 @@ fn logged_in_as(status: &serde_json::Value) -> Option<String> {
 }
 
 /// The web app the browser signs in on, overridable for staging.
-fn app_url() -> String {
+pub fn app_url() -> String {
     std::env::var("SMARTLOOP_APP_URL")
         .unwrap_or_else(|_| "https://app.smartloop.ai".to_string())
         .trim_end_matches('/')
@@ -831,8 +854,13 @@ pub fn browser_login(client: &Client, on_url: impl FnOnce(&str)) -> Result<Strin
     Err("Timed out waiting for the browser sign-in".to_string())
 }
 
+/// Where `/upgrade` goes: the web app's checkout hand-off, which sends a
+/// free account to Stripe checkout and a subscribed one to its billing
+/// portal, signing in first if needed.
+pub const UPGRADE_URL: &str = "https://app.smartloop.ai/upgrade";
+
 /// Open `url` in the default browser. Best effort: the URL is shown too.
-fn open_browser(url: &str) {
+pub fn open_browser(url: &str) {
     let mut command = if cfg!(target_os = "macos") {
         std::process::Command::new("open")
     } else if cfg!(windows) {
