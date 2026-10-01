@@ -209,8 +209,9 @@ its path) to attach it: it shows in the prompt as `[Image 1]` or `[Doc 1]`,
 Backspace removes it, and it's uploaded with the message so the answer can
 draw on it. Shift+Enter starts a new line, say for the question under an
 attachment, where the terminal reports it; Alt+Enter and Ctrl+J work in any
-terminal. The prompt grows to six lines; while empty it reads "Ask anything, or drop a file to attach it". Documents (PDF, Word, PowerPoint, Excel, CSV, text) are read as
-text; any other file is turned away with a note in the chat. `Ctrl+O` lists the project's models, where Enter
+terminal. The prompt grows to six lines; while empty it reads "Ask anything, or drop a file to attach it". Images can be PNG or JPEG; documents
+(PDF, Word .docx, PowerPoint .pptx, Excel .xlsx, CSV, text, HTML, JSON) are read as
+text. Any other file, a HEIC photo or an old .doc say, is turned away with a note in the chat. `Ctrl+O` lists the project's models, where Enter
 enables one (downloading it first, with its progress in the status pane) or
 disables it. Typing `/` lists the commands under the prompt, narrowing
 as you type: ↑/↓ picks one, Tab completes it and Enter runs it. Commands: `/login` (sign in

@@ -1038,7 +1038,7 @@ impl App {
                     if !is_image(&path) && !is_document(&path) {
                         let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
                         self.entries.push(Entry::Error(format!(
-                            "Can't attach {}: only images and documents (PDF, Word, PowerPoint, Excel, CSV, text) are supported",
+                            "Can't attach {}: only PNG and JPEG images, and PDF, Word, PowerPoint, Excel, CSV, text, HTML and JSON documents",
                             name
                         )));
                         continue;
@@ -1827,13 +1827,14 @@ fn dropped_files(text: &str) -> Option<Vec<std::path::PathBuf>> {
 
 fn is_image(path: &std::path::Path) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
-    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "heic")
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg")
 }
 
-/// The documents the agent reads as text.
+/// The documents the agent reads as text; it has a parser for these and
+/// stores anything else as bytes the model never sees.
 fn is_document(path: &std::path::Path) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
-    matches!(ext.as_str(), "pdf" | "doc" | "docx" | "ppt" | "pptx" | "xls" | "xlsx" | "csv" | "txt" | "md" | "markdown")
+    matches!(ext.as_str(), "pdf" | "docx" | "pptx" | "xlsx" | "csv" | "txt" | "html" | "htm" | "json")
 }
 
 /// The slash commands, for hints as they're typed.
@@ -2219,6 +2220,12 @@ mod tests {
         assert_eq!(app.input, "compare [Image 1] ");
         assert_eq!(app.attachments.len(), 1);
         assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("Can't attach bundle.zip")));
+        // Nor an image the vision model can't read.
+        let heic = dir.join("IMG_0001.HEIC");
+        std::fs::write(&heic, b"heic").unwrap();
+        app.paste(&heic.display().to_string());
+        assert_eq!(app.attachments.len(), 1);
+        assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("Can't attach IMG_0001.HEIC")));
 
         // Plain text pastes as text.
         app.paste("these two");
