@@ -1035,6 +1035,14 @@ impl App {
         match dropped_files(text) {
             Some(paths) => {
                 for path in paths {
+                    if !is_image(&path) && !is_document(&path) {
+                        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+                        self.entries.push(Entry::Error(format!(
+                            "Can't attach {}: only images and documents (PDF, Word, PowerPoint, Excel, CSV, text) are supported",
+                            name
+                        )));
+                        continue;
+                    }
                     let kind = if is_image(&path) { "Image" } else { "Doc" };
                     let n = self.attachments.iter().filter(|a| a.label.starts_with(&format!("[{} ", kind))).count() + 1;
                     let label = format!("[{} {}]", kind, n);
@@ -1113,8 +1121,9 @@ impl App {
         let command = words.next().unwrap_or_default();
         match command {
             "/login" => match words.next() {
+                None => self.browser_login(),
+                Some("--token") => self.token_entry = true,
                 Some(token) => self.login(token.to_string()),
-                None => self.token_entry = true,
             },
             "/logout" => {
                 let project = self.project.clone();
@@ -1180,6 +1189,23 @@ impl App {
     }
 
 
+    /// Sign in on app.smartloop.ai in the browser, then refresh the models
+    /// panel as a token sign-in does.
+    fn browser_login(&mut self) {
+        let project = self.project.clone();
+        self.spawn(move |client, tx| {
+            let notify = tx.clone();
+            let result = crate::browser_login(&client, |url| {
+                let _ = notify.send(AppEvent::Notice(format!("Sign in in the browser: {}", url)));
+            });
+            let _ = tx.send(match result {
+                Ok(who) => AppEvent::Notice(who),
+                Err(e) => AppEvent::Error(e),
+            });
+            refresh_models(&client, &tx, project);
+        });
+    }
+
     fn key_models(&mut self, key: KeyEvent) {
         let Overlay::Models { rows, selected } = &mut self.overlay else { return };
         let count = rows.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, Vec::len);
@@ -1195,7 +1221,7 @@ impl App {
                 let row = row.clone();
                 if !row.accessible {
                     self.entries.push(Entry::Error(format!(
-                        "{} needs a sign-in; run `smartloop login` first",
+                        "{} needs a sign-in; /login first",
                         row.name
                     )));
                 } else if row.enabled {
@@ -1503,7 +1529,12 @@ impl App {
                 let mark = if i == 0 { prompt.clone() } else { Span::raw(" ".repeat(indent as usize)) };
                 let offset = if i == row { Span::raw(col_text).width().saturating_sub(room) } else { 0 };
                 let visible: String = text.chars().skip(offset).collect();
-                shown.push(Line::from(vec![mark, Span::raw(visible)]));
+                let mut spans = vec![mark, Span::raw(visible)];
+                // Until something's typed, say what the prompt takes.
+                if input.is_empty() && !self.token_entry {
+                    spans.push(Span::styled("Ask anything, or drop a file to attach it", dim()));
+                }
+                shown.push(Line::from(spans));
                 if i == row && matches!(self.overlay, Overlay::None) {
                     let x = inner.x + indent + Span::raw(col_text).width().saturating_sub(offset) as u16;
                     let y = inner.y + (i - first) as u16;
@@ -1799,11 +1830,17 @@ fn is_image(path: &std::path::Path) -> bool {
     matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "heic")
 }
 
+/// The documents the agent reads as text.
+fn is_document(path: &std::path::Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+    matches!(ext.as_str(), "pdf" | "doc" | "docx" | "ppt" | "pptx" | "xls" | "xlsx" | "csv" | "txt" | "md" | "markdown")
+}
+
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
 const COMMANDS: [(&str, &str); 7] = [
     ("/help", "shortcuts and commands"),
-    ("/login", "login with a token"),
+    ("/login", "sign in in the browser (--token to paste one)"),
     ("/logout", "log out"),
     ("/models", "enable, disable and download models"),
     ("/status", "account, model, agent and versions"),
@@ -1821,10 +1858,10 @@ fn help_lines() -> Vec<Line<'static>> {
         ("[↑] [↓]", "earlier prompts"),
         ("wheel [pgup] [pgdn]", "scroll the conversation"),
         ("drag", "select and copy to the clipboard"),
-        ("drop a file", "attach it, shown as [Image 1] or [Doc 1]"),
+        ("drop a file", "attach an image or document as [Image 1] or [Doc 1]"),
         ("[ctrl+o] /models", "models: enable, disable, download"),
         ("/status", "account, model, agent and versions"),
-        ("/login", "login with a token"),
+        ("/login", "sign in in the browser (--token to paste one)"),
         ("/logout", "log out"),
         ("/clear", "clear the chat and start a new session"),
         ("[ctrl+c] /quit", "quit"),
@@ -1918,7 +1955,7 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         app.project = Some(("p1".into(), "Default".into()));
-        app.input = "/login".into();
+        app.input = "/login --token".into();
         app.submit();
         assert!(app.token_entry);
         app.input = "sl_secret".into();
@@ -2174,6 +2211,14 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(app.input, "compare [Image 1] ");
         assert_eq!(app.attachments.len(), 1);
+
+        // A file the agent can't read isn't attached, and says why.
+        let archive = dir.join("bundle.zip");
+        std::fs::write(&archive, b"zip").unwrap();
+        app.paste(&archive.display().to_string());
+        assert_eq!(app.input, "compare [Image 1] ");
+        assert_eq!(app.attachments.len(), 1);
+        assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("Can't attach bundle.zip")));
 
         // Plain text pastes as text.
         app.paste("these two");

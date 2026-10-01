@@ -33,10 +33,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Sign in by pasting a Smartloop token
+    /// Sign in through app.smartloop.ai in the browser, or with a token
     Login {
-        /// Token to store; prompts for it (input hidden) when omitted
-        #[arg(long)]
+        /// Sign in with a token instead; prompts for it (input hidden) when
+        /// given without a value
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
         token: Option<String>,
     },
     /// Clear stored credentials
@@ -706,10 +707,22 @@ fn disable_model(client: &Client, project_id: &str, name: &str) {
     println!("Model {} disabled", name);
 }
 
-/// Store a pasted token with the agent, which owns the credential store and
-/// uses it for every platform call.
+/// Sign in: in the browser by default, or with a token from `--token` or
+/// piped in. The agent owns the credential store and uses it for every
+/// platform call.
 fn login(client: &Client, token: Option<String>) {
-    let token = token.unwrap_or_else(|| {
+    if token.is_none() && std::io::stdin().is_terminal() {
+        let result = browser_login(client, |url| {
+            println!("Opening {} to sign in…", url);
+            println!("Waiting for the browser; ctrl+c to cancel");
+        });
+        match result {
+            Ok(who) => println!("{}", who),
+            Err(e) => fail(e),
+        }
+        return;
+    }
+    let token = token.filter(|t| !t.is_empty()).unwrap_or_else(|| {
         if !std::io::stdin().is_terminal() {
             let mut input = String::new();
             std::io::stdin()
@@ -749,11 +762,8 @@ pub fn try_login(client: &Client, token: &str) -> Result<String, String> {
 
     // The agent resolves the user with the token; no user means the platform
     // refused it.
-    match status["user"]["email"].as_str() {
-        Some(email) => Ok(match status["user"]["name"].as_str() {
-            Some(name) if !name.is_empty() => format!("Logged in as {} <{}>", name, email),
-            _ => format!("Logged in as {}", email),
-        }),
+    match logged_in_as(&status) {
+        Some(who) => Ok(who),
         None => {
             let _ = client
                 .delete(format!("{}/auth/token?type=developer_token", api_url()))
@@ -761,6 +771,83 @@ pub fn try_login(client: &Client, token: &str) -> Result<String, String> {
             Err("The token was not accepted".to_string())
         }
     }
+}
+
+/// "Logged in as …" for the user an `/auth/status` reply names.
+fn logged_in_as(status: &serde_json::Value) -> Option<String> {
+    let email = status["user"]["email"].as_str()?;
+    Some(match status["user"]["name"].as_str() {
+        Some(name) if !name.is_empty() => format!("Logged in as {} <{}>", name, email),
+        _ => format!("Logged in as {}", email),
+    })
+}
+
+/// The web app the browser signs in on, overridable for staging.
+fn app_url() -> String {
+    std::env::var("SMARTLOOP_APP_URL")
+        .unwrap_or_else(|_| "https://app.smartloop.ai".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// How long the browser has to finish signing in.
+const BROWSER_LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Sign in on app.smartloop.ai, as the desktop app does: its login page, in
+/// desktop mode, hands the tokens to the agent's `/v1/auth/callback` on this
+/// machine, so all that's left here is to wait for them to land. `on_url`
+/// is told the page opened, for when no browser comes up.
+pub fn browser_login(client: &Client, on_url: impl FnOnce(&str)) -> Result<String, String> {
+    let status = request_json(client, format!("{}/auth/status", api_url()), "read sign-in status")?;
+    if status["has_access_token"].as_bool().unwrap_or_default() {
+        if let Some(who) = logged_in_as(&status) {
+            return Ok(format!("{}; log out first to switch accounts", who));
+        }
+    }
+
+    // The page posts to 127.0.0.1, so it has to be an agent on this machine.
+    let base = base_url();
+    let host = base.split("://").nth(1).unwrap_or(&base);
+    let (name, port) = host.rsplit_once(':').unwrap_or((host, "80"));
+    if !matches!(name, "localhost" | "127.0.0.1") {
+        return Err(format!("Browser sign-in needs an agent on this machine, not {}; use --token", base));
+    }
+    let url = format!("{}/login?mode=desktop&port={}", app_url(), port);
+    on_url(&url);
+    open_browser(&url);
+
+    let started = std::time::Instant::now();
+    while started.elapsed() < BROWSER_LOGIN_TIMEOUT {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let Ok(status) = request_json(client, format!("{}/auth/status", api_url()), "read sign-in status") else {
+            continue;
+        };
+        if status["has_access_token"].as_bool().unwrap_or_default() {
+            if let Some(who) = logged_in_as(&status) {
+                return Ok(who);
+            }
+        }
+    }
+    Err("Timed out waiting for the browser sign-in".to_string())
+}
+
+/// Open `url` in the default browser. Best effort: the URL is shown too.
+fn open_browser(url: &str) {
+    let mut command = if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else if cfg!(windows) {
+        // Not `cmd /C start`, which would split the URL at its `&`.
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    let _ = command
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn logout(client: &Client) {

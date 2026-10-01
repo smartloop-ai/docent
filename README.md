@@ -99,10 +99,15 @@ smartloop agent stop
 smartloop login
 ```
 
-Paste your Smartloop token at the prompt (input is hidden). The agent stores it
-and uses it for every platform call. The command prints the account it signed
-in as, or fails if the token is rejected. Use `--token <token>` or pipe the
-token on stdin in scripts. `smartloop logout` clears the stored credentials.
+Opens app.smartloop.ai in the browser to sign in, the same way the desktop app
+does: once you're in, the page hands the session to the local agent, which
+stores it and uses it for every platform call. The command waits (up to five
+minutes) and prints the account it signed in as. If the browser doesn't open,
+visit the URL it prints.
+
+To sign in with a token instead, run `smartloop login --token` and paste it at
+the prompt (input is hidden), or use `--token <token>` or pipe it on stdin in
+scripts. `smartloop logout` clears the stored credentials.
 
 ### Projects
 
@@ -204,12 +209,12 @@ its path) to attach it: it shows in the prompt as `[Image 1]` or `[Doc 1]`,
 Backspace removes it, and it's uploaded with the message so the answer can
 draw on it. Shift+Enter starts a new line, say for the question under an
 attachment, where the terminal reports it; Alt+Enter and Ctrl+J work in any
-terminal. The prompt grows to six lines. Documents (PDF, Word, PowerPoint, Excel, CSV, text) are read as
-text. `Ctrl+O` lists the project's models, where Enter
+terminal. The prompt grows to six lines; while empty it reads "Ask anything, or drop a file to attach it". Documents (PDF, Word, PowerPoint, Excel, CSV, text) are read as
+text; any other file is turned away with a note in the chat. `Ctrl+O` lists the project's models, where Enter
 enables one (downloading it first, with its progress in the status pane) or
 disables it. Typing `/` lists the commands under the prompt, narrowing
-as you type: ↑/↓ picks one, Tab completes it and Enter runs it. Commands: `/login` (paste a
-token, masked, to sign in without leaving the chat), `/logout`, `/models`,
+as you type: ↑/↓ picks one, Tab completes it and Enter runs it. Commands: `/login` (sign in
+in the browser; `/login --token` pastes a token, masked, instead), `/logout`, `/models`,
 `/status` (account, model, agent and versions), `/clear` (clear the chat and start a new session), `/help` and
 `/quit`. On exit the session id is printed, to resume with `--session`.
 
