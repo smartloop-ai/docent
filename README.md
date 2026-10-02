@@ -198,30 +198,29 @@ that answered:
   [enter] send  [esc] interrupt  [?] shortcuts
 ```
 
-On first use the app shows setup under its banner, as the same checklist,
-and opens the chat once the agent is ready. It chats in the server's current project,
-or the one given with `--project`. `?` lists the shortcuts. The mouse wheel or
-trackpad (or PgUp/PgDn) scrolls the chat, and dragging over it selects text
-and copies it to the clipboard when you let go (over SSH, through the
-terminal's OSC 52 support). Hold Option (macOS) or Shift (most Linux
-terminals) for the terminal's own selection instead. Drop a file on the terminal (or paste
-its path) to attach it: it shows in the prompt as `[Image 1]` or `[Doc 1]`,
-Backspace removes it, and it's uploaded with the message so the answer can
-draw on it. Shift+Enter starts a new line, say for the question under an
-attachment, where the terminal reports it; Alt+Enter and Ctrl+J work in any
-terminal. The prompt grows to six lines; while empty it reads "Ask anything, or drop a file to attach it". Images can be PNG or JPEG; documents
-(PDF, Word .docx, PowerPoint .pptx, Excel .xlsx, CSV, text, HTML, JSON) are read as
-text. Any other file, a HEIC photo or an old .doc say, is turned away with a note in the chat. `Ctrl+O` lists the project's models, where Enter
-enables one (downloading it first, with its progress in the status pane) or
-disables it. `Ctrl+S` turns web search on or off for the project, as
-Cmd/Ctrl+Alt+S does in the studio app. Typing `/` lists the commands under the prompt, narrowing
-as you type: ↑/↓ picks one, Tab completes it and Enter runs it. Commands: `/login` (sign in
-in the browser; `/login --token` pastes a token, masked, instead), `/logout`, `/models`,
-`/status` (account, model, agent and versions), `/usage` (web searches left this month as a
-bar, plus the last 7 days' tokens and the estimated cost saved against a hosted model), `/upgrade` (opens https://app.smartloop.ai/upgrade; the Pro plan unlocks 1,000 web
-searches a month, and a subscribed account manages billing there), `/clear` (clear the chat and start a new session), `/help` and
-`/quit`. Once 70% of the month's web searches are used, the footer says how much of
-the allocated AI search budget is gone and how many are left, and points at `/upgrade`. On exit the session id is printed, to resume with `--session`.
+It chats in the server's current project, or the one given with `--project`.
+On exit it prints the session id, to resume with `--session`.
+
+| Key | Does |
+| --- | --- |
+| `?` | shortcuts |
+| `Shift+Enter`, `Alt+Enter`, `Ctrl+J` | new line |
+| `Esc` | interrupt the reply |
+| wheel, `PgUp`/`PgDn` | scroll; drag to select and copy |
+| drop a file | attach an image (PNG, JPEG) or document (PDF, Office, CSV, text) |
+| `Ctrl+O` | models: enable, disable, download |
+| `Ctrl+S` | web search on or off |
+
+| Command | Does |
+| --- | --- |
+| `/login`, `/logout` | sign in in the browser (`--token` to paste one) |
+| `/models` | enable, disable and download models |
+| `/mcp` | MCP servers; `/mcp add <url>` connects one |
+| `/status` | account, model, agent and versions |
+| `/usage` | web searches left, tokens and cost saved |
+| `/upgrade` | Pro plan: 1,000 web searches a month |
+| `/clear` | clear the chat and start a new session |
+| `/help`, `/quit` | |
 
 Pass an initial prompt to send immediately:
 
