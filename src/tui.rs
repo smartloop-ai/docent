@@ -2421,18 +2421,23 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         app.project = Some(("p1".into(), "general_chat".into()));
-        app.entries.push(Entry::User("[Doc 1] When does my lease end, and how much notice do I need to give?".into()));
+        app.entries.push(Entry::User(
+            "[Doc 1] Issue a mutual NDA to Northwind Labs from our template: 2-year term, California law".into(),
+        ));
         app.entries.push(Entry::Reply(Reply {
             warnings: Vec::new(),
             model: Some("sl-mini".into()),
-            text: "Your lease ends on 31 August 2027. You need to give 60 days' written notice, \
-                   so by 2 July 2027 (section 4.2). Leaving early costs one month's rent."
+            text: "Drafted nda-northwind-labs.docx from your template:\n\
+                   1. Mutual NDA between Smartloop Inc. and Northwind Labs, Inc.\n\
+                   2. 2-year term from signing; confidentiality survives 3 years (section 5)\n\
+                   3. Governed by California law, venue in San Francisco (section 9)\n\
+                   Signature blocks are left blank for both parties."
                 .into(),
-            citations: vec!["lease-agreement.pdf".into()],
-            stats: Some(TurnStats { tokens: 41, elapsed: Duration::from_secs(9) }),
+            citations: vec!["mutual-nda-template.docx".into()],
+            stats: Some(TurnStats { tokens: 96, elapsed: Duration::from_secs(14) }),
             ended: None,
         }));
-        app.entries.push(Entry::User("Find well-reviewed movers near Seattle for early July".into()));
+        app.entries.push(Entry::User("[Doc 2] Compare it with their redlines and flag anything risky".into()));
         app.entries.push(Entry::Reply(Reply::default()));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         app.turn = Some(Turn {
@@ -2440,11 +2445,11 @@ mod tests {
             task: runtime.spawn(async {}),
             entry: 3,
             tokens: 0,
-            activity: Some("Searching the web for the latest information".into()),
+            activity: Some("Reading northwind-redlines.pdf".into()),
         });
         app.input = "".into();
 
-        let (width, height) = (100, 33);
+        let (width, height) = (100, 38);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
