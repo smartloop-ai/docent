@@ -948,13 +948,16 @@ fn detach(cmd: &mut Command) {
     cmd.process_group(0);
 }
 
+/// A hidden console of its own rather than none: under `DETACHED_PROCESS`
+/// (which also overrides `CREATE_NO_WINDOW`) every console child the agent
+/// starts, such as a project worker `slp.exe`, would open a visible window.
+/// Children inherit the hidden console instead.
 #[cfg(windows)]
 fn detach(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
 
 #[cfg(test)]
