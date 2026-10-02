@@ -9,6 +9,7 @@ use progress::Steps;
 
 mod chat;
 mod framework;
+mod mcp;
 mod progress;
 mod tui;
 mod usage;

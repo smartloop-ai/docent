@@ -48,7 +48,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::chat::{self, ChatEvent, TurnStats};
 use crate::progress::{self, Steps, format_duration, format_size};
 use crate::usage::{SearchUsage, TokenStats};
-use crate::{ModelRow, framework};
+use crate::{ModelRow, framework, mcp};
 
 const LABEL_WIDTH: usize = 28;
 const DETAIL_WIDTH: usize = 12;
@@ -120,11 +120,14 @@ enum AppEvent {
     SetupDone(Result<(), String>),
     Projects(Result<Vec<serde_json::Value>, String>),
     Models(Result<Vec<ModelRow>, String>),
+    /// The project's MCP servers, for `/mcp`.
+    Mcp(Result<Vec<mcp::Server>, String>),
     Chat(ChatEvent),
     TurnDone(Result<TurnStats, String>),
     Download(usize, StepEvent),
     DownloadDone(usize),
     Notice(String),
+    Warning(String),
     Error(String),
     Status(Vec<(String, String)>),
     /// The account's web search usage; `None` when signed out.
@@ -465,6 +468,8 @@ struct Reply {
 enum Overlay {
     None,
     Models { rows: Option<Result<Vec<ModelRow>, String>>, selected: usize },
+    /// `/mcp`: the project's MCP servers.
+    Mcp { rows: Option<Result<Vec<mcp::Server>, String>>, selected: usize },
     Help,
     /// `/status`: rows fill in once the agent answers.
     Status(Option<Vec<(String, String)>>),
@@ -593,7 +598,11 @@ impl App {
                 event = keys.next() => match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => self.key(key),
                     Some(Ok(Event::Mouse(mouse))) if matches!(self.overlay, Overlay::None) => self.mouse(mouse),
-                    Some(Ok(Event::Paste(text))) if matches!(self.overlay, Overlay::None) => self.paste(&text),
+                    // Pasting is typing too: it closes an open panel.
+                    Some(Ok(Event::Paste(text))) => {
+                        self.overlay = Overlay::None;
+                        self.paste(&text)
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(format!("Failed to read input: {}", e)),
                     None => break,
@@ -741,6 +750,14 @@ impl App {
                     *rows = Some(result);
                 }
             }
+            AppEvent::Mcp(result) => {
+                if let Overlay::Mcp { rows, selected } = &mut self.overlay {
+                    if let Ok(list) = &result {
+                        *selected = (*selected).min(list.len().saturating_sub(1));
+                    }
+                    *rows = Some(result);
+                }
+            }
             AppEvent::Chat(event) => self.chat_event(event),
             AppEvent::TurnDone(result) => {
                 let Some(turn) = self.turn.take() else { return };
@@ -769,6 +786,7 @@ impl App {
                 self.load_models();
             }
             AppEvent::Notice(text) => self.entries.push(Entry::Notice(text)),
+            AppEvent::Warning(text) => self.entries.push(Entry::Warning(text)),
             AppEvent::Status(rows) => {
                 if let Overlay::Status(shown) = &mut self.overlay {
                     *shown = Some(rows);
@@ -931,14 +949,23 @@ impl App {
             (KeyCode::Char('s'), true) => return self.toggle_web_search(),
             _ => {}
         }
-        match self.overlay {
-            Overlay::None => self.key_chat(key),
+        let handled = match self.overlay {
+            Overlay::None => false,
             Overlay::Models { .. } => self.key_models(key),
+            Overlay::Mcp { .. } => self.key_mcp(key),
             Overlay::Help | Overlay::Status(_) | Overlay::Usage { .. } => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                let close = matches!(key.code, KeyCode::Esc | KeyCode::Enter);
+                if close {
                     self.overlay = Overlay::None;
                 }
+                close
             }
+        };
+        // A panel keeps only its own keys; anything else is typing, which
+        // closes it and goes to the prompt.
+        if !handled {
+            self.overlay = Overlay::None;
+            self.key_chat(key);
         }
     }
 
@@ -948,6 +975,72 @@ impl App {
         }
         self.overlay = Overlay::Models { rows: None, selected: 0 };
         self.load_models();
+    }
+
+    fn open_mcp(&mut self) {
+        if self.project.is_none() {
+            return;
+        }
+        self.overlay = Overlay::Mcp { rows: None, selected: 0 };
+        self.load_mcp();
+    }
+
+    fn load_mcp(&self) {
+        let Some((id, _)) = self.project.clone() else { return };
+        self.spawn(move |client, tx| {
+            let _ = tx.send(AppEvent::Mcp(mcp::list(&client, &id)));
+        });
+    }
+
+    /// `/mcp add <url>`: register the server, opening the browser when it
+    /// wants a sign-in, then say once it's connected (or why not).
+    fn add_mcp(&mut self, url: &str) {
+        let url = match mcp::parse_url(url) {
+            Ok(url) => url,
+            Err(e) => return self.entries.push(Entry::Error(e)),
+        };
+        let Some((project, _)) = self.project.clone() else { return };
+        self.entries.push(Entry::Notice(format!("Adding MCP server {}", url)));
+        self.spawn(move |client, tx| {
+            let id = match mcp::add(&client, &project, &url) {
+                Ok(mcp::Added::Server(server)) => Some(server.id),
+                Ok(mcp::Added::SignIn(auth_url)) => {
+                    crate::open_browser(&auth_url);
+                    let _ = tx.send(AppEvent::Notice(format!("Sign in to the MCP server in the browser: {}", auth_url)));
+                    None
+                }
+                Err(e) => return drop(tx.send(AppEvent::Error(e))),
+            };
+            let _ = tx.send(AppEvent::Mcp(mcp::list(&client, &project)));
+            let event = match mcp::watch(&client, &project, &url, id.as_deref()) {
+                Some(server) if server.state == "failed" => AppEvent::Error(format!(
+                    "MCP server {} failed to connect: {}",
+                    server.name,
+                    server.error.unwrap_or_else(|| "no reason given".to_string())
+                )),
+                Some(server) => AppEvent::Notice(format!(
+                    "MCP server {} connected with {} tool{}",
+                    server.name,
+                    server.tools,
+                    if server.tools == 1 { "" } else { "s" }
+                )),
+                None if id.is_none() => AppEvent::Error(format!("MCP server {} wasn't signed in to; /mcp add it again to retry", url)),
+                None => AppEvent::Warning(format!("MCP server {} is still connecting; /mcp shows when it's ready", url)),
+            };
+            let _ = tx.send(event);
+            let _ = tx.send(AppEvent::Mcp(mcp::list(&client, &project)));
+        });
+    }
+
+    fn remove_mcp(&mut self, server: mcp::Server) {
+        let Some((project, _)) = self.project.clone() else { return };
+        self.spawn(move |client, tx| {
+            let _ = tx.send(match mcp::remove(&client, &project, &server.id) {
+                Ok(()) => AppEvent::Notice(format!("MCP server {} removed", server.name)),
+                Err(e) => AppEvent::Error(e),
+            });
+            let _ = tx.send(AppEvent::Mcp(mcp::list(&client, &project)));
+        });
     }
 
     fn open_status(&mut self) {
@@ -1211,6 +1304,13 @@ impl App {
             }
             "/quit" | "/exit" | "/q" | "exit" => self.quit = true,
             "/models" => self.open_models(),
+            "/mcp" => match words.next() {
+                None | Some("list") => self.open_mcp(),
+                Some("add") => self.add_mcp(&words.collect::<Vec<_>>().join(" ")),
+                // A bare URL adds it too.
+                Some(url) if url.contains("://") => self.add_mcp(url),
+                Some(other) => self.entries.push(Entry::Error(format!("Unknown /mcp {}; try /mcp add <url>", other))),
+            },
             "/help" | "/?" => self.overlay = Overlay::Help,
             "/status" => self.open_status(),
             "/usage" => self.open_usage(),
@@ -1287,17 +1387,19 @@ impl App {
         });
     }
 
-    fn key_models(&mut self, key: KeyEvent) {
-        let Overlay::Models { rows, selected } = &mut self.overlay else { return };
+    /// The models panel's keys; false for any other, which is typing.
+    fn key_models(&mut self, key: KeyEvent) -> bool {
+        let Overlay::Models { rows, selected } = &mut self.overlay else { return false };
         let count = rows.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, Vec::len);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.overlay = Overlay::None,
-            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1).min(count.saturating_sub(1)),
-            KeyCode::Char('r') => self.load_models(),
-            KeyCode::Enter | KeyCode::Char(' ') => {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Down => *selected = (*selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Char('r') if ctrl => self.load_models(),
+            KeyCode::Enter => {
                 let Some(row) = rows.as_ref().and_then(|r| r.as_ref().ok()).and_then(|r| r.get(*selected)) else {
-                    return;
+                    return true;
                 };
                 let row = row.clone();
                 if !row.accessible {
@@ -1311,8 +1413,36 @@ impl App {
                     self.enable_model(row.name);
                 }
             }
-            _ => {}
+            _ => return false,
         }
+        true
+    }
+
+    /// The MCP panel's keys; false for any other, which is typing (a new
+    /// server is added from the prompt with `/mcp add <url>`).
+    fn key_mcp(&mut self, key: KeyEvent) -> bool {
+        let Overlay::Mcp { rows, selected } = &mut self.overlay else { return false };
+        let list = rows.as_ref().and_then(|r| r.as_ref().ok());
+        let count = list.map_or(0, Vec::len);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Down => *selected = (*selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Char('r') if ctrl => self.load_mcp(),
+            KeyCode::Char('d') if ctrl => {
+                if let Some(server) = list.and_then(|l| l.get(*selected)).cloned() {
+                    self.remove_mcp(server);
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(server) = list.and_then(|l| l.get(*selected)).cloned() {
+                    self.remove_mcp(server);
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 
     // ----- drawing -------------------------------------------------------
@@ -1347,6 +1477,7 @@ impl App {
             Overlay::None if hints.is_empty() => self.draw_footer(frame, footer),
             Overlay::None => frame.render_widget(Paragraph::new(hints), footer),
             Overlay::Models { rows, selected } => self.draw_models(frame, footer, rows, *selected),
+            Overlay::Mcp { rows, selected } => self.draw_mcp(frame, footer, rows, *selected),
             Overlay::Help => {
                 let block = panel(&bar_hints(&[("esc", "close")]));
                 frame.render_widget(Paragraph::new(help_lines()).block(block), footer);
@@ -1368,6 +1499,8 @@ impl App {
             Overlay::None => return None,
             Overlay::Models { rows: Some(Ok(list)), .. } => list.len(),
             Overlay::Models { .. } => 1,
+            Overlay::Mcp { rows: Some(Ok(list)), .. } => list.len().max(1),
+            Overlay::Mcp { .. } => 1,
             Overlay::Help => help_lines().len(),
             Overlay::Status(rows) => self.status_panel_lines(rows).len(),
             Overlay::Usage { loading, tokens } => self.usage_panel_lines(*loading, tokens).len(),
@@ -1712,7 +1845,7 @@ impl App {
     /// The project's models as a list, like Claude Code's model picker:
     /// the selected one marked, each with its state and what it can do.
     fn draw_models(&self, frame: &mut Frame, area: Rect, rows: &Option<Result<Vec<ModelRow>, String>>, selected: usize) {
-        let block = panel(&bar_hints(&[("↑↓", "select"), ("enter", "enable/disable"), ("r", "refresh"), ("esc", "close")]));
+        let block = panel(&bar_hints(&[("↑↓", "select"), ("enter", "enable/disable"), ("ctrl+r", "refresh"), ("esc", "close")]));
         frame.render_widget(Clear, area);
         let list = match rows {
             None => return frame.render_widget(Paragraph::new(format!(" Loading models {}", self.spinner())).block(block), area),
@@ -1748,6 +1881,55 @@ impl App {
                 spans.push(Span::styled(m.capabilities.clone(), dim()));
                 if !m.accessible {
                     spans.push(Span::styled("  · sign in to use", Style::new().fg(Color::Yellow)));
+                }
+                Line::from(spans)
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    fn draw_mcp(&self, frame: &mut Frame, area: Rect, rows: &Option<Result<Vec<mcp::Server>, String>>, selected: usize) {
+        let block = panel(&bar_hints(&[("↑↓", "select"), ("ctrl+d", "remove"), ("ctrl+r", "refresh"), ("esc", "close")]));
+        frame.render_widget(Clear, area);
+        let list = match rows {
+            None => return frame.render_widget(Paragraph::new(format!(" Loading MCP servers {}", self.spinner())).block(block), area),
+            Some(Err(e)) => return frame.render_widget(Paragraph::new(e.clone()).block(block).wrap(Wrap { trim: false }), area),
+            Some(Ok(list)) if list.is_empty() => {
+                let line = Line::from(vec![
+                    Span::styled("No MCP servers yet; add one with ", dim()),
+                    Span::styled("/mcp add <url>", key_style()),
+                ]);
+                return frame.render_widget(Paragraph::new(line).block(block), area);
+            }
+            Some(Ok(list)) => list,
+        };
+        let name_width = list.iter().map(|s| s.name.chars().count()).max().unwrap_or(0).min(28) + 2;
+        let lines: Vec<Line> = list
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let chosen = i == selected;
+                let mut spans = vec![
+                    Span::styled(if chosen { "› " } else { "  " }, Style::new().fg(pink()).bold()),
+                    Span::styled(
+                        format!("{:<w$}", truncate(&s.name, name_width - 2), w = name_width),
+                        if chosen { Style::new().fg(pink()).bold() } else { Style::new() },
+                    ),
+                ];
+                let state = match s.state.as_str() {
+                    "provisioning" => Span::styled(format!("connecting {}", self.spinner()), Style::new().fg(pink())),
+                    "failed" => Span::styled("✗ failed", Style::new().fg(Color::Red)),
+                    _ => Span::styled(
+                        format!("✓ {} tool{}", s.tools, if s.tools == 1 { "" } else { "s" }),
+                        Style::new().fg(Color::Green),
+                    ),
+                };
+                let state_width = state.width();
+                spans.push(state);
+                spans.push(Span::raw(" ".repeat(16usize.saturating_sub(state_width))));
+                match (&s.error, s.state.as_str()) {
+                    (Some(error), "failed") => spans.push(Span::styled(error.clone(), Style::new().fg(Color::Red))),
+                    _ => spans.push(Span::styled(s.location.clone(), dim())),
                 }
                 Line::from(spans)
             })
@@ -2055,11 +2237,12 @@ fn is_document(path: &std::path::Path) -> bool {
 
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
-const COMMANDS: [(&str, &str); 9] = [
+const COMMANDS: [(&str, &str); 10] = [
     ("/help", "shortcuts and commands"),
     ("/login", "sign in in the browser (--token to paste one)"),
     ("/logout", "log out"),
     ("/models", "enable, disable and download models"),
+    ("/mcp", "MCP servers; /mcp add <url> to connect one"),
     ("/status", "account, model, agent and versions"),
     ("/usage", "web searches left, tokens and cost saved"),
     ("/upgrade", "Pro plan: 1,000 web searches a month"),
@@ -2080,6 +2263,8 @@ fn help_lines() -> Vec<Line<'static>> {
         ("drop a file", "attach an image or document as [Image 1] or [Doc 1]"),
         ("[ctrl+o] /models", "models: enable, disable, download"),
         ("[ctrl+s]", "turn web search on or off for the project"),
+        ("/mcp", "MCP servers: list, remove"),
+        ("/mcp add <url>", "connect an MCP server by its URL"),
         ("/status", "account, model, agent and versions"),
         ("/login", "sign in in the browser (--token to paste one)"),
         ("/logout", "log out"),
@@ -2567,6 +2752,38 @@ mod tests {
         app.input = "/mo".into();
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(app.overlay, Overlay::Models { .. }));
+    }
+
+    #[test]
+    fn mcp_lists_the_servers_and_checks_the_url() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.input = "/mcp".into();
+        app.submit();
+        let server = |name: &str, state: &str, tools| mcp::Server {
+            id: name.into(),
+            name: name.into(),
+            location: format!("https://{}.example.com/mcp", name),
+            state: state.into(),
+            tools,
+            error: None,
+        };
+        app.apply(AppEvent::Mcp(Ok(vec![server("linear", "ready", 12), server("notion", "provisioning", 0)])));
+        let text = screen(&app, 100, 30);
+        assert!(text.contains("› linear"), "{}", text);
+        assert!(text.contains("✓ 12 tools"), "{}", text);
+        assert!(text.contains("https://linear.example.com/mcp"), "{}", text);
+        assert!(text.contains("connecting"), "{}", text);
+
+        // Typing closes the panel and goes to the prompt.
+        for c in "/mcp add not-a-url".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(app.input, "/mcp add not-a-url");
+        app.submit();
+        assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("Not a URL")));
     }
 
     #[test]
