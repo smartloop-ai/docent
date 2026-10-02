@@ -1,4 +1,4 @@
-# Docent by Smartloop
+# Docent
 
 Your private AI assistant. Chat with your PDFs and Office files, search the web, and connect MCP servers, all from the terminal. If no local agent is running, the CLI downloads the framework and models it needs and starts one itself.
 
