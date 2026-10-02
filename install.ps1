@@ -9,7 +9,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-$Repo = 'smartloop-ai/smartloop-cli'
+$Repo = 'smartloop-ai/docent'
 
 # Where the binary lands.  A Rust toolchain already has CARGO_HOME\bin on PATH,
 # so installing there means `smartloop` works straight away with no PATH edit.

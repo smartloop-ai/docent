@@ -9,7 +9,7 @@
 #                              Rust toolchain is present, else ~/.local/bin)
 set -eu
 
-REPO="smartloop-ai/smartloop-cli"
+REPO="smartloop-ai/docent"
 
 # Colors, only when stdout is a terminal.
 if [ -t 1 ]; then
