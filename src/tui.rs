@@ -30,7 +30,6 @@
 
 use std::time::{Duration, Instant};
 
-use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -68,8 +67,8 @@ const USAGE_BAR: usize = 30;
 const SPINNER: [&str; 4] = ["[-]", "[\\]", "[|]", "[/]"];
 
 const BANNER: [&str; 2] = [
-    "█▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█",
-    "▄█ █ ▀ █ █▀█ █▀▄  █  █▄▄ █▄█ █▄█ █▀▀",
+    "█▀▄ █▀█ █▀▀ █▀▀ █▄ █ ▀█▀",
+    "█▄▀ █▄█ █▄▄ ██▄ █ ▀█  █",
 ];
 
 /// Run the app until the user quits, then print the session id so the
@@ -499,7 +498,6 @@ struct Turn {
 
 struct App {
     client: Client,
-    chat: OpenAIClient<OpenAIConfig>,
     tx: UnboundedSender<AppEvent>,
     rx: UnboundedReceiver<AppEvent>,
     phase: Phase,
@@ -551,7 +549,6 @@ impl App {
         let (tx, rx) = unbounded_channel();
         App {
             client,
-            chat: chat::openai_client(crate::api_url()),
             tx,
             rx,
             phase: Phase::Setup,
@@ -693,7 +690,10 @@ impl App {
         self.entries.push(Entry::Reply(Reply::default()));
         let entry = self.entries.len() - 1;
         self.scroll_back = 0;
-        let (chat, tx, session, client) = (self.chat.clone(), self.tx.clone(), self.session.clone(), self.client.clone());
+        // Made per turn: the agent picks its port once it's up, and a new
+        // one each time it restarts.
+        let chat = chat::openai_client(crate::api_url());
+        let (tx, session, client) = (self.tx.clone(), self.session.clone(), self.client.clone());
         let task = tokio::spawn(async move {
             let events = tx.clone();
             let mut on = move |event| {
@@ -1565,9 +1565,10 @@ impl App {
     /// ```text
     /// ╭───────────────────────────────────────────────────────────────────────────╮
     /// │                                                                           │
-    /// │ █▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█    project  general_chat               │
-    /// │ ▄█ █ ▀ █ █▀█ █▀▄  █  █▄▄ █▄█ █▄█ █▀▀    agent    http://localhost:38540/v1  │
-    /// │ Local AI assistant · ? for shortcuts    version  CLI 1.0.14 · agent 1.2.7   │
+    /// │ █▀▄ █▀█ █▀▀ █▀▀ █▄ █ ▀█▀          project  general_chat                   │
+    /// │ █▄▀ █▄█ █▄▄ ██▄ █ ▀█  █           agent    http://localhost:38540/v1      │
+    /// │ Your private AI assistant         version  CLI 1.0.14 · agent 1.2.7       │
+    /// │ by Smartloop · ? for shortcuts                                            │
     /// │                                                                           │
     /// │ Here are some commands to get you started                                 │
     /// │   /login     sign in for web search and more models                       │
@@ -1591,8 +1592,9 @@ impl App {
             .iter()
             .map(|row| Line::from(Span::styled(*row, Style::new().fg(pink()))))
             .collect();
-        left.push(Line::from(Span::styled("Local AI assistant · ? for shortcuts", dim())));
-        let left_width = BANNER[0].chars().count().max(left[2].width()) + 4;
+        left.push(Line::from(Span::styled("Your private AI assistant", dim())));
+        left.push(Line::from(Span::styled("by Smartloop · ? for shortcuts", dim())));
+        let left_width = left.iter().map(Line::width).max().unwrap_or(0) + 4;
 
         let row = |label: &str, value: &str| {
             Line::from(vec![
@@ -2384,26 +2386,28 @@ mod tests {
         let text = screen(&app, 80, 24);
         let rows: Vec<&str> = text.lines().collect();
         // Short: the banner sits just above the prompt.
-        let banner = rows.iter().position(|r| r.contains("█▀ █▀▄▀█")).expect(&text);
+        let banner = rows.iter().position(|r| r.contains("█▀▄ █▀█ █▀▀")).expect(&text);
         assert!(rows[banner].contains("project  Default"), "{}", text);
         assert!(rows[banner + 1].contains("agent    http://localhost:"), "{}", text);
         assert!(rows[banner + 1].contains("/v1"), "{}", text);
         assert!(rows[banner + 2].contains(&format!("version  CLI {} · agent", env!("CARGO_PKG_VERSION"))), "{}", text);
+        assert!(rows[banner + 2].contains("Your private AI assistant"), "{}", text);
+        assert!(rows[banner + 3].contains("by Smartloop"), "{}", text);
         // No account row (the /status tip mentions the word, not a value).
         assert!(!text.contains("account  "), "{}", text);
         // Only as wide as what it holds, not the screen.
         let wide = screen(&app, 120, 24);
         let top = wide.lines().find(|r| r.starts_with('╭')).expect(&wide);
         assert!(top.ends_with('╮') && top.chars().count() < 100, "{}", wide);
-        assert!(rows[banner + 4].contains("Here are some commands to get you started"), "{}", text);
-        assert!(rows[banner + 5].contains("/login"), "{}", text);
+        assert!(rows[banner + 5].contains("Here are some commands to get you started"), "{}", text);
+        assert!(rows[banner + 6].contains("/login"), "{}", text);
         assert!(!text.contains("search the web"), "{}", text);
-        assert!(rows[banner - 2].starts_with('╭') && rows[banner + 9].starts_with('╰'), "{}", text);
+        assert!(rows[banner - 2].starts_with('╭') && rows[banner + 10].starts_with('╰'), "{}", text);
         for i in 0..40 {
             app.entries.push(Entry::Notice(format!("line {}", i)));
         }
         let text = screen(&app, 80, 24);
-        assert!(!text.contains("█▀ █▀▄▀█"), "{}", text);
+        assert!(!text.contains("█▀▄ █▀█ █▀▀"), "{}", text);
         assert!(text.contains("line 39"), "{}", text);
     }
 
@@ -2497,7 +2501,7 @@ mod tests {
             app.scroll(WHEEL_LINES as i32);
         }
         assert_eq!(app.scroll_back, limit);
-        assert!(screen(&app, 80, 24).contains("█▀ █▀▄▀█"), "the top shows the welcome card");
+        assert!(screen(&app, 80, 24).contains("█▀▄ █▀█ █▀▀"), "the top shows the welcome card");
         app.scroll(-1000);
         assert_eq!(app.scroll_back, 0);
         assert!(screen(&app, 80, 24).contains("line 59"));

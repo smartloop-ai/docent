@@ -275,8 +275,9 @@ setup_path() {
 
 print_banner() {
     say ""
-    say "${PINK}█▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█${NC}"
-    say "${PINK}▄█ █ ▀ █ █▀█ █▀▄  █  █▄▄ █▄█ █▄█ █▀▀${NC}"
+    say "${PINK}█▀▄ █▀█ █▀▀ █▀▀ █▄ █ ▀█▀${NC}"
+    say "${PINK}█▄▀ █▄█ █▄▄ ██▄ █ ▀█  █${NC}"
+    say "${MUTED}Your private AI assistant, by Smartloop${NC}"
     say ""
     say "${MUTED}Version: ${NC}${VERSION}"
     say ""
@@ -284,7 +285,7 @@ print_banner() {
     if on_path "$INSTALL_DIR"; then
         say "${MUTED}To get started:${NC}"
         say ""
-        say "  smartloop project list  ${MUTED}# List your projects${NC}"
+        say "  docent                  ${MUTED}# Start chatting${NC}"
     else
         say "${MUTED}To get started, restart your terminal or run:${NC}"
         say ""
@@ -296,7 +297,7 @@ print_banner() {
         say ""
         say "${MUTED}Then run:${NC}"
         say ""
-        say "  smartloop project list  ${MUTED}# List your projects${NC}"
+        say "  docent                  ${MUTED}# Start chatting${NC}"
     fi
 
     say ""
@@ -351,7 +352,15 @@ install_smartloop() {
     "${INSTALL_DIR}/${BIN_NAME}" --version >/dev/null 2>&1 \
         || error "Installation verification failed: 'smartloop --version' did not succeed"
 
-    say "${GREEN}Installed${NC} ${INSTALL_DIR}/${BIN_NAME}"
+    # `docent` is the same binary under its other name: a symlink, or on
+    # Windows (no symlinks without admin) a copy.
+    if [ "$OS" = "pc-windows-msvc" ]; then
+        cp "${INSTALL_DIR}/${BIN_NAME}" "${INSTALL_DIR}/docent.exe"
+    else
+        ln -sf "$BIN_NAME" "${INSTALL_DIR}/docent"
+    fi
+
+    say "${GREEN}Installed${NC} ${INSTALL_DIR}/${BIN_NAME} ${MUTED}(also as${NC} docent${MUTED})${NC}"
 
     say "${MUTED}Processing triggers for smartloop (${VERSION}) ...${NC}"
     if [ "$OS" = "pc-windows-msvc" ]; then

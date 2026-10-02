@@ -48,8 +48,9 @@ function Write-Banner {
     }
 
     Write-Host ""
-    Write-Host "$PINK$(& $render '#^ #^<^# <^# #^# ^#^ #   #^# #^# #^#')$NC"
-    Write-Host "$PINK$(& $render '<# # ^ # #^# #^<  #  #<< #<# #<# #^^')$NC"
+    Write-Host "$PINK$(& $render '#^< #^# #^^ #^^ #< # ^#^')$NC"
+    Write-Host "$PINK$(& $render '#<^ #<# #<< ##< # ^#  #')$NC"
+    Write-Host "${MUTED}Your private AI assistant, by Smartloop${NC}"
     Write-Host ""
     Write-Host "${MUTED}Version: ${NC}$Version"
     Write-Host ""
@@ -60,7 +61,7 @@ function Write-Banner {
         Write-Host "${MUTED}To get started, restart your terminal, then run:${NC}"
     }
     Write-Host ""
-    Write-Host "  smartloop project list  ${MUTED}# List your projects${NC}"
+    Write-Host "  docent                  ${MUTED}# Start chatting${NC}"
     Write-Host ""
     Write-Host "${MUTED}For more information visit ${NC}https://smartloop.ai/docs/intro/"
     Write-Host ""
@@ -123,7 +124,10 @@ try {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Copy-Item -Path (Join-Path $tmp "$name\smartloop.exe") -Destination $InstallDir -Force
 
-    Write-Host "${GREEN}Installed${NC} $(Join-Path $InstallDir 'smartloop.exe')"
+    # `docent` is the same binary under its other name; symlinks need admin.
+    Copy-Item -Path (Join-Path $InstallDir 'smartloop.exe') -Destination (Join-Path $InstallDir 'docent.exe') -Force
+
+    Write-Host "${GREEN}Installed${NC} $(Join-Path $InstallDir 'smartloop.exe') ${MUTED}(also as${NC} docent${MUTED})${NC}"
 
     Write-Host "${MUTED}Processing triggers for smartloop ($version) ...$NC"
 

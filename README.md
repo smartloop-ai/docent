@@ -1,8 +1,8 @@
-# Smartloop
+# Docent by Smartloop
 
-Smartloop is a local AI orchestration framework for extracting information from your own sources and generating new content. It runs on your device.
+Your private AI assistant. Chat with your PDFs and Office files, search the web, and connect MCP servers, all from the terminal. If no local agent is running, the CLI downloads the framework and models it needs and starts one itself.
 
-The Smartloop command line interface runs Smartloop from your terminal. Chat with the local agent in a full-screen app, search the web, script repeatable workflows, and set up your own local AI infrastructure: the agent, its models, and your projects. If no local agent is running, the CLI downloads the framework and models it needs and starts one itself.
+It installs as both `docent` and `smartloop`; the two are the same command.
 
 <img width="822" alt="smartloop run: a reply with its sources, the status line and the prompt" src="docs/tui.png" />
 
@@ -51,8 +51,9 @@ cargo install --path .
 
 ### First run
 
-Any command that talks to the agent starts it when nothing answers on
-`http://localhost:38540`. On first use that means:
+Any command that talks to the agent starts it when none is running. It
+listens on a free port it picks itself and writes it to
+`~/.smartloop/server.port`, where the CLI reads it. On first use that means:
 
 1. Download the agent (SLP framework 1.2.7) from `https://dl.smartloop.ai/slp/1.2.7/` into
    `~/.smartloop/1.2.7/`. Studio desktop uses the same folder and marker files,
@@ -66,12 +67,12 @@ Any command that talks to the agent starts it when nothing answers on
    the default project and loads the model.
 
 Each step is skipped when its files are already there. Progress shows as a
-checklist on stderr under the Smartloop banner that redraws in place, with
+checklist on stderr under the Docent banner that redraws in place, with
 the active download's bar in Smartloop pink:
 
 ```
 [✓] Agent 1.2.7                        667 MB
-[✓] Start agent                    port 38540
+[✓] Start agent                    port 50578
 [✓] Embeddings (bge-m3)                417 MB
 [•] Base model sl-mini
     ██████████████▋░░░░░░░░░░░░░░░   49%  377 MB/769 MB
@@ -156,7 +157,7 @@ smartloop agent status
 ```
 
 ```
-Endpoint: http://localhost:38540
+Endpoint: http://localhost:50578
 Status:   healthy
 Model:    sl-mini (Q4_K_M, 32768 ctx, 769 MB)
 Process:  pid 8738, 250 MB
@@ -275,8 +276,8 @@ one. The `sl-mini` orchestrator is always on and isn't listed.
 
 ## Configuration
 
-The CLI connects to the Smartloop API at `http://localhost:38540` by default.
-Point it elsewhere with `SMARTLOOP_API_URL`:
+The CLI connects to the local agent on whatever port it picked
+(`~/.smartloop/server.port`). Point it elsewhere with `SMARTLOOP_API_URL`:
 
 ```sh
 SMARTLOOP_API_URL=http://localhost:9000 smartloop project list
@@ -288,7 +289,7 @@ an agent for that URL.
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `SLP_HOME` | `~/.smartloop` | Where the framework, workspace, models and logs live |
-| `SLP_PORT` | `38540` | Port the managed local agent listens on |
+| `SLP_PORT` | a free port | Pin the managed local agent to this port |
 | `SLP_BASE_URL` | `https://dl.smartloop.ai` | Where the framework archive is downloaded from |
 
 ## License

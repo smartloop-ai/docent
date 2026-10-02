@@ -43,13 +43,27 @@ pub fn install_dir() -> PathBuf {
 }
 
 /// Port the local agent listens on: `SLP_PORT` (as the studio app honors
-/// it) or 38540.
+/// it), else the one the running agent bound, else 38540 (where an agent
+/// from before random ports listens).
 pub fn port() -> u16 {
-    std::env::var("SLP_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .filter(|&p| p > 0)
-        .unwrap_or(DEFAULT_PORT)
+    fixed_port().or_else(bound_port).unwrap_or(DEFAULT_PORT)
+}
+
+/// The port asked for with `SLP_PORT`. Without one the agent is started on a
+/// free port of its choosing, so it never clashes with whatever else holds
+/// 38540.
+fn fixed_port() -> Option<u16> {
+    std::env::var("SLP_PORT").ok().and_then(|p| p.parse().ok()).filter(|&p| p > 0)
+}
+
+/// Where the agent writes the port it bound once it's up:
+/// `~/.smartloop/server.port`. It removes the file when it stops.
+fn port_path() -> PathBuf {
+    install_dir().join("server.port")
+}
+
+fn bound_port() -> Option<u16> {
+    fs::read_to_string(port_path()).ok()?.trim().parse().ok().filter(|&p| p > 0)
 }
 
 fn binary_name() -> &'static str {
@@ -507,17 +521,19 @@ pub fn prepare(list: &mut dyn Steps, client: &Client, base_url: &str, local: boo
         let install = (!running && !is_non_empty_file(&binary_path()))
             .then(|| list.add(&format!("Agent {}", VERSION)));
         let start = list.add(if running { "Wait for agent" } else { "Start agent" });
-        list.set_detail(start, &format!("port {}", port()));
+        list.set_detail(start, &port_detail(running));
         queued = Some(queue_setup(list));
         if running {
             list.start(start);
-            await_agent(list, start, client, base_url, None);
+            await_agent(list, start, client, None);
         } else {
             // Something other than an `slp` process may serve the port (a
             // dev build, say); only start one when nothing answers either.
-            launch(list, install, start, client, base_url);
+            launch(list, install, start, client);
         }
     }
+    // Known only now that the agent is up, when it picked its own port.
+    let base_url = &crate::base_url();
     if needs_setup(client, base_url) {
         let steps = queued.unwrap_or_else(|| queue_setup(list));
         setup(list, &steps, client, base_url);
@@ -528,6 +544,14 @@ pub fn prepare(list: &mut dyn Steps, client: &Client, base_url: &str, local: boo
         }
     }
     Ok(())
+}
+
+/// The start step's detail before the agent answers: its port, when known.
+fn port_detail(running: bool) -> String {
+    match fixed_port().or_else(|| bound_port().filter(|_| running)) {
+        Some(port) => format!("port {}", port),
+        None => "free port".to_string(),
+    }
 }
 
 /// The steps `setup` works through, queued before it runs.
@@ -805,7 +829,7 @@ fn model_name_in(message: &str) -> Option<String> {
 /// Install the framework as step `install`, when it's missing, then start
 /// `slp agent start` as `step`, detached from this process and logging to
 /// `~/.smartloop/server.log`, and wait until `/health` answers.
-fn launch(list: &mut dyn Steps, install: Option<usize>, step: usize, client: &Client, base_url: &str) {
+fn launch(list: &mut dyn Steps, install: Option<usize>, step: usize, client: &Client) {
     let binary = match install {
         Some(install) => ensure_installed(list, install),
         None => binary_path(),
@@ -825,8 +849,21 @@ fn launch(list: &mut dyn Steps, install: Option<usize>, step: usize, client: &Cl
         .unwrap_or_else(|e| list.fail(step, format!("Failed to open {}: {}", log_path.display(), e)));
 
     let mut cmd = Command::new(&binary);
-    cmd.args(["agent", "start", "--port", &port().to_string()])
-        .env("SLP_HOME", &home)
+    cmd.args(["agent", "start"]);
+    match fixed_port() {
+        Some(port) => {
+            cmd.args(["--port", &port.to_string()]);
+        }
+        // Port 0: the agent binds a free one and writes it to `server.port`.
+        // Through the environment, since SLP reads `--port 0` as no port.
+        None => {
+            cmd.env("SLP_API_PORT", "0");
+        }
+    }
+    // A file left by an agent that didn't stop cleanly would point at a dead
+    // port; the new agent writes its own once it binds.
+    let _ = fs::remove_file(port_path());
+    cmd.env("SLP_HOME", &home)
         .current_dir(&home)
         .stdin(Stdio::null())
         .stdout(log)
@@ -839,22 +876,19 @@ fn launch(list: &mut dyn Steps, install: Option<usize>, step: usize, client: &Cl
         .spawn()
         .unwrap_or_else(|e| list.fail(step, format!("Failed to start {}: {}", binary.display(), e)));
     write_pid(child.id());
-    await_agent(list, step, client, base_url, Some(child));
+    await_agent(list, step, client, Some(child));
 }
 
 /// Wait until the agent answers `/health`, failing as soon as no agent
 /// process is left to wait on. `child` is the agent this CLI just spawned.
-fn await_agent(
-    list: &mut dyn Steps,
-    step: usize,
-    client: &Client,
-    base_url: &str,
-    mut child: Option<std::process::Child>,
-) {
+fn await_agent(list: &mut dyn Steps, step: usize, client: &Client, mut child: Option<std::process::Child>) {
     let log_path = install_dir().join("server.log");
     let started = Instant::now();
     while started.elapsed() < START_TIMEOUT {
-        if is_healthy(client, base_url) {
+        // Read each time: an agent on a free port only says which once bound.
+        let port_known = fixed_port().is_some() || bound_port().is_some();
+        if port_known && is_healthy(client, &crate::base_url()) {
+            list.set_detail(step, &format!("port {}", port()));
             list.done(step);
             return;
         }
@@ -891,13 +925,14 @@ fn processes() -> System {
     let mut system = System::new();
     let kind = ProcessRefreshKind::nothing()
         .with_exe(UpdateKind::OnlyIfNotSet)
-        .with_cmd(UpdateKind::OnlyIfNotSet);
+        .with_cmd(UpdateKind::OnlyIfNotSet)
+        .with_cwd(UpdateKind::OnlyIfNotSet);
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
     system
 }
 
-/// Whether the process is a live `slp agent start` on our port, so a pid
-/// file pointing at a reused pid is not mistaken for the agent.
+/// Whether the process is a live `slp agent start` that serves this home,
+/// so a pid file pointing at a reused pid is not mistaken for the agent.
 fn is_agent(process: &Process) -> bool {
     if process.status() == ProcessStatus::Zombie {
         return false;
@@ -908,13 +943,29 @@ fn is_agent(process: &Process) -> bool {
     }
     let args: Vec<_> = process.cmd().iter().map(|a| a.to_string_lossy()).collect();
     let starts_agent = args.windows(2).any(|w| w[0] == "agent" && w[1] == "start");
-    // No `--port` means SLP's default, which is ours unless `SLP_PORT` moved it.
-    let agent_port = args
-        .windows(2)
-        .find(|w| w[0] == "--port")
-        .and_then(|w| w[1].parse().ok())
-        .unwrap_or(DEFAULT_PORT);
-    starts_agent && agent_port == port()
+    let agent_port = args.windows(2).find(|w| w[0] == "--port").and_then(|w| w[1].parse::<u16>().ok());
+    starts_agent && is_our_port(agent_port) && serves_home(process.cwd(), &install_dir())
+}
+
+/// Whether an agent working in `cwd` belongs to `home`: the CLI starts it
+/// there, and it only moves into its projects, which live under it. An
+/// agent for another `SLP_HOME` (a test, a second workspace) is left alone.
+/// One whose directory can't be read is given the benefit of the doubt.
+fn serves_home(cwd: Option<&Path>, home: &Path) -> bool {
+    let Some(cwd) = cwd else { return true };
+    let canonical = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canonical(cwd).starts_with(canonical(home))
+}
+
+/// Whether an agent started with `--port agent_port` (or none) is ours. With
+/// `SLP_PORT` set it must be on that port, no `--port` meaning SLP's default.
+/// Without, the agent picks its own port, so one started on no port in
+/// particular is ours; only one pinned elsewhere (a dev build, say) is not.
+fn is_our_port(agent_port: Option<u16>) -> bool {
+    match fixed_port() {
+        Some(fixed) => agent_port.unwrap_or(DEFAULT_PORT) == fixed,
+        None => matches!(agent_port, None | Some(0) | Some(DEFAULT_PORT)),
+    }
 }
 
 /// The running agent: the pid on file when it is still the agent, otherwise
@@ -1010,6 +1061,7 @@ fn kill_agent(pid: Pid) {
         std::thread::sleep(Duration::from_millis(200));
     }
     let _ = fs::remove_file(pid_path());
+    let _ = fs::remove_file(port_path());
 }
 
 /// Keep the agent alive after the CLI exits and out of reach of the
@@ -1034,6 +1086,28 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
+
+    #[test]
+    fn an_agent_in_another_home_is_not_ours() {
+        let home = Path::new("/Users/me/.smartloop");
+        assert!(serves_home(Some(home), home));
+        assert!(serves_home(Some(&home.join("772a9194")), home));
+        assert!(!serves_home(Some(Path::new("/tmp/other-home")), home));
+        assert!(!serves_home(Some(Path::new("/Users/me/.smartloop-dev")), home));
+        assert!(serves_home(None, home));
+    }
+
+    #[test]
+    fn an_agent_on_no_port_in_particular_is_ours() {
+        if fixed_port().is_some() {
+            return;
+        }
+        assert!(is_our_port(None));
+        assert!(is_our_port(Some(0)));
+        // Started by a CLI from before random ports.
+        assert!(is_our_port(Some(DEFAULT_PORT)));
+        assert!(!is_our_port(Some(9000)));
+    }
 
     #[test]
     fn finds_the_archive_in_the_published_checksums() {

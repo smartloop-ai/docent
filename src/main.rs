@@ -1,7 +1,7 @@
 use std::io::{IsTerminal, Write};
 use std::process::exit;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use prettytable::{Attr, Cell, Row, Table, color};
 use reqwest::blocking::{Client, Response, multipart};
 
@@ -15,8 +15,8 @@ mod tui;
 mod usage;
 
 const LOGO: &str = r#"
-█▀ █▀▄▀█ ▄▀█ █▀█ ▀█▀ █   █▀█ █▀█ █▀█
-▄█ █ ▀ █ █▀█ █▀▄  █  █▄▄ █▄█ █▄█ █▀▀
+█▀▄ █▀█ █▀▀ █▀▀ █▄ █ ▀█▀
+█▄▀ █▄█ █▄▄ ██▄ █ ▀█  █
 "#;
 
 #[derive(Parser)]
@@ -24,7 +24,7 @@ const LOGO: &str = r#"
     name = "smartloop", 
     version, 
     author,
-    about=format!("{}\nLocal AI assistant and model orchestrator", LOGO),
+    about=format!("{}\nDocent by Smartloop: your private AI assistant", LOGO),
 )]
 
 struct Args {
@@ -972,7 +972,14 @@ fn delete_project(client: &Client, id: String) {
 }
 
 fn main() {
-    let args = Args::parse();
+    // Installed as both `smartloop` and `docent`: name it as it was run.
+    let docent = std::env::args_os()
+        .next()
+        .and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s == "docent"))
+        .unwrap_or_default();
+    let name = if docent { "docent" } else { "smartloop" };
+    let args = Args::from_arg_matches(&Args::command().name(name).bin_name(name).get_matches())
+        .unwrap_or_else(|e| e.exit());
 
     // Bare `smartloop` is `smartloop run`.
     let command = args.command.unwrap_or(Commands::Run { prompt: None, project: None, session: None, plain: false });
