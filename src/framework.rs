@@ -747,7 +747,7 @@ pub fn stream_progress(
             .and_then(|b| b["detail"].as_str().map(str::to_string))
             .unwrap_or_else(|| status.to_string());
         let hint = if matches!(status.as_u16(), 401 | 403) {
-            "; sign in with `smartloop login`"
+            "; sign in with `docent login`"
         } else {
             ""
         };

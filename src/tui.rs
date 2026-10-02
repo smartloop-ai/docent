@@ -67,8 +67,8 @@ const USAGE_BAR: usize = 30;
 const SPINNER: [&str; 4] = ["[-]", "[\\]", "[|]", "[/]"];
 
 const BANNER: [&str; 2] = [
-    "█▀▄ █▀█ █▀▀ █▀▀ █▄ █ ▀█▀",
-    "█▄▀ █▄█ █▄▄ ██▄ █ ▀█  █",
+    "█▀▄ █▀█ █▀▀ █▀▀ █▄  █ ▀█▀",
+    "█▄▀ █▄█ █▄▄ ██▄ █ ▀▄█  █",
 ];
 
 /// Run the app until the user quits, then print the session id so the
@@ -844,7 +844,7 @@ impl App {
                 }
             }
             None => self.entries.push(Entry::Error(
-                "No projects found; create one with `smartloop project create`".to_string(),
+                "No projects found; create one with `docent project create`".to_string(),
             )),
         }
     }
@@ -1565,8 +1565,8 @@ impl App {
     /// ```text
     /// ╭───────────────────────────────────────────────────────────────────────────╮
     /// │                                                                           │
-    /// │ █▀▄ █▀█ █▀▀ █▀▀ █▄ █ ▀█▀          project  general_chat                   │
-    /// │ █▄▀ █▄█ █▄▄ ██▄ █ ▀█  █           agent    http://localhost:38540/v1      │
+    /// │ █▀▄ █▀█ █▀▀ █▀▀ █▄  █ ▀█▀         project  general_chat                   │
+    /// │ █▄▀ █▄█ █▄▄ ██▄ █ ▀▄█  █          agent    http://localhost:38540/v1      │
     /// │ Your private AI assistant         version  CLI 1.0.14 · agent 1.2.7       │
     /// │ by Smartloop · ? for shortcuts                                            │
     /// │                                                                           │
@@ -2421,20 +2421,18 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         app.project = Some(("p1".into(), "general_chat".into()));
-        app.entries.push(Entry::User("What are three things to do in Madrid? Keep it short.".into()));
+        app.entries.push(Entry::User("[Doc 1] When does my lease end, and how much notice do I need to give?".into()));
         app.entries.push(Entry::Reply(Reply {
             warnings: Vec::new(),
             model: Some("sl-mini".into()),
-            text: "1. Explore the Royal Palace & Prado Museum\n2. Wander Los Rosales\n3. Indulge in Tapas and Food".into(),
-            citations: vec![
-                "https://www.cntraveler.com/story/three-perfect-days-in-madrid-according-to-our-local-editor".into(),
-                "https://www.esmadrid.com/en/whats-on-madrid".into(),
-                "https://www.tripadvisor.com/Attractions-g187514-Activities-Madrid.html".into(),
-            ],
-            stats: Some(TurnStats { tokens: 28, elapsed: Duration::from_secs(25) }),
+            text: "Your lease ends on 31 August 2027. You need to give 60 days' written notice, \
+                   so by 2 July 2027 (section 4.2). Leaving early costs one month's rent."
+                .into(),
+            citations: vec!["lease-agreement.pdf".into()],
+            stats: Some(TurnStats { tokens: 41, elapsed: Duration::from_secs(9) }),
             ended: None,
         }));
-        app.entries.push(Entry::User("Which one is best on a rainy day?".into()));
+        app.entries.push(Entry::User("Find well-reviewed movers near Seattle for early July".into()));
         app.entries.push(Entry::Reply(Reply::default()));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         app.turn = Some(Turn {
@@ -2446,7 +2444,7 @@ mod tests {
         });
         app.input = "".into();
 
-        let (width, height) = (100, 42);
+        let (width, height) = (100, 33);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();

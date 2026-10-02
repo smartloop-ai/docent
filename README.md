@@ -4,7 +4,7 @@ Your private AI assistant. Chat with your PDFs and Office files, search the web,
 
 It installs as both `docent` and `smartloop`; the two are the same command.
 
-<img width="822" alt="smartloop run: a reply with its sources, the status line and the prompt" src="docs/tui.png" />
+<img width="822" alt="docent run: a reply with its sources, the status line and the prompt" src="docs/tui.png" />
 
 More at:
 [docs.smartloop.ai](https://smartloop.ai/docs/intro/)
@@ -85,19 +85,19 @@ A step without a bar shows its elapsed time once it runs past a couple of
 seconds, and it ends with `✓ Setup complete in 1min 12s`.
 
 When stderr isn't a terminal, each step prints one line as it finishes
-instead. `smartloop model enable` shows the same checklist for its download.
+instead. `docent model enable` shows the same checklist for its download.
 
 To do this up front, or to stop the agent:
 
 ```sh
-smartloop agent start
-smartloop agent stop
+docent agent start
+docent agent stop
 ```
 
 ### Login
 
 ```sh
-smartloop login
+docent login
 ```
 
 Opens app.smartloop.ai in the browser to sign in, the same way the desktop app
@@ -106,16 +106,16 @@ stores it and uses it for every platform call. The command waits (up to five
 minutes) and prints the account it signed in as. If the browser doesn't open,
 visit the URL it prints.
 
-To sign in with a token instead, run `smartloop login --token` and paste it at
+To sign in with a token instead, run `docent login --token` and paste it at
 the prompt (input is hidden), or use `--token <token>` or pipe it on stdin in
-scripts. `smartloop logout` clears the stored credentials.
+scripts. `docent logout` clears the stored credentials.
 
 ### Projects
 
 List projects:
 
 ```sh
-smartloop project list
+docent project list
 ```
 
 Output is rendered as a table showing each project's ID, name, and whether it is a system project.
@@ -123,8 +123,8 @@ Output is rendered as a table showing each project's ID, name, and whether it is
 Create a project from a blank template:
 
 ```sh
-smartloop project create --name my-project
-smartloop project create --name my-project --description "Research notes"
+docent project create --name my-project
+docent project create --name my-project --description "Research notes"
 ```
 
 A blank project starts with no skills; the service seeds it with the workspace
@@ -135,8 +135,8 @@ choose.
 Import a project from an archive produced by an earlier export:
 
 ```sh
-smartloop project create --import my-project.zip
-smartloop project create --import my-project.zip --name restored-project
+docent project create --import my-project.zip
+docent project create --import my-project.zip --name restored-project
 ```
 
 `--name` is optional here — pass it to rename the imported project. The import
@@ -146,14 +146,14 @@ archive on the way in.
 Delete a project:
 
 ```sh
-smartloop project delete --id <project-id>
+docent project delete --id <project-id>
 ```
 
 Check which endpoint the CLI uses, whether the local agent is running there,
 which model it has loaded, and the per-project agents it has started:
 
 ```sh
-smartloop agent status
+docent agent status
 ```
 
 ```
@@ -174,10 +174,10 @@ The command exits with status 1 when the agent can't be reached there.
 Start an interactive chat with the local agent:
 
 ```sh
-smartloop
+docent
 ```
 
-`smartloop` on its own is short for `smartloop run`. In a terminal this opens a full-screen app, laid out like Claude Code. While
+`docent` on its own is short for `docent run`. In a terminal this opens a full-screen app, laid out like Claude Code. While
 a reply runs, a live status line above the prompt shows the agent's current
 step (web search, document lookup, model selection) and for how long, with a
 line per running download. The finished reply keeps its sources and the model
@@ -226,15 +226,15 @@ On exit it prints the session id, to resume with `--session`.
 Pass an initial prompt to send immediately:
 
 ```sh
-smartloop run "what are some things to do in madrid spain?"
+docent run "what are some things to do in madrid spain?"
 ```
 
 Options:
 
 ```sh
-smartloop run --project <project-id>   # chat in this project
-smartloop run --session <session-id>   # resume an existing session; a new one is created when omitted
-smartloop run --plain                  # line-by-line chat instead of the full-screen app
+docent run --project <project-id>   # chat in this project
+docent run --session <session-id>   # resume an existing session; a new one is created when omitted
+docent run --plain                  # line-by-line chat instead of the full-screen app
 ```
 
 When stdin or stdout isn't a terminal, or with `--plain`, `run` chats line by
@@ -257,20 +257,20 @@ The orchestrator picks which model serves each turn from the models enabled
 for the project. List what's available and its state for the current project:
 
 ```sh
-smartloop model list
+docent model list
 ```
 
 Enable or disable a model:
 
 ```sh
-smartloop model enable gemma4-e2b
-smartloop model disable gemma4-e2b
+docent model enable gemma4-e2b
+docent model disable gemma4-e2b
 ```
 
 `enable` downloads the weights first when they aren't on disk yet, showing
 progress, and only then switches the model on. Weights are shared across
 projects, so each model downloads once. Models marked `(sign in)` need
-`smartloop login` first. `disable` also unloads the model from memory. All
+`docent login` first. `disable` also unloads the model from memory. All
 three take `--project <project-id>` to act on a project other than the current
 one. The `sl-mini` orchestrator is always on and isn't listed.
 
@@ -280,7 +280,7 @@ The CLI connects to the local agent on whatever port it picked
 (`~/.smartloop/server.port`). Point it elsewhere with `SMARTLOOP_API_URL`:
 
 ```sh
-SMARTLOOP_API_URL=http://localhost:9000 smartloop project list
+SMARTLOOP_API_URL=http://localhost:9000 docent project list
 ```
 
 With `SMARTLOOP_API_URL` set, the CLI only connects: it never installs or starts

@@ -15,8 +15,8 @@ mod tui;
 mod usage;
 
 const LOGO: &str = r#"
-█▀▄ █▀█ █▀▀ █▀▀ █▄ █ ▀█▀
-█▄▀ █▄█ █▄▄ ██▄ █ ▀█  █
+█▀▄ █▀█ █▀▀ █▀▀ █▄  █ ▀█▀
+█▄▀ █▄█ █▄▄ ██▄ █ ▀▄█  █
 "#;
 
 #[derive(Parser)]
@@ -28,7 +28,7 @@ const LOGO: &str = r#"
 )]
 
 struct Args {
-    /// Without one, `smartloop` opens the chat, as `smartloop run` does.
+    /// Without one, `docent` opens the chat, as `docent run` does.
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -98,7 +98,7 @@ enum ModelCommands {
     },
     /// Enable a model for a project, downloading it first when needed
     Enable {
-        /// Model name, as shown by `smartloop model list`
+        /// Model name, as shown by `docent model list`
         name: String,
         /// Project ID; defaults to the current project
         #[arg(long, short)]
@@ -106,7 +106,7 @@ enum ModelCommands {
     },
     /// Disable a model for a project and unload it
     Disable {
-        /// Model name, as shown by `smartloop model list`
+        /// Model name, as shown by `docent model list`
         name: String,
         /// Project ID; defaults to the current project
         #[arg(long, short)]
@@ -246,7 +246,7 @@ fn list_projects(client: &Client) {
 fn select_project(client: &Client) -> String {
     let projects = fetch_projects(client);
     if projects.is_empty() {
-        fail("No projects found; create one with `smartloop project create`".to_string());
+        fail("No projects found; create one with `docent project create`".to_string());
     }
 
     let default = projects
@@ -509,7 +509,7 @@ fn resolve_project(client: &Client, project: Option<String>) -> String {
         .or_else(|| projects.first())
         .and_then(|p| p["id"].as_str())
         .map(str::to_string)
-        .unwrap_or_else(|| fail("No projects found; create one with `smartloop project create`".to_string()))
+        .unwrap_or_else(|| fail("No projects found; create one with `docent project create`".to_string()))
 }
 
 fn project_models_url(project_id: &str) -> String {

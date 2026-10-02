@@ -48,8 +48,8 @@ function Write-Banner {
     }
 
     Write-Host ""
-    Write-Host "$PINK$(& $render '#^< #^# #^^ #^^ #< # ^#^')$NC"
-    Write-Host "$PINK$(& $render '#<^ #<# #<< ##< # ^#  #')$NC  ${MUTED}by Smartloop${NC}"
+    Write-Host "$PINK$(& $render '#^< #^# #^^ #^^ #<  # ^#^')$NC"
+    Write-Host "$PINK$(& $render '#<^ #<# #<< ##< # ^<#  #')$NC  ${MUTED}by Smartloop${NC}"
     Write-Host "${MUTED}Your private AI assistant${NC}"
     Write-Host ""
     Write-Host "${MUTED}Version: ${NC}$Version"
@@ -100,7 +100,7 @@ $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToS
 New-Item -ItemType Directory -Path $tmp | Out-Null
 
 try {
-    Write-Host "${MUTED}[1/3] Downloading smartloop ($version)${NC}"
+    Write-Host "${MUTED}[1/3] Downloading docent ($version)${NC}"
     $archivePath = Join-Path $tmp $archive
     # Invoke-WebRequest draws its own progress bar; leave $ProgressPreference
     # at its default so the user sees it.
@@ -117,10 +117,10 @@ try {
     $actual = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLower()
     if ($actual -ne $expected.ToLower()) { throw "Checksum mismatch for $archive" }
 
-    Write-Host "${MUTED}[2/3] Unpacking smartloop ($version)${NC}"
+    Write-Host "${MUTED}[2/3] Unpacking docent ($version)${NC}"
     Expand-Archive -Path $archivePath -DestinationPath $tmp -Force
 
-    Write-Host "${MUTED}[3/3] Setting up smartloop ($version)${NC}"
+    Write-Host "${MUTED}[3/3] Setting up docent ($version)${NC}"
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Copy-Item -Path (Join-Path $tmp "$name\smartloop.exe") -Destination $InstallDir -Force
 
@@ -129,7 +129,7 @@ try {
 
     Write-Host "${GREEN}Installed${NC} $(Join-Path $InstallDir 'smartloop.exe') ${MUTED}(also as${NC} docent${MUTED})${NC}"
 
-    Write-Host "${MUTED}Processing triggers for smartloop ($version) ...$NC"
+    Write-Host "${MUTED}Processing triggers for docent ($version) ...$NC"
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if ($userPath -notlike "*$InstallDir*") {

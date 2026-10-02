@@ -275,8 +275,8 @@ setup_path() {
 
 print_banner() {
     say ""
-    say "${PINK}█▀▄ █▀█ █▀▀ █▀▀ █▄ █ ▀█▀${NC}"
-    say "${PINK}█▄▀ █▄█ █▄▄ ██▄ █ ▀█  █${NC}  ${MUTED}by Smartloop${NC}"
+    say "${PINK}█▀▄ █▀█ █▀▀ █▀▀ █▄  █ ▀█▀${NC}"
+    say "${PINK}█▄▀ █▄█ █▄▄ ██▄ █ ▀▄█  █${NC}  ${MUTED}by Smartloop${NC}"
     say "${MUTED}Your private AI assistant${NC}"
     say ""
     say "${MUTED}Version: ${NC}${VERSION}"
@@ -328,14 +328,14 @@ install_smartloop() {
 
     TMP_DIR="$(mktemp -d)"
 
-    say "${MUTED}[1/3] Downloading smartloop (${VERSION})${NC}"
+    say "${MUTED}[1/3] Downloading docent (${VERSION})${NC}"
     download_with_progress "${base_url}/${archive}" "${TMP_DIR}/${archive}" \
-        "Get:1 smartloop ${VERSION}"
+        "Get:1 docent ${VERSION}"
     curl -fsSL "${base_url}/SHA256SUMS" -o "${TMP_DIR}/SHA256SUMS" \
         || error "Could not download SHA256SUMS"
     verify_checksum "${TMP_DIR}/${archive}" "${TMP_DIR}/SHA256SUMS"
 
-    say "${MUTED}[2/3] Unpacking smartloop (${VERSION})${NC}"
+    say "${MUTED}[2/3] Unpacking docent (${VERSION})${NC}"
     if [ "$ARCHIVE_EXT" = "zip" ]; then
         need unzip
         unzip -q "${TMP_DIR}/${archive}" -d "$TMP_DIR"
@@ -343,14 +343,14 @@ install_smartloop() {
         tar -xzf "${TMP_DIR}/${archive}" -C "$TMP_DIR"
     fi
 
-    say "${MUTED}[3/3] Setting up smartloop (${VERSION})${NC}"
+    say "${MUTED}[3/3] Setting up docent (${VERSION})${NC}"
     mkdir -p "$INSTALL_DIR"
     install -m 755 "${TMP_DIR}/${name}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null \
         || { cp "${TMP_DIR}/${name}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}" \
              && chmod 755 "${INSTALL_DIR}/${BIN_NAME}"; }
 
     "${INSTALL_DIR}/${BIN_NAME}" --version >/dev/null 2>&1 \
-        || error "Installation verification failed: 'smartloop --version' did not succeed"
+        || error "Installation verification failed: 'docent --version' did not succeed"
 
     # `docent` is the same binary under its other name: a symlink, or on
     # Windows (no symlinks without admin) a copy.
@@ -362,7 +362,7 @@ install_smartloop() {
 
     say "${GREEN}Installed${NC} ${INSTALL_DIR}/${BIN_NAME} ${MUTED}(also as${NC} docent${MUTED})${NC}"
 
-    say "${MUTED}Processing triggers for smartloop (${VERSION}) ...${NC}"
+    say "${MUTED}Processing triggers for docent (${VERSION}) ...${NC}"
     if [ "$OS" = "pc-windows-msvc" ]; then
         # No POSIX rc file to edit under MSYS/Cygwin; install.ps1 sets the real
         # Windows user PATH.
