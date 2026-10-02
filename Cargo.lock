@@ -2771,6 +2771,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rpassword",
  "serde_json",
+ "sha2",
  "sysinfo",
  "tokio",
 ]

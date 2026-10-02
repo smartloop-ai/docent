@@ -76,11 +76,68 @@ fn platform() -> (&'static str, &'static str) {
     }
 }
 
-fn archive_url() -> String {
+fn release_url() -> String {
     let base = std::env::var("SLP_BASE_URL").unwrap_or_else(|_| DEFAULT_DOWNLOAD_URL.to_string());
+    format!("{}/slp/{}", base.trim_end_matches('/'), VERSION)
+}
+
+fn archive_name() -> String {
     let (plat, arch) = platform();
     let ext = if plat == "windows" { "zip" } else { "tar.gz" };
-    format!("{}/slp/{}/{}-{}-slp.{}", base.trim_end_matches('/'), VERSION, plat, arch, ext)
+    format!("{}-{}-slp.{}", plat, arch, ext)
+}
+
+fn archive_url() -> String {
+    format!("{}/{}", release_url(), archive_name())
+}
+
+/// Where an install records the SHA-256 of the archive it came from.
+fn checksum_path() -> PathBuf {
+    install_dir().join(VERSION).join(".archive-sha256")
+}
+
+/// The SHA-256 published for this platform's archive, from the release's
+/// `checksums-sha256.txt`. `None` when it can't be fetched (offline, say).
+fn published_checksum(client: &Client) -> Option<String> {
+    let listing = client
+        .get(format!("{}/checksums-sha256.txt", release_url()))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())?
+        .text()
+        .ok()?;
+    checksum_for(&listing, &archive_name())
+}
+
+/// `name`'s entry in `sha256sum` output (`<hex>  <file>`, or `<hex> *<file>`
+/// in binary mode).
+fn checksum_for(listing: &str, name: &str) -> Option<String> {
+    listing.lines().find_map(|line| {
+        let (sum, file) = line.split_once(char::is_whitespace)?;
+        (file.trim().trim_start_matches('*') == name).then(|| sum.trim().to_ascii_lowercase())
+    })
+}
+
+/// Whether this version was republished since it was installed: a release
+/// can be rebuilt under the same version, so the archive's checksum, not the
+/// version, says which build is on disk. An install from before checksums
+/// were recorded counts as outdated; with nothing published to compare
+/// against, the install stands.
+fn is_outdated(client: &Client) -> bool {
+    if !is_non_empty_file(&binary_path()) {
+        return false;
+    }
+    let Some(published) = published_checksum(client) else { return false };
+    fs::read_to_string(checksum_path()).map_or(true, |installed| installed.trim() != published)
+}
+
+fn sha256_of(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let mut file = fs::File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Download and extract the framework unless this version is already present,
@@ -114,6 +171,7 @@ fn ensure_installed(list: &mut dyn Steps, step: usize) -> PathBuf {
     let archive = cache_dir.join(format!("slp-{}-{}", VERSION, file_name));
 
     download(&url, &archive, list, step).unwrap_or_else(|e| list.fail(step, e));
+    let checksum = sha256_of(&archive).unwrap_or_else(|e| list.fail(step, e));
 
     list.note(step, "unpacking…");
     let result = extract(&archive, &version_dir);
@@ -164,6 +222,7 @@ fn ensure_installed(list: &mut dyn Steps, step: usize) -> PathBuf {
         );
     }
 
+    let _ = fs::write(checksum_path(), checksum);
     write_markers(&root);
     list.set_detail(step, "");
     list.done(step);
@@ -424,6 +483,19 @@ pub fn prepare(list: &mut dyn Steps, client: &Client, base_url: &str, local: boo
         list.start(step);
         kill_agent(Pid::from_u32(pid));
         list.done(step);
+    }
+    if is_outdated(client) {
+        // The running agent holds the old build's files open (Windows won't
+        // delete them), so it stops first; the install below then fetches
+        // the republished build and starts it again.
+        if let Some(pid) = agent_pid() {
+            let step = list.add(&format!("Stop agent (pid {})", pid));
+            list.set_detail(step, "update available");
+            list.start(step);
+            kill_agent(Pid::from_u32(pid));
+            list.done(step);
+        }
+        let _ = fs::remove_dir_all(install_dir().join(VERSION));
     }
     let running = agent_pid().is_some();
     let healthy = is_healthy(client, base_url);
@@ -962,6 +1034,14 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
+
+    #[test]
+    fn finds_the_archive_in_the_published_checksums() {
+        let listing = "736CED95  darwin-arm64-slp.tar.gz\n6b906a50  linux-amd64-slp.tar.gz\n2a6fb48a *windows-amd64-slp.zip\n";
+        assert_eq!(checksum_for(listing, "darwin-arm64-slp.tar.gz").as_deref(), Some("736ced95"));
+        assert_eq!(checksum_for(listing, "windows-amd64-slp.zip").as_deref(), Some("2a6fb48a"));
+        assert_eq!(checksum_for(listing, "linux-arm64-slp.tar.gz"), None);
+    }
 
     /// A server that stalls halfway through the first response and serves
     /// the rest from the Range the retry asks for.
