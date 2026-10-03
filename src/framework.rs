@@ -492,22 +492,20 @@ pub fn prepare(list: &mut dyn Steps, client: &Client, base_url: &str, local: boo
     if !home.exists()
         && let Some(pid) = agent_pid()
     {
-        let step = list.add(&format!("Stop agent (pid {})", pid));
-        list.set_detail(step, "home missing");
-        list.start(step);
-        kill_agent(Pid::from_u32(pid));
-        list.done(step);
+        stop_for(list, Pid::from_u32(pid), "home missing");
+    }
+    // An agent started before this CLI moved to a new `VERSION` still
+    // answers, so it stops here; the install below then fetches this
+    // version and starts it in its place.
+    if let Some(pid) = outdated_agent() {
+        stop_for(list, pid, &format!("upgrading to {}", VERSION));
     }
     if is_outdated(client) {
         // The running agent holds the old build's files open (Windows won't
         // delete them), so it stops first; the install below then fetches
         // the republished build and starts it again.
         if let Some(pid) = agent_pid() {
-            let step = list.add(&format!("Stop agent (pid {})", pid));
-            list.set_detail(step, "update available");
-            list.start(step);
-            kill_agent(Pid::from_u32(pid));
-            list.done(step);
+            stop_for(list, Pid::from_u32(pid), "update available");
         }
         let _ = fs::remove_dir_all(install_dir().join(VERSION));
     }
@@ -544,6 +542,32 @@ pub fn prepare(list: &mut dyn Steps, client: &Client, base_url: &str, local: boo
         }
     }
     Ok(())
+}
+
+/// Stop the agent as a step on `list`, saying why in `reason`.
+fn stop_for(list: &mut dyn Steps, pid: Pid, reason: &str) {
+    let step = list.add(&format!("Stop agent (pid {})", pid));
+    list.set_detail(step, reason);
+    list.start(step);
+    kill_agent(pid);
+    list.done(step);
+}
+
+/// The running agent when it runs another installed version, such as one
+/// the CLI started before an upgrade. One run from outside the home (a dev
+/// build, say) or whose binary can't be read is left alone.
+fn outdated_agent() -> Option<Pid> {
+    let system = processes();
+    let pid = find_agent(&system)?;
+    let exe = system.process(pid)?.exe()?;
+    runs_other_version(exe, &install_dir()).then_some(pid)
+}
+
+/// Whether `exe` is installed under `home` for a version other than this one.
+fn runs_other_version(exe: &Path, home: &Path) -> bool {
+    let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let exe = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    exe.starts_with(&home) && !exe.starts_with(home.join(VERSION))
 }
 
 /// The start step's detail before the agent answers: its port, when known.
@@ -1095,6 +1119,15 @@ mod tests {
         assert!(!serves_home(Some(Path::new("/tmp/other-home")), home));
         assert!(!serves_home(Some(Path::new("/Users/me/.smartloop-dev")), home));
         assert!(serves_home(None, home));
+    }
+
+    #[test]
+    fn an_agent_from_another_version_is_outdated() {
+        let home = Path::new("/Users/me/.smartloop");
+        assert!(!runs_other_version(&home.join(VERSION).join(binary_name()), home));
+        assert!(runs_other_version(&home.join("1.2.7").join(binary_name()), home));
+        // A dev build serving this home is not ours to replace.
+        assert!(!runs_other_version(Path::new("/opt/slp/bin/slp"), home));
     }
 
     #[test]
