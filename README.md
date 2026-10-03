@@ -55,8 +55,8 @@ Any command that talks to the agent starts it when none is running. It
 listens on a free port it picks itself and writes it to
 `~/.smartloop/server.port`, where the CLI reads it. On first use that means:
 
-1. Download the agent (SLP framework 1.2.7) from `https://dl.smartloop.ai/slp/1.2.7/` into
-   `~/.smartloop/1.2.7/`. Studio desktop uses the same folder and marker files,
+1. Download the agent (SLP framework 1.2.8) from `https://dl.smartloop.ai/slp/1.2.8/` into
+   `~/.smartloop/1.2.8/`. Studio desktop uses the same folder and marker files,
    so the two share one install.
 2. Start `slp agent start` in the background with `SLP_HOME=~/.smartloop`,
    logging to `~/.smartloop/server.log`. The agent keeps running after the CLI
@@ -71,7 +71,7 @@ checklist on stderr under the Docent banner that redraws in place, with
 the active download's bar in Smartloop pink:
 
 ```
-[✓] Agent 1.2.7                        667 MB
+[✓] Agent 1.2.8                        667 MB
 [✓] Start agent                    port 50578
 [✓] Embeddings (bge-m3)                417 MB
 [•] Base model sl-mini
