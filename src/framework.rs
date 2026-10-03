@@ -49,11 +49,20 @@ pub fn port() -> u16 {
     fixed_port().or_else(bound_port).unwrap_or(DEFAULT_PORT)
 }
 
-/// The port asked for with `SLP_PORT`. Without one the agent is started on a
-/// free port of its choosing, so it never clashes with whatever else holds
-/// 38540.
+/// The port asked for with `SLP_PORT`. Without one the agent is started on
+/// `launch_port`.
 fn fixed_port() -> Option<u16> {
     std::env::var("SLP_PORT").ok().and_then(|p| p.parse().ok()).filter(|&p| p > 0)
+}
+
+/// The port a new agent starts on: `SLP_PORT`, else 38540 while it is free,
+/// so MCP sign-in redirects, which name the port, still reach the agent
+/// after a restart. `None` when something else holds 38540: the agent then
+/// binds a free port of its choosing rather than clash with it.
+fn launch_port() -> Option<u16> {
+    fixed_port().or_else(|| {
+        std::net::TcpListener::bind(("127.0.0.1", DEFAULT_PORT)).ok().map(|_| DEFAULT_PORT)
+    })
 }
 
 /// Where the agent writes the port it bound once it's up:
@@ -548,7 +557,8 @@ pub fn prepare(list: &mut dyn Steps, client: &Client, base_url: &str, local: boo
 
 /// The start step's detail before the agent answers: its port, when known.
 fn port_detail(running: bool) -> String {
-    match fixed_port().or_else(|| bound_port().filter(|_| running)) {
+    let port = if running { fixed_port().or_else(bound_port) } else { launch_port() };
+    match port {
         Some(port) => format!("port {}", port),
         None => "free port".to_string(),
     }
@@ -850,7 +860,7 @@ fn launch(list: &mut dyn Steps, install: Option<usize>, step: usize, client: &Cl
 
     let mut cmd = Command::new(&binary);
     cmd.args(["agent", "start"]);
-    match fixed_port() {
+    match launch_port() {
         Some(port) => {
             cmd.args(["--port", &port.to_string()]);
         }
