@@ -83,9 +83,9 @@ fn platform() -> (&'static str, &'static str) {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => ("darwin", "arm64"),
         ("linux", "x86_64") => ("linux", "amd64"),
+        ("linux", "aarch64") => ("linux", "arm64"),
         ("windows", "x86_64") => ("windows", "amd64"),
         ("macos", _) => fail("Only Apple Silicon (arm64) is supported on macOS".to_string()),
-        ("linux", _) => fail("Only x86_64 (amd64) is supported on Linux".to_string()),
         (os, arch) => fail(format!("Unsupported platform: {}-{}", os, arch)),
     }
 }
