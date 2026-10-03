@@ -20,7 +20,7 @@ use crate::fail;
 use crate::progress::{Checklist, Steps, format_size};
 
 /// SLP framework version this CLI installs and runs.
-pub const VERSION: &str = "1.2.7";
+pub const VERSION: &str = "1.2.8";
 const DEFAULT_PORT: u16 = 38540;
 const DEFAULT_DOWNLOAD_URL: &str = "https://dl.smartloop.ai";
 /// Embedding GGUF SLP loads for document search (AppSettings.embedding_gguf_file).
