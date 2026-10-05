@@ -47,6 +47,22 @@ Requires Rust (2024 edition):
 cargo install --path .
 ```
 
+## Quick start
+
+All you need is `docent`. Run it and you're chatting: no account and no
+separate agent setup.
+
+```sh
+docent
+```
+
+The first run downloads and starts the local agent for you (see
+[First run](#first-run)). Everything below is optional:
+
+- **AI search:** `docent login` signs you in and enables web (AI) search.
+- **Agent control:** `docent agent stop` stops the local agent and
+  `docent agent start` starts it again.
+
 ## Usage
 
 ### First run
@@ -87,14 +103,18 @@ seconds, and it ends with `✓ Setup complete in 1min 12s`.
 When stderr isn't a terminal, each step prints one line as it finishes
 instead. `docent model enable` shows the same checklist for its download.
 
-To do this up front, or to stop the agent:
+To do this up front, or to stop (and later restart) the agent. Optional; the
+agent starts on its own when needed:
 
 ```sh
 docent agent start
 docent agent stop
 ```
 
-### Login
+### Login (optional)
+
+Signing in isn't required to use Docent. It unlocks AI search (web search) and
+the models marked `(sign in)`.
 
 ```sh
 docent login
