@@ -2,14 +2,26 @@
 name = "smartloop-cli"
 version = "1.0.33"
 edition = "2024"
+build = "build.rs"
 
 [[bin]]
 name = "smartloop"
 path = "src/main.rs"
 
+[features]
+default = []
+# GPU backends for the embedded agent's llama.cpp, passed through to the
+# smartloop crate: Metal on macOS, Vulkan on Linux and Windows.
+metal = ["smartloop/metal"]
+vulkan = ["smartloop/vulkan"]
+cuda = ["smartloop/cuda"]
+
 [dependencies]
+# The SLP framework, run in-process as the local agent, from Smartloop's
+# registry at dl.smartloop.ai (declared in .cargo/config.toml).
+smartloop = { version = "1.2.9", registry = "smartloop" }
 serde_json = "1"
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 prettytable-rs = "^0.10"
 async-openai = { version = "0.42.0", features = ["byot", "chat-completion"] }
@@ -22,4 +34,9 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 arboard = { version = "3.6.1", default-features = false }
 fernet = { version = "0.2.2", default-features = false, features = ["rustcrypto"] }
-sha2 = "0.10"
+anyhow = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

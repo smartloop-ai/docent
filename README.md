@@ -36,16 +36,28 @@ sets your user `PATH` through the registry. Restart the shell to pick it up.
 Set `SMARTLOOP_CLI_INSTALL_DIR` to install elsewhere, or `SMARTLOOP_CLI_VERSION`
 to pin a specific release.
 
-Prebuilt binaries are published for Linux (x86_64, aarch64 — statically linked
-against musl), macOS (Apple Silicon and Intel) and Windows (x86_64).
+Prebuilt binaries are published for Linux (x86_64, aarch64; glibc, with the
+Vulkan loader bundled), macOS (Apple Silicon, signed and notarized) and
+Windows (x86_64, signed). The agent is built in, with GPU inference through
+Metal on macOS and Vulkan on Linux and Windows.
+
+On Linux the release folder goes to `~/.local/share/smartloop/<version>/`, and
+the bin directory gets symlinks to it.
 
 ### From source
 
-Requires Rust (2024 edition):
+Requires Rust (2024 edition), CMake and a C/C++ toolchain, since the built-in
+agent compiles llama.cpp. Pick the GPU backend with a feature:
 
 ```sh
-cargo install --path .
+cargo install --path . --features metal    # macOS
+cargo install --path . --features vulkan   # Linux, Windows (needs the Vulkan SDK)
+cargo install --path .                     # CPU only
 ```
+
+The framework crate comes from Smartloop's public registry at
+`https://dl.smartloop.ai/crates/`, declared in `.cargo/config.toml`; no
+account or token is needed.
 
 ## Quick start
 
@@ -71,15 +83,14 @@ Any command that talks to the agent starts it when none is running. It
 listens on a free port it picks itself and writes it to
 `~/.smartloop/server.port`, where the CLI reads it. On first use that means:
 
-1. Download the agent (SLP framework 1.2.8) from `https://dl.smartloop.ai/slp/1.2.8/` into
-   `~/.smartloop/1.2.8/`. Studio desktop uses the same folder and marker files,
-   so the two share one install.
-2. Start `slp agent start` in the background with `SLP_HOME=~/.smartloop`,
-   logging to `~/.smartloop/server.log`. The agent keeps running after the CLI
-   exits.
-3. Download the embedding model (`bge-m3-Q4_K_M.gguf`, ~417 MB) into the
+1. Start the agent, which is built into the CLI (SLP framework 1.2.9), in
+   the background with `SLP_HOME=~/.smartloop`, logging to
+   `~/.smartloop/server.log`. The agent keeps running after the CLI exits.
+   An agent Studio desktop runs on the same home is used instead, when it is
+   the same framework version.
+2. Download the embedding model (`bge-m3-Q4_K_M.gguf`, ~417 MB) into the
    workspace's `models/embeddings/` folder for document search.
-4. Run the agent's bootstrap, which downloads the default base model, creates
+3. Run the agent's bootstrap, which downloads the default base model, creates
    the default project and loads the model.
 
 Each step is skipped when its files are already there. Progress shows as a
@@ -87,7 +98,6 @@ checklist on stderr under the Docent banner that redraws in place, with
 the active download's bar in Smartloop pink:
 
 ```
-[✓] Agent 1.2.8                        667 MB
 [✓] Start agent                    port 50578
 [✓] Embeddings (bge-m3)                417 MB
 [•] Base model sl-mini
@@ -308,9 +318,8 @@ an agent for that URL.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `SLP_HOME` | `~/.smartloop` | Where the framework, workspace, models and logs live |
+| `SLP_HOME` | `~/.smartloop` | Where the workspace, models and logs live |
 | `SLP_PORT` | a free port | Pin the managed local agent to this port |
-| `SLP_BASE_URL` | `https://dl.smartloop.ai` | Where the framework archive is downloaded from |
 
 ## License
 

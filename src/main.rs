@@ -7,6 +7,7 @@ use reqwest::blocking::{Client, Response, multipart};
 
 use progress::Steps;
 
+mod agent;
 mod chat;
 mod framework;
 mod mcp;
@@ -972,6 +973,12 @@ fn delete_project(client: &Client, id: String) {
 }
 
 fn main() {
+    // The agent and its workers run from this same binary.
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(code) = agent::dispatch(&argv) {
+        exit(code);
+    }
+
     // Installed as both `smartloop` and `docent`: name it as it was run.
     let docent = std::env::args_os()
         .next()
