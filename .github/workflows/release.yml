@@ -176,6 +176,26 @@ jobs:
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\bin"
 
+      # llama.cpp builds with Ninja on Windows. Under MSBuild, llama-cpp-sys-2
+      # turns file tracking off (TrackFileAccess=false), so MSBuild runs the
+      # steps of the vulkan-shaders-gen external project in parallel without
+      # their order: the install step raced the configure step and failed
+      # on a missing cmake_install.cmake (runs 37414126706, 37415358531).
+      # Ninja follows the step dependencies. cmake-rs picks the generator
+      # up from CMAKE_GENERATOR, and Ninja needs the MSVC developer shell.
+      - name: Set up MSVC and Ninja (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Use Ninja for CMake (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          command -v ninja >/dev/null || choco install ninja -y --no-progress
+          ninja --version
+          echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
+
       # llama.cpp takes tens of minutes from scratch; keep the -sys crates.
       - uses: Swatinem/rust-cache@v2
         with:
@@ -192,11 +212,6 @@ jobs:
             aarch64-unknown-linux-gnu) export GGML_NATIVE=OFF GGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16 ;;
           esac
           export CMAKE_BUILD_PARALLEL_LEVEL="$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)"
-          # MSBuild runs the steps of llama.cpp's vulkan-shaders-gen external
-          # project in parallel; at 4 the install step ran before configure
-          # and failed (run 37414126706). 2 is what smartloop's own Windows
-          # build uses, which passes.
-          if [ "${{ runner.os }}" = Windows ]; then export CMAKE_BUILD_PARALLEL_LEVEL=2; fi
           cargo build --release --locked --target ${{ matrix.target }} --features "${{ matrix.features }}"
 
       - name: Stage
