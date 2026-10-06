@@ -635,7 +635,12 @@ fn launch(list: &mut dyn Steps, step: usize, client: &Client) {
     let binary = std::env::current_exe()
         .unwrap_or_else(|e| list.fail(step, format!("Cannot find this executable: {}", e)));
 
+    // Nothing else creates the home on a first run: the agent writes its
+    // log there and runs in it.
     let home = install_dir();
+    if let Err(e) = fs::create_dir_all(&home) {
+        list.fail(step, format!("Failed to create {}: {}", home.display(), e));
+    }
     let log_path = home.join("server.log");
     let mut log = fs::OpenOptions::new()
         .create(true)
