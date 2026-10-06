@@ -123,6 +123,9 @@ try {
     Write-Host "${MUTED}[3/3] Setting up docent ($version)${NC}"
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Copy-Item -Path (Join-Path $tmp "$name\smartloop.exe") -Destination $InstallDir -Force
+    # The Vulkan loader and MSVC runtime the embedded agent loads, found in
+    # the application directory.
+    Copy-Item -Path (Join-Path $tmp "$name\*.dll") -Destination $InstallDir -Force
 
     # `docent` is the same binary under its other name; symlinks need admin.
     Copy-Item -Path (Join-Path $InstallDir 'smartloop.exe') -Destination (Join-Path $InstallDir 'docent.exe') -Force

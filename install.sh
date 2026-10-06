@@ -60,7 +60,7 @@ detect_target() {
     arch="$(uname -m)"
 
     case "$os" in
-        Linux)  os_part="unknown-linux-musl" ;;
+        Linux)  os_part="unknown-linux-gnu" ;;
         Darwin) os_part="apple-darwin" ;;
         MINGW*|MSYS*|CYGWIN*) os_part="pc-windows-msvc" ;;
         *) error "Unsupported OS: $os" ;;
@@ -74,6 +74,9 @@ detect_target() {
 
     if [ "$os_part" = "pc-windows-msvc" ] && [ "$arch_part" != "x86_64" ]; then
         error "Windows builds are published for x86_64 only"
+    fi
+    if [ "$os_part" = "apple-darwin" ] && [ "$arch_part" != "aarch64" ]; then
+        error "macOS builds are published for Apple Silicon only"
     fi
 
     OS="$os_part"
@@ -345,9 +348,26 @@ install_smartloop() {
 
     say "${MUTED}[3/3] Setting up docent (${VERSION})${NC}"
     mkdir -p "$INSTALL_DIR"
-    install -m 755 "${TMP_DIR}/${name}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null \
-        || { cp "${TMP_DIR}/${name}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}" \
-             && chmod 755 "${INSTALL_DIR}/${BIN_NAME}"; }
+    if [ -d "${TMP_DIR}/${name}/lib" ]; then
+        # Linux builds carry the Vulkan loader in lib/, found next to the real
+        # binary, so the folder lives in its own place and the bin directory
+        # gets symlinks.
+        local data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/smartloop"
+        local payload="${data_dir}/${VERSION}"
+        mkdir -p "$data_dir"
+        rm -rf "$payload"
+        cp -R "${TMP_DIR}/${name}" "$payload"
+        chmod 755 "${payload}/${BIN_NAME}"
+        ln -sf "${payload}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
+        # Earlier versions' folders are no longer referenced.
+        for old in "$data_dir"/*; do
+            [ "$old" = "$payload" ] || rm -rf "$old"
+        done
+    else
+        install -m 755 "${TMP_DIR}/${name}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null \
+            || { cp "${TMP_DIR}/${name}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}" \
+                 && chmod 755 "${INSTALL_DIR}/${BIN_NAME}"; }
+    fi
 
     "${INSTALL_DIR}/${BIN_NAME}" --version >/dev/null 2>&1 \
         || error "Installation verification failed: 'docent --version' did not succeed"
@@ -355,6 +375,7 @@ install_smartloop() {
     # `docent` is the same binary under its other name: a symlink, or on
     # Windows (no symlinks without admin) a copy.
     if [ "$OS" = "pc-windows-msvc" ]; then
+        cp "${TMP_DIR}/${name}"/*.dll "$INSTALL_DIR"/ 2>/dev/null || true
         cp "${INSTALL_DIR}/${BIN_NAME}" "${INSTALL_DIR}/docent.exe"
     else
         ln -sf "$BIN_NAME" "${INSTALL_DIR}/docent"

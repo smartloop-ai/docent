@@ -1,0 +1,4 @@
+# Smartloop's crate registry, a static sparse index on Cloudflare R2. It is
+# public, so a fresh clone builds with no credentials.
+[registries.smartloop]
+index = "sparse+https://dl.smartloop.ai/crates/"

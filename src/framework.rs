@@ -1,11 +1,11 @@
-//! Install and run the SLP framework without the studio app.
+//! Run the local agent without the studio app.
 //!
-//! Mirrors studio-desktop's `slp-setup.js` fallback path: the framework is
-//! downloaded from `https://dl.smartloop.ai/slp/<version>/<plat>-<arch>-slp.<ext>`
-//! and extracted into `~/.smartloop/<version>/`, with the same marker files so
-//! the studio app and the CLI share one install. The agent is then started as
-//! a detached `slp agent start` with `SLP_HOME=~/.smartloop`, the way
-//! `slp-service.js` launches it.
+//! The SLP framework is built into this binary (the `smartloop` crate), so
+//! there is nothing to install: the agent is this executable started
+//! detached as `__agent-serve` with `SLP_HOME=~/.smartloop`, the way
+//! `slp-service.js` launches `slp agent start`. An `slp agent start` the
+//! studio app runs on the same home is used as well, when it is this
+//! framework version.
 
 use std::fs;
 use std::io::{BufRead, Read, Write};
@@ -16,11 +16,12 @@ use std::time::{Duration, Instant};
 use reqwest::blocking::Client;
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, Signal, System, UpdateKind};
 
+use crate::agent::{CLI_VERSION_FLAG, SERVE_SUBCOMMAND};
 use crate::fail;
 use crate::progress::{Checklist, Steps, format_size};
 
-/// SLP framework version this CLI installs and runs.
-pub const VERSION: &str = "1.2.8";
+/// SLP framework version built into this CLI.
+pub const VERSION: &str = smartloop::VERSION;
 const DEFAULT_PORT: u16 = 38540;
 const DEFAULT_DOWNLOAD_URL: &str = "https://dl.smartloop.ai";
 /// Embedding GGUF SLP loads for document search (AppSettings.embedding_gguf_file).
@@ -66,201 +67,10 @@ fn bound_port() -> Option<u16> {
     fs::read_to_string(port_path()).ok()?.trim().parse().ok().filter(|&p| p > 0)
 }
 
-fn binary_name() -> &'static str {
-    if cfg!(windows) { "slp.exe" } else { "slp" }
-}
-
-pub fn binary_path() -> PathBuf {
-    install_dir().join(VERSION).join(binary_name())
-}
-
 fn is_non_empty_file(path: &Path) -> bool {
     fs::metadata(path).map(|m| m.is_file() && m.len() > 0).unwrap_or(false)
 }
 
-/// Platform segment of the archive name; only the builds the CDN publishes.
-fn platform() -> (&'static str, &'static str) {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => ("darwin", "arm64"),
-        ("linux", "x86_64") => ("linux", "amd64"),
-        ("linux", "aarch64") => ("linux", "arm64"),
-        ("windows", "x86_64") => ("windows", "amd64"),
-        ("macos", _) => fail("Only Apple Silicon (arm64) is supported on macOS".to_string()),
-        (os, arch) => fail(format!("Unsupported platform: {}-{}", os, arch)),
-    }
-}
-
-fn release_url() -> String {
-    let base = std::env::var("SLP_BASE_URL").unwrap_or_else(|_| DEFAULT_DOWNLOAD_URL.to_string());
-    format!("{}/slp/{}", base.trim_end_matches('/'), VERSION)
-}
-
-fn archive_name() -> String {
-    let (plat, arch) = platform();
-    let ext = if plat == "windows" { "zip" } else { "tar.gz" };
-    format!("{}-{}-slp.{}", plat, arch, ext)
-}
-
-fn archive_url() -> String {
-    format!("{}/{}", release_url(), archive_name())
-}
-
-/// Where an install records the SHA-256 of the archive it came from.
-fn checksum_path() -> PathBuf {
-    install_dir().join(VERSION).join(".archive-sha256")
-}
-
-/// The SHA-256 published for this platform's archive, from the release's
-/// `checksums-sha256.txt`. `None` when it can't be fetched (offline, say).
-fn published_checksum(client: &Client) -> Option<String> {
-    let listing = client
-        .get(format!("{}/checksums-sha256.txt", release_url()))
-        .timeout(Duration::from_secs(5))
-        .send()
-        .ok()
-        .filter(|r| r.status().is_success())?
-        .text()
-        .ok()?;
-    checksum_for(&listing, &archive_name())
-}
-
-/// `name`'s entry in `sha256sum` output (`<hex>  <file>`, or `<hex> *<file>`
-/// in binary mode).
-fn checksum_for(listing: &str, name: &str) -> Option<String> {
-    listing.lines().find_map(|line| {
-        let (sum, file) = line.split_once(char::is_whitespace)?;
-        (file.trim().trim_start_matches('*') == name).then(|| sum.trim().to_ascii_lowercase())
-    })
-}
-
-/// Whether this version was republished since it was installed: a release
-/// can be rebuilt under the same version, so the archive's checksum, not the
-/// version, says which build is on disk. An install from before checksums
-/// were recorded counts as outdated; with nothing published to compare
-/// against, the install stands.
-fn is_outdated(client: &Client) -> bool {
-    if !is_non_empty_file(&binary_path()) {
-        return false;
-    }
-    let Some(published) = published_checksum(client) else { return false };
-    fs::read_to_string(checksum_path()).map_or(true, |installed| installed.trim() != published)
-}
-
-fn sha256_of(path: &Path) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    let mut file = fs::File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-/// Download and extract the framework unless this version is already present,
-/// as `step` on `list`. Returns the binary path.
-fn ensure_installed(list: &mut dyn Steps, step: usize) -> PathBuf {
-    let binary = binary_path();
-    if is_non_empty_file(&binary) {
-        list.done(step);
-        return binary;
-    }
-
-    let url = archive_url();
-    let file_name = url.rsplit_once('/').map_or("slp-archive", |(_, f)| f);
-    list.start(step);
-
-    let root = install_dir();
-    let version_dir = root.join(VERSION);
-    let cache_dir = root.join("cache");
-    for dir in [&root, &cache_dir] {
-        if let Err(e) = fs::create_dir_all(dir) {
-            list.fail(step, format!("Failed to create {}: {}", dir.display(), e));
-        }
-    }
-    // Start from a clean version dir so a half-finished earlier install
-    // can't leave stale files next to the new ones.
-    let _ = fs::remove_dir_all(&version_dir);
-    if let Err(e) = fs::create_dir_all(&version_dir) {
-        list.fail(step, format!("Failed to create {}: {}", version_dir.display(), e));
-    }
-
-    let archive = cache_dir.join(format!("slp-{}-{}", VERSION, file_name));
-
-    download(&url, &archive, list, step).unwrap_or_else(|e| list.fail(step, e));
-    let checksum = sha256_of(&archive).unwrap_or_else(|e| list.fail(step, e));
-
-    list.note(step, "unpacking…");
-    let result = extract(&archive, &version_dir);
-    let _ = fs::remove_file(&archive);
-    if let Err(e) = result {
-        let _ = fs::remove_dir_all(&version_dir);
-        list.fail(step, e);
-    }
-
-    if !is_non_empty_file(&binary) {
-        list.fail(
-            step,
-            format!(
-                "Binary missing or empty at {} after install — the archive may be incomplete",
-                binary.display()
-            ),
-        );
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&binary, fs::Permissions::from_mode(0o755));
-    }
-
-    // Strip quarantine so Gatekeeper doesn't block the freshly downloaded binary.
-    if cfg!(target_os = "macos") {
-        let _ = Command::new("xattr")
-            .args(["-dr", "com.apple.quarantine"])
-            .arg(&version_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-
-    list.note(step, "verifying…");
-    let verified = Command::new(&binary)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !verified {
-        list.fail(
-            step,
-            format!("Installation verification failed: '{} --version' did not succeed", binary.display()),
-        );
-    }
-
-    let _ = fs::write(checksum_path(), checksum);
-    write_markers(&root);
-    list.set_detail(step, "");
-    list.done(step);
-    binary
-}
-
-/// Same bookkeeping files slp-setup.js writes, so the studio app sees this
-/// install as its own.
-fn write_markers(root: &Path) {
-    let _ = fs::write(root.join("version"), VERSION);
-    let _ = fs::write(root.join(".installed-version"), VERSION);
-
-    let installed = root.join("installed");
-    let listed = fs::read_to_string(&installed).unwrap_or_default();
-    if !listed.lines().any(|v| v.trim() == VERSION)
-        && let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&installed)
-    {
-        let _ = writeln!(file, "{}", VERSION);
-    }
-}
-
-/// Download `url` to `dest` through `<dest>.part`. A stalled or dropped
-/// connection is retried, resuming from the bytes already on disk with a
-/// Range request; so is a `.part` left by an earlier run.
 fn download(url: &str, dest: &Path, list: &mut dyn Steps, step: usize) -> Result<u64, String> {
     download_with(url, dest, list, step, STALL_TIMEOUT)
 }
@@ -412,46 +222,6 @@ fn content_range_total(response: &reqwest::blocking::Response) -> Option<u64> {
         .ok()
 }
 
-/// Extract with the system `tar` (bsdtar on macOS and Windows 10+, which
-/// also reads zip). The archive may wrap everything in a top-level `slp/`
-/// directory; strip it so the binary lands at `<version_dir>/slp`.
-fn extract(archive: &Path, dest: &Path) -> Result<(), String> {
-    let gz = archive.extension().is_some_and(|e| e == "gz");
-
-    let listing = Command::new("tar")
-        .arg(if gz { "-tzf" } else { "-tf" })
-        .arg(archive)
-        .output()
-        .map_err(|e| format!("Failed to run tar: {}", e))?;
-    if !listing.status.success() {
-        return Err(format!(
-            "Failed to read archive: {}",
-            String::from_utf8_lossy(&listing.stderr).trim()
-        ));
-    }
-    let listing = String::from_utf8_lossy(&listing.stdout);
-    let mut top_level = listing
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(|l| l.split('/').next().unwrap_or_default());
-    let strip_wrapper = top_level.next() == Some("slp") && top_level.all(|t| t == "slp");
-
-    let mut cmd = Command::new("tar");
-    cmd.arg(if gz { "-xzf" } else { "-xf" }).arg(archive).arg("-C").arg(dest);
-    if strip_wrapper {
-        cmd.arg("--strip-components=1");
-    }
-    let out = cmd.output().map_err(|e| format!("Failed to run tar: {}", e))?;
-    if !out.status.success() {
-        return Err(format!(
-            "Failed to extract archive: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(())
-}
-
 fn is_healthy(client: &Client, base_url: &str) -> bool {
     client
         .get(format!("{}/health", base_url))
@@ -494,20 +264,10 @@ pub fn prepare(list: &mut dyn Steps, client: &Client, base_url: &str, local: boo
     {
         stop_for(list, Pid::from_u32(pid), "home missing");
     }
-    // An agent started before this CLI moved to a new `VERSION` still
-    // answers, so it stops here; the install below then fetches this
-    // version and starts it in its place.
+    // An agent from another build still answers, so it stops here and this
+    // binary's agent starts in its place below.
     if let Some(pid) = outdated_agent() {
-        stop_for(list, pid, &format!("upgrading to {}", VERSION));
-    }
-    if is_outdated(client) {
-        // The running agent holds the old build's files open (Windows won't
-        // delete them), so it stops first; the install below then fetches
-        // the republished build and starts it again.
-        if let Some(pid) = agent_pid() {
-            stop_for(list, Pid::from_u32(pid), "update available");
-        }
-        let _ = fs::remove_dir_all(install_dir().join(VERSION));
+        stop_for(list, pid, &format!("upgrading to {}", env!("CARGO_PKG_VERSION")));
     }
     let running = agent_pid().is_some();
     let healthy = is_healthy(client, base_url);
@@ -516,8 +276,6 @@ pub fn prepare(list: &mut dyn Steps, client: &Client, base_url: &str, local: boo
     // agent answers.
     let mut queued = None;
     if !healthy {
-        let install = (!running && !is_non_empty_file(&binary_path()))
-            .then(|| list.add(&format!("Agent {}", VERSION)));
         let start = list.add(if running { "Wait for agent" } else { "Start agent" });
         list.set_detail(start, &port_detail(running));
         queued = Some(queue_setup(list));
@@ -527,7 +285,7 @@ pub fn prepare(list: &mut dyn Steps, client: &Client, base_url: &str, local: boo
         } else {
             // Something other than an `slp` process may serve the port (a
             // dev build, say); only start one when nothing answers either.
-            launch(list, install, start, client);
+            launch(list, start, client);
         }
     }
     // Known only now that the agent is up, when it picked its own port.
@@ -553,14 +311,34 @@ fn stop_for(list: &mut dyn Steps, pid: Pid, reason: &str) {
     list.done(step);
 }
 
-/// The running agent when it runs another installed version, such as one
-/// the CLI started before an upgrade. One run from outside the home (a dev
-/// build, say) or whose binary can't be read is left alone.
+/// The running agent when it is another build than this one: one this
+/// binary served for another CLI version (an upgrade in place), or an `slp`
+/// the CLI installed before the framework was built in, for another
+/// framework version. An `slp` run from outside the home (a dev build, say)
+/// is left alone.
 fn outdated_agent() -> Option<Pid> {
     let system = processes();
     let pid = find_agent(&system)?;
-    let exe = system.process(pid)?.exe()?;
-    runs_other_version(exe, &install_dir()).then_some(pid)
+    let process = system.process(pid)?;
+    let args = args_of(process);
+    let outdated = match served_cli_version(&args) {
+        Some(version) => version != env!("CARGO_PKG_VERSION"),
+        None => process.exe().is_some_and(|exe| runs_other_version(exe, &install_dir())),
+    };
+    outdated.then_some(pid)
+}
+
+/// The `--cli-version` an agent served by this binary was started with;
+/// `None` for an `slp agent start`.
+fn served_cli_version(args: &[String]) -> Option<&str> {
+    if !args.iter().any(|a| a == SERVE_SUBCOMMAND) {
+        return None;
+    }
+    Some(
+        args.windows(2)
+            .find(|w| w[0] == CLI_VERSION_FLAG)
+            .map_or("", |w| w[1].as_str()),
+    )
 }
 
 /// Whether `exe` is installed under `home` for a version other than this one.
@@ -850,15 +628,12 @@ fn model_name_in(message: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Install the framework as step `install`, when it's missing, then start
-/// `slp agent start` as `step`, detached from this process and logging to
-/// `~/.smartloop/server.log`, and wait until `/health` answers.
-fn launch(list: &mut dyn Steps, install: Option<usize>, step: usize, client: &Client) {
-    let binary = match install {
-        Some(install) => ensure_installed(list, install),
-        None => binary_path(),
-    };
+/// Start this binary's agent as `step`, detached from this process and
+/// logging to `~/.smartloop/server.log`, and wait until `/health` answers.
+fn launch(list: &mut dyn Steps, step: usize, client: &Client) {
     list.start(step);
+    let binary = std::env::current_exe()
+        .unwrap_or_else(|e| list.fail(step, format!("Cannot find this executable: {}", e)));
 
     let home = install_dir();
     let log_path = home.join("server.log");
@@ -873,13 +648,13 @@ fn launch(list: &mut dyn Steps, install: Option<usize>, step: usize, client: &Cl
         .unwrap_or_else(|e| list.fail(step, format!("Failed to open {}: {}", log_path.display(), e)));
 
     let mut cmd = Command::new(&binary);
-    cmd.args(["agent", "start"]);
+    cmd.args([SERVE_SUBCOMMAND, CLI_VERSION_FLAG, env!("CARGO_PKG_VERSION")]);
     match fixed_port() {
         Some(port) => {
             cmd.args(["--port", &port.to_string()]);
         }
         // Port 0: the agent binds a free one and writes it to `server.port`.
-        // Through the environment, since SLP reads `--port 0` as no port.
+        // Through the environment, since `--port 0` reads as no port.
         None => {
             cmd.env("SLP_API_PORT", "0");
         }
@@ -955,18 +730,22 @@ fn processes() -> System {
     system
 }
 
-/// Whether the process is a live `slp agent start` that serves this home,
-/// so a pid file pointing at a reused pid is not mistaken for the agent.
+fn args_of(process: &Process) -> Vec<String> {
+    process.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect()
+}
+
+/// Whether the process is a live agent that serves this home — this
+/// binary's `__agent-serve`, or an `slp agent start` such as the studio
+/// app's — so a pid file pointing at a reused pid is not mistaken for it.
 fn is_agent(process: &Process) -> bool {
     if process.status() == ProcessStatus::Zombie {
         return false;
     }
+    let args = args_of(process);
     let name = process.exe().and_then(|e| e.file_name()).unwrap_or(process.name());
-    if name != binary_name() {
-        return false;
-    }
-    let args: Vec<_> = process.cmd().iter().map(|a| a.to_string_lossy()).collect();
-    let starts_agent = args.windows(2).any(|w| w[0] == "agent" && w[1] == "start");
+    let is_slp = name == if cfg!(windows) { "slp.exe" } else { "slp" };
+    let starts_agent = args.iter().any(|a| a == SERVE_SUBCOMMAND)
+        || (is_slp && args.windows(2).any(|w| w[0] == "agent" && w[1] == "start"));
     let agent_port = args.windows(2).find(|w| w[0] == "--port").and_then(|w| w[1].parse::<u16>().ok());
     starts_agent && is_our_port(agent_port) && serves_home(process.cwd(), &install_dir())
 }
@@ -1122,10 +901,10 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_from_another_version_is_outdated() {
+    fn an_slp_from_another_version_is_outdated() {
         let home = Path::new("/Users/me/.smartloop");
-        assert!(!runs_other_version(&home.join(VERSION).join(binary_name()), home));
-        assert!(runs_other_version(&home.join("1.2.7").join(binary_name()), home));
+        assert!(!runs_other_version(&home.join(VERSION).join("slp"), home));
+        assert!(runs_other_version(&home.join("1.2.7").join("slp"), home));
         // A dev build serving this home is not ours to replace.
         assert!(!runs_other_version(Path::new("/opt/slp/bin/slp"), home));
     }
@@ -1143,11 +922,13 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_archive_in_the_published_checksums() {
-        let listing = "736CED95  darwin-arm64-slp.tar.gz\n6b906a50  linux-amd64-slp.tar.gz\n2a6fb48a *windows-amd64-slp.zip\n";
-        assert_eq!(checksum_for(listing, "darwin-arm64-slp.tar.gz").as_deref(), Some("736ced95"));
-        assert_eq!(checksum_for(listing, "windows-amd64-slp.zip").as_deref(), Some("2a6fb48a"));
-        assert_eq!(checksum_for(listing, "linux-arm64-slp.tar.gz"), None);
+    fn reads_the_cli_version_an_agent_was_served_by() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let served = args(&["/usr/local/bin/docent", SERVE_SUBCOMMAND, CLI_VERSION_FLAG, "1.0.34"]);
+        assert_eq!(served_cli_version(&served), Some("1.0.34"));
+        // Served without a version: never this build's.
+        assert_eq!(served_cli_version(&args(&["smartloop", SERVE_SUBCOMMAND])), Some(""));
+        assert_eq!(served_cli_version(&args(&["slp", "agent", "start"])), None);
     }
 
     /// A server that stalls halfway through the first response and serves

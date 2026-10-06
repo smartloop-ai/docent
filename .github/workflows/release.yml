@@ -88,23 +88,50 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+          # The agent is built in, so each build carries llama.cpp with the
+          # platform's GPU backend: Metal on macOS, Vulkan elsewhere. Linux
+          # links glibc (a static musl binary cannot load the Vulkan driver)
+          # and ships the Vulkan loader in lib/.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            features: vulkan
             archive: tar.gz
-          - target: aarch64-unknown-linux-musl
+          # LunarG ships no arm64 apt packages; 24.04's own Vulkan headers
+          # and glslc are new enough for ggml.
+          - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-            archive: tar.gz
-          - target: x86_64-apple-darwin
-            os: macos-latest
+            features: vulkan
             archive: tar.gz
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-14
+            features: metal
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            os: windows-2022
+            features: vulkan
             archive: zip
     runs-on: ${{ matrix.os }}
+    # Scopes the Azure OIDC token to a stable subject
+    # (repo:smartloop-ai/docent:environment:release) for Trusted Signing.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      NAME: smartloop-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+      # The smartloop crate's packaged-build switch (read at compile time).
+      SLP_PACKAGED_BUILD: "1"
     steps:
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.tag }}
@@ -112,21 +139,186 @@ jobs:
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
-      - name: Install musl toolchain
-        if: endsWith(matrix.target, '-musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install Vulkan SDK (Linux amd64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk cmake clang libclang-dev
+
+      - name: Install Vulkan headers, loader and glslc (Linux arm64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev glslc spirv-headers spirv-tools cmake clang libclang-dev
+
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VULKAN_VERSION: 1.4.313.2
+        run: |
+          curl.exe -f -L -o "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" `
+            "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\bin"
+
+      # llama.cpp takes tens of minutes from scratch; keep the -sys crates.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.features }}
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # ggml would otherwise build for -march=native; pin a portable
+          # baseline so the binary runs on CPUs other than the runner's.
+          case "${{ matrix.target }}" in
+            x86_64-*) export GGML_NATIVE=OFF GGML_AVX2=ON ;;
+            aarch64-unknown-linux-gnu) export GGML_NATIVE=OFF GGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16 ;;
+          esac
+          export CMAKE_BUILD_PARALLEL_LEVEL="$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)"
+          cargo build --release --locked --target ${{ matrix.target }} --features "${{ matrix.features }}"
+
+      - name: Stage
+        run: |
+          set -euo pipefail
+          EXE=smartloop; [ "${{ runner.os }}" = Windows ] && EXE=smartloop.exe
+          mkdir -p "dist/${NAME}"
+          cp "target/${{ matrix.target }}/release/${EXE}" README.md "dist/${NAME}/"
+          case "${{ runner.os }}" in
+            Linux)
+              # Found through the binary's $ORIGIN/lib RUNPATH (build.rs).
+              mkdir -p "dist/${NAME}/lib"
+              for d in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib64 /usr/lib; do
+                [ -e "$d/libvulkan.so.1" ] && cp -L "$d/libvulkan.so.1" "dist/${NAME}/lib/" && break
+              done
+              ;;
+            Windows)
+              # The application directory is searched first.
+              cp "$VULKAN_SDK/runtime/x64/vulkan-1.dll" "dist/${NAME}/" 2>/dev/null \
+                || cp "C:/Windows/System32/vulkan-1.dll" "dist/${NAME}/"
+              for dll in vcruntime140.dll vcruntime140_1.dll msvcp140.dll; do
+                [ -f "C:/Windows/System32/$dll" ] && cp "C:/Windows/System32/$dll" "dist/${NAME}/"
+              done
+              ;;
+          esac
+
+      - name: Verify
+        run: |
+          set -euo pipefail
+          BIN="dist/${NAME}/smartloop"; [ "${{ runner.os }}" = Windows ] && BIN="${BIN}.exe"
+          VER="$("$BIN" --version | awk '{print $NF}')"
+          [ "$VER" = "${{ needs.prepare.outputs.version }}" ] || { echo "FAIL: binary reports $VER"; exit 1; }
+          case "${{ matrix.features }}" in
+            metal) grep -aq ggml_metal "$BIN" || { echo "FAIL: Metal backend not compiled in"; exit 1; } ;;
+            vulkan) grep -aq ggml_vulkan "$BIN" || { echo "FAIL: Vulkan backend not compiled in"; exit 1; } ;;
+          esac
+          case "${{ runner.os }}" in
+            Linux)
+              ldd "$BIN" | grep 'libvulkan.so.1' | grep -q "$PWD/dist/${NAME}/lib/" \
+                || { echo "FAIL: bundled libvulkan.so.1 not used:"; ldd "$BIN"; exit 1; }
+              ! ldd "$BIN" | grep -q 'not found' || { ldd "$BIN"; exit 1; }
+              ;;
+            macOS)
+              # Users have no Homebrew prefix: system libraries only.
+              bad="$(otool -L "$BIN" | tail -n +2 | awk '{print $1}' | grep -Ev '^(/usr/lib/|/System/Library/)' || true)"
+              [ -z "$bad" ] || { echo "FAIL: links non-system libraries:"; echo "$bad"; exit 1; }
+              ;;
+            Windows)
+              [ -f "dist/${NAME}/vulkan-1.dll" ] || { echo "FAIL: vulkan-1.dll not bundled"; exit 1; }
+              ;;
+          esac
+          echo "OK: $VER (${{ matrix.features }})"
+
+      - name: Import Apple certificate
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o $CERTIFICATE_PATH
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security import $CERTIFICATE_PATH -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+      # Developer ID + hardened runtime, then notarization, so the binary also
+      # runs when downloaded through a browser (quarantined). A bare Mach-O
+      # cannot carry a stapled ticket; Gatekeeper looks it up online.
+      - name: Sign and notarize (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          BIN="dist/${NAME}/smartloop"
+          codesign --force --options runtime --timestamp \
+            --entitlements packaging/macos/entitlements.plist \
+            --sign "$APPLE_DEVELOPER_ID" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          ditto -c -k --keepParent "dist/${NAME}" notarize.zip
+          # notarytool exits 0 on an Invalid verdict too; check the status.
+          xcrun notarytool submit notarize.zip \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --output-format json | tee notarize.json
+          ID=$(plutil -extract id raw -o - notarize.json)
+          STATUS=$(plutil -extract status raw -o - notarize.json)
+          if [ "$STATUS" != "Accepted" ]; then
+            xcrun notarytool log "$ID" \
+              --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID"
+            exit 1
+          fi
+          rm -f notarize.zip notarize.json
+
+      # Smart App Control and WDAC block an unsigned executable outright, so
+      # smartloop.exe and every bundled DLL are Authenticode-signed.
+      - name: Azure login (OIDC)
+        if: runner.os == 'Windows'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign (Windows)
+        if: runner.os == 'Windows'
+        uses: azure/trusted-signing-action@v0.5.9
+        with:
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
+          files-folder: dist/${{ env.NAME }}
+          files-folder-filter: exe,dll
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify signature (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "dist/$env:NAME/smartloop.exe"
+          Write-Host "smartloop.exe: $($sig.Status) - $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "signature is $($sig.Status), expected Valid" }
 
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
         run: |
-          set -euo pipefail
-          NAME="smartloop-${{ needs.prepare.outputs.version }}-${{ matrix.target }}"
-          mkdir -p "dist/${NAME}"
-          cp "target/${{ matrix.target }}/release/smartloop" "dist/${NAME}/"
-          cp README.md "dist/${NAME}/"
           tar -czf "dist/${NAME}.tar.gz" -C dist "${NAME}"
           rm -rf "dist/${NAME}"
 
@@ -134,12 +326,8 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $name = "smartloop-${{ needs.prepare.outputs.version }}-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/smartloop.exe" "dist/$name/"
-          Copy-Item "README.md" "dist/$name/"
-          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
-          Remove-Item -Recurse -Force "dist/$name"
+          Compress-Archive -Path "dist/$env:NAME" -DestinationPath "dist/$env:NAME.zip"
+          Remove-Item -Recurse -Force "dist/$env:NAME"
 
       - uses: actions/upload-artifact@v4
         with:
