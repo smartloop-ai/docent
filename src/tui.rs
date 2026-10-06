@@ -66,12 +66,6 @@ const USAGE_BAR: usize = 30;
 /// A bar turning in brackets.
 const SPINNER: [&str; 4] = ["[-]", "[\\]", "[|]", "[/]"];
 
-const BANNER: [&str; 3] = [
-    "█▀▀▀▄ ▄▀▀▀▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀",
-    "█   █ █   █ █     █▀▀▀  █ ▀▄█   █",
-    "▀▀▀▀   ▀▀▀   ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀",
-];
-
 /// Run the app until the user quits, then print the session id so the
 /// conversation can be resumed with `--session`.
 pub fn run(client: &Client, prompt: Option<String>, project: Option<String>, session: Option<String>) {
@@ -1590,7 +1584,7 @@ impl App {
             ("version", format!("CLI {} · agent {}", env!("CARGO_PKG_VERSION"), framework::VERSION)),
         ];
         // Styled per span: the rows are taken apart into spans below.
-        let mut left: Vec<Line<'static>> = BANNER
+        let mut left: Vec<Line<'static>> = crate::BANNER
             .iter()
             .map(|row| Line::from(Span::styled(*row, Style::new().fg(pink()))))
             .collect();

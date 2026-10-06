@@ -293,7 +293,7 @@ impl Checklist {
         self.printed = true;
         let pink = pink();
         self.multi.suspend(|| {
-            for row in BANNER {
+            for row in crate::BANNER {
                 eprintln!("{}{}{}", pink, row, RESET);
             }
             eprintln!();
@@ -308,13 +308,6 @@ impl Drop for Checklist {
         }
     }
 }
-
-/// The Docent wordmark, printed at startup.
-const BANNER: [&str; 3] = [
-    "█▀▀▀▄ ▄▀▀▀▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀",
-    "█   █ █   █ █     █▀▀▀  █ ▀▄█   █",
-    "▀▀▀▀   ▀▀▀   ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀",
-];
 
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
