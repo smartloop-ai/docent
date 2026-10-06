@@ -112,7 +112,7 @@ jobs:
             archive: zip
     runs-on: ${{ matrix.os }}
     # Scopes the Azure OIDC token to a stable subject
-    # (repo:smartloop-ai/smartloop-cli:environment:release) for Trusted Signing.
+    # (repo:smartloop-ai/docent:environment:release) for Trusted Signing.
     environment: release
     permissions:
       contents: read
