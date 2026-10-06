@@ -1,8 +1,9 @@
 //! A checklist of setup steps drawn on stderr under the Docent banner:
 //!
 //! ```text
-//! █▀▄ █▀█ █▀▀ █▀▀ █▄  █ ▀█▀
-//! █▄▀ █▄█ █▄▄ ██▄ █ ▀▄█  █
+//! █▀▀▀▄ ▄▀▀▀▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀
+//! █   █ █   █ █     █▀▀▀  █ ▀▄█   █
+//! ▀▀▀▀   ▀▀▀   ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀
 //!
 //! [✓] Agent 1.2.7                        667 MB
 //! [✓] Start agent                    port 38540
@@ -309,9 +310,10 @@ impl Drop for Checklist {
 }
 
 /// The Docent wordmark, printed at startup.
-const BANNER: [&str; 2] = [
-    "█▀▄ █▀█ █▀▀ █▀▀ █▄  █ ▀█▀",
-    "█▄▀ █▄█ █▄▄ ██▄ █ ▀▄█  █",
+const BANNER: [&str; 3] = [
+    "█▀▀▀▄ ▄▀▀▀▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀",
+    "█   █ █   █ █     █▀▀▀  █ ▀▄█   █",
+    "▀▀▀▀   ▀▀▀   ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀",
 ];
 
 const BOLD: &str = "\x1b[1m";

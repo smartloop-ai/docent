@@ -278,8 +278,9 @@ setup_path() {
 
 print_banner() {
     say ""
-    say "${PINK}█▀▄ █▀█ █▀▀ █▀▀ █▄  █ ▀█▀${NC}"
-    say "${PINK}█▄▀ █▄█ █▄▄ ██▄ █ ▀▄█  █${NC}  ${MUTED}by Smartloop${NC}"
+    say "${PINK}█▀▀▀▄ ▄▀▀▀▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀${NC}"
+    say "${PINK}█   █ █   █ █     █▀▀▀  █ ▀▄█   █${NC}  ${MUTED}by Smartloop${NC}"
+    say "${PINK}▀▀▀▀   ▀▀▀   ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀${NC}"
     say "${MUTED}Your private AI assistant${NC}"
     say ""
     say "${MUTED}Version: ${NC}${VERSION}"
