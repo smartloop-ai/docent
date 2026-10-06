@@ -96,20 +96,27 @@ jobs:
             os: ubuntu-22.04
             features: vulkan
             archive: tar.gz
+            target_dir: target
           # LunarG ships no arm64 apt packages; 24.04's own Vulkan headers
           # and glslc are new enough for ggml.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             features: vulkan
             archive: tar.gz
+            target_dir: target
           - target: aarch64-apple-darwin
             os: macos-14
             features: metal
             archive: tar.gz
+            target_dir: target
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             features: vulkan
             archive: zip
+            # llama.cpp's Vulkan shader generator nests deep CMake try-compile
+            # dirs; under D:\a\docent\docent\target\<triple> its object
+            # paths pass MAX_PATH (260) and MSVC fails with C1083.
+            target_dir: C:/t
     runs-on: ${{ matrix.os }}
     # Scopes the Azure OIDC token to a stable subject
     # (repo:smartloop-ai/docent:environment:release) for Trusted Signing.
@@ -124,6 +131,7 @@ jobs:
       NAME: smartloop-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
       # The smartloop crate's packaged-build switch (read at compile time).
       SLP_PACKAGED_BUILD: "1"
+      CARGO_TARGET_DIR: ${{ matrix.target_dir }}
     steps:
       - name: Free disk space
         if: runner.os == 'Linux'
@@ -172,6 +180,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}-${{ matrix.features }}
+          workspaces: ". -> ${{ matrix.target_dir }}"
 
       - name: Build
         run: |
@@ -190,7 +199,7 @@ jobs:
           set -euo pipefail
           EXE=smartloop; [ "${{ runner.os }}" = Windows ] && EXE=smartloop.exe
           mkdir -p "dist/${NAME}"
-          cp "target/${{ matrix.target }}/release/${EXE}" README.md "dist/${NAME}/"
+          cp "${CARGO_TARGET_DIR}/${{ matrix.target }}/release/${EXE}" README.md "dist/${NAME}/"
           case "${{ runner.os }}" in
             Linux)
               # Found through the binary's $ORIGIN/lib RUNPATH (build.rs).
