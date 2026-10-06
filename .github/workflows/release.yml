@@ -139,19 +139,22 @@ jobs:
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
+      # cmake builds llama.cpp, libclang drives bindgen, and mupdf's
+      # system fonts (font-kit) need fontconfig, which the ubuntu-24.04-arm
+      # image doesn't ship.
       - name: Install Vulkan SDK (Linux amd64)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
           sudo apt-get update
-          sudo apt-get install -y vulkan-sdk cmake clang libclang-dev
+          sudo apt-get install -y vulkan-sdk cmake clang libclang-dev pkg-config libfontconfig1-dev
 
       - name: Install Vulkan headers, loader and glslc (Linux arm64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libvulkan-dev glslc spirv-headers spirv-tools cmake clang libclang-dev
+          sudo apt-get install -y libvulkan-dev glslc spirv-headers spirv-tools cmake clang libclang-dev pkg-config libfontconfig1-dev
 
       - name: Install Vulkan SDK (Windows)
         if: runner.os == 'Windows'
