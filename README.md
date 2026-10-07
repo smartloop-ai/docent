@@ -250,6 +250,7 @@ On exit it prints the session id, to resume with `--session`.
 | `/login`, `/logout` | sign in in the browser (`--token` to paste one) |
 | `/models` | enable, disable and download models |
 | `/mcp` | MCP servers; `/mcp add <url>` connects one |
+| `/project` | switch project, in a new session |
 | `/status` | account, model, agent and versions |
 | `/usage` | web searches left, tokens and cost saved |
 | `/upgrade` | Pro plan: 1,000 web searches a month |
