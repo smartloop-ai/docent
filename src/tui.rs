@@ -468,6 +468,8 @@ enum Overlay {
     Models { rows: Option<Result<Vec<ModelRow>, String>>, selected: usize },
     /// `/mcp`: the project's MCP servers.
     Mcp { rows: Option<Result<Vec<mcp::Server>, String>>, selected: usize },
+    /// `/project`: the projects to switch to, as (id, name).
+    Projects { rows: Option<Result<Vec<(String, String)>, String>>, selected: usize },
     Help,
     /// `/status`: rows fill in once the agent answers.
     Status(Option<Vec<(String, String)>>),
@@ -812,9 +814,10 @@ impl App {
     }
 
     /// Pick the project: the one asked for, else the server's current one.
+    /// Once chatting, the list is for `/project` instead.
     fn projects_loaded(&mut self, result: Result<Vec<serde_json::Value>, String>) {
         if !matches!(self.phase, Phase::Connecting) {
-            return;
+            return self.project_list_loaded(result);
         }
         let projects = match result {
             Ok(projects) => projects,
@@ -849,6 +852,46 @@ impl App {
                 "No projects found; create one with `docent project create`".to_string(),
             )),
         }
+    }
+
+    /// Fill the `/project` panel, the current project selected.
+    fn project_list_loaded(&mut self, result: Result<Vec<serde_json::Value>, String>) {
+        let Overlay::Projects { rows, selected } = &mut self.overlay else { return };
+        let field = |p: &serde_json::Value, k: &str| p[k].as_str().unwrap_or_default().to_string();
+        let list: Vec<(String, String)> = match result {
+            Ok(projects) => projects.iter().map(|p| (field(p, "id"), field(p, "name"))).collect(),
+            Err(e) => return *rows = Some(Err(e)),
+        };
+        let current = self.project.as_ref().map(|(id, _)| id.clone());
+        *selected = list.iter().position(|(id, _)| Some(id) == current.as_ref()).unwrap_or(0);
+        *rows = Some(Ok(list));
+    }
+
+    /// Chat in `project` from now on, in a new session: the conversation so
+    /// far belongs to the old one, so it's cleared as `/clear` does. The
+    /// agent is told too, so it stays the current project after a restart.
+    fn switch_project(&mut self, project: (String, String)) {
+        if self.project.as_ref().is_some_and(|(id, _)| *id == project.0) {
+            return self.entries.push(Entry::Notice(format!("Already in project {}", project.1)));
+        }
+        self.stop_turn();
+        self.entries.clear();
+        self.attachments.clear();
+        self.session = chat::new_session_id();
+        self.scroll_back = 0;
+        self.web_search = None;
+        self.entries.push(Entry::Notice(format!("Switched to project {}", project.1)));
+        let id = project.0.clone();
+        self.project = Some(project);
+        self.load_web_search();
+        if cfg!(test) {
+            return;
+        }
+        self.spawn(move |client, tx| {
+            if let Err(e) = crate::set_current_project(&client, &id) {
+                let _ = tx.send(AppEvent::Error(e));
+            }
+        });
     }
 
     fn chat_event(&mut self, event: ChatEvent) {
@@ -955,6 +998,7 @@ impl App {
             Overlay::None => false,
             Overlay::Models { .. } => self.key_models(key),
             Overlay::Mcp { .. } => self.key_mcp(key),
+            Overlay::Projects { .. } => self.key_projects(key),
             Overlay::Help | Overlay::Status(_) | Overlay::Usage { .. } => {
                 let close = matches!(key.code, KeyCode::Esc | KeyCode::Enter);
                 if close {
@@ -985,6 +1029,15 @@ impl App {
         }
         self.overlay = Overlay::Mcp { rows: None, selected: 0 };
         self.load_mcp();
+    }
+
+    /// `/project`: list the projects to switch to.
+    fn open_projects(&mut self) {
+        if self.project.is_none() {
+            return;
+        }
+        self.overlay = Overlay::Projects { rows: None, selected: 0 };
+        self.load_projects();
     }
 
     fn load_mcp(&self) {
@@ -1336,6 +1389,7 @@ impl App {
                 Some(url) if url.contains("://") => self.add_mcp(url),
                 Some(other) => self.entries.push(Entry::Error(format!("Unknown /mcp {}; try /mcp add <url>", other))),
             },
+            "/project" | "/projects" => self.open_projects(),
             "/help" | "/?" => self.overlay = Overlay::Help,
             "/status" => self.open_status(),
             "/usage" => self.open_usage(),
@@ -1470,6 +1524,25 @@ impl App {
         true
     }
 
+    /// The projects panel's keys; false for any other, which is typing.
+    fn key_projects(&mut self, key: KeyEvent) -> bool {
+        let Overlay::Projects { rows, selected, .. } = &mut self.overlay else { return false };
+        let list = rows.as_ref().and_then(|r| r.as_ref().ok());
+        let count = list.map_or(0, Vec::len);
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Down => *selected = (*selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Enter => {
+                let Some(project) = list.and_then(|l| l.get(*selected)).cloned() else { return true };
+                self.overlay = Overlay::None;
+                self.switch_project(project);
+            }
+            _ => return false,
+        }
+        true
+    }
+
     // ----- drawing -------------------------------------------------------
 
     fn draw(&self, frame: &mut Frame) {
@@ -1503,6 +1576,7 @@ impl App {
             Overlay::None => frame.render_widget(Paragraph::new(hints), footer),
             Overlay::Models { rows, selected } => self.draw_models(frame, footer, rows, *selected),
             Overlay::Mcp { rows, selected } => self.draw_mcp(frame, footer, rows, *selected),
+            Overlay::Projects { rows, selected, .. } => self.draw_projects(frame, footer, rows, *selected),
             Overlay::Help => {
                 let block = panel(&bar_hints(&[("esc", "close")]));
                 frame.render_widget(Paragraph::new(help_lines()).block(block), footer);
@@ -1526,6 +1600,8 @@ impl App {
             Overlay::Models { .. } => 1,
             Overlay::Mcp { rows: Some(Ok(list)), .. } => list.len().max(1),
             Overlay::Mcp { .. } => 1,
+            Overlay::Projects { rows: Some(Ok(list)), .. } => list.len().max(1),
+            Overlay::Projects { .. } => 1,
             Overlay::Help => help_lines().len(),
             Overlay::Status(rows) => self.status_panel_lines(rows).len(),
             Overlay::Usage { loading, tokens } => self.usage_panel_lines(*loading, tokens).len(),
@@ -1967,6 +2043,45 @@ impl App {
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
+    /// The projects to switch to, the one in use marked.
+    fn draw_projects(&self, frame: &mut Frame, area: Rect, rows: &Option<Result<Vec<(String, String)>, String>>, selected: usize) {
+        let block = panel(&bar_hints(&[("↑↓", "select"), ("enter", "switch"), ("esc", "close")]));
+        frame.render_widget(Clear, area);
+        let list = match rows {
+            None => return frame.render_widget(Paragraph::new(format!(" Loading projects {}", self.spinner())).block(block), area),
+            Some(Err(e)) => return frame.render_widget(Paragraph::new(e.clone()).block(block).wrap(Wrap { trim: false }), area),
+            Some(Ok(list)) if list.is_empty() => {
+                let line = Line::from(vec![
+                    Span::styled("No projects yet; create one with ", dim()),
+                    Span::styled("docent project create", key_style()),
+                ]);
+                return frame.render_widget(Paragraph::new(line).block(block), area);
+            }
+            Some(Ok(list)) => list,
+        };
+        let current = self.project.as_ref().map(|(id, _)| id.as_str());
+        let name_width = list.iter().map(|(_, name)| name.chars().count()).max().unwrap_or(0).min(40) + 2;
+        let lines: Vec<Line> = list
+            .iter()
+            .enumerate()
+            .map(|(i, (id, name))| {
+                let chosen = i == selected;
+                let mut spans = vec![
+                    Span::styled(if chosen { "› " } else { "  " }, Style::new().fg(pink()).bold()),
+                    Span::styled(
+                        format!("{:<w$}", truncate(name, name_width - 2), w = name_width),
+                        if chosen { Style::new().fg(pink()).bold() } else { Style::new() },
+                    ),
+                ];
+                if Some(id.as_str()) == current {
+                    spans.push(Span::styled("✓ current", Style::new().fg(Color::Green)));
+                }
+                Line::from(spans)
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
     /// Who's signed in, the project and session, the agent, its model and
     /// process, and the versions.
     fn status_panel_lines(&self, rows: &Option<Vec<(String, String)>>) -> Vec<Line<'static>> {
@@ -2267,12 +2382,13 @@ fn is_document(path: &std::path::Path) -> bool {
 
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
-const COMMANDS: [(&str, &str); 10] = [
+const COMMANDS: [(&str, &str); 11] = [
     ("/help", "shortcuts and commands"),
     ("/login", "sign in in the browser (--token to paste one)"),
     ("/logout", "log out"),
     ("/models", "enable, disable and download models"),
     ("/mcp", "MCP servers; /mcp add <url> to connect one"),
+    ("/project", "switch to another project"),
     ("/status", "account, model, agent and versions"),
     ("/usage", "web searches left, tokens and cost saved"),
     ("/upgrade", "Pro plan: 1,000 web searches a month"),
@@ -2296,6 +2412,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("[ctrl+s]", "turn web search on or off for the project"),
         ("/mcp", "MCP servers: list, remove"),
         ("/mcp add <url>", "connect an MCP server by its URL"),
+        ("/project", "switch project; starts a new session"),
         ("/status", "account, model, agent and versions"),
         ("/login", "sign in in the browser (--token to paste one)"),
         ("/logout", "log out"),
@@ -2657,6 +2774,28 @@ mod tests {
         app.input = "/new".into();
         app.submit();
         assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("Unknown command /new")));
+    }
+
+    #[test]
+    fn project_switches_to_a_new_session() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.entries.push(Entry::Notice("earlier".into()));
+        app.input = "/project".into();
+        app.submit();
+        let project = |id: &str, name: &str| serde_json::json!({ "id": id, "name": name });
+        app.apply(AppEvent::Projects(Ok(vec![project("p1", "Default"), project("p2", "Research")])));
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("› Default   ✓ current"), "{}", text);
+        assert!(text.contains("  Research"), "{}", text);
+
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(app.project, Some(("p2".into(), "Research".into())));
+        assert_ne!(app.session, "cli-test");
+        assert!(matches!(&app.entries[..], [Entry::Notice(n)] if n == "Switched to project Research"));
     }
 
     #[test]

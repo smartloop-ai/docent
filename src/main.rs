@@ -645,6 +645,25 @@ pub fn patch_project_model(client: &Client, project_id: &str, name: &str, enable
     Ok(())
 }
 
+/// Make `project_id` the agent's current project, as the studio app does on
+/// picking one: `/v1/models/load` records the selection (which a client
+/// that names no project gets, and which the next launch opens in) and loads
+/// the project's model. Loading can take a while, so this gets longer than
+/// the client's usual 30 seconds.
+pub fn set_current_project(client: &Client, project_id: &str) -> Result<(), String> {
+    let action = "switch project";
+    let response = client
+        .post(format!("{}/models/load", api_url()))
+        .json(&serde_json::json!({ "project_id": project_id }))
+        .timeout(std::time::Duration::from_secs(600))
+        .send()
+        .map_err(|e| format!("Failed to {}: {}", action, e))?;
+    if !response.status().is_success() {
+        return Err(error_message(action, response));
+    }
+    Ok(())
+}
+
 /// Whether web search is on for the project: the agent's own per-project
 /// switch, which the studio app toggles with Cmd/Ctrl+Alt+S.
 pub fn web_search_enabled(client: &Client, project_id: &str) -> Result<bool, String> {
