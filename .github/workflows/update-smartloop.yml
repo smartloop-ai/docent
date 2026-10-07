@@ -1,0 +1,59 @@
+name: Update smartloop
+
+# Moves the smartloop crate to its newest release (or the version given) and
+# re-syncs Cargo.lock when a version was republished under the same number,
+# commits that to main, and optionally starts a release.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'smartloop version (empty: newest compatible)'
+        required: false
+        default: ''
+      release:
+        description: 'Then release the CLI with this bump'
+        required: true
+        type: choice
+        options:
+          - none
+          - patch
+          - minor
+          - major
+        default: none
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Update
+        run: scripts/update-smartloop.sh "${{ inputs.version }}"
+
+      - name: Commit
+        id: commit
+        run: |
+          set -euo pipefail
+          if git diff --quiet Cargo.toml Cargo.lock; then
+            echo "smartloop is already up to date"
+            exit 0
+          fi
+          VERSION=$(grep -A1 '^name = "smartloop"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Update smartloop to ${VERSION}"
+          git push origin HEAD:main
+
+      # A push by GITHUB_TOKEN starts no workflow, but a dispatch does.
+      - name: Release
+        if: inputs.release != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run release.yml --repo "${{ github.repository }}" --ref main -f bump=${{ inputs.release }}

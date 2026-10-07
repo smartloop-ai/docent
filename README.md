@@ -57,7 +57,10 @@ cargo install --path .                     # CPU only
 
 The framework crate comes from Smartloop's public registry at
 `https://dl.smartloop.ai/crates/`, declared in `.cargo/config.toml`; no
-account or token is needed.
+account or token is needed. `scripts/update-smartloop.sh [version]` moves it to
+the newest (or given) release, and also picks up a version republished under
+the same number; the **Update smartloop** workflow does the same on `main`
+and can start a release after it.
 
 ## Quick start
 
