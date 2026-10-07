@@ -61,6 +61,10 @@ const PROMPT_LINES: u16 = 6;
 /// Lines one wheel notch scrolls, and one page key.
 const WHEEL_LINES: u16 = 3;
 const PAGE_LINES: u16 = 10;
+/// How long after an Esc a second one clears the prompt. Generous, since a
+/// quick double press can reach us as one Esc (crossterm reads two ESC bytes
+/// that arrive together as a single key); the footer then asks for another.
+const DOUBLE_ESC: Duration = Duration::from_secs(2);
 /// Cells in `/usage`'s bar.
 const USAGE_BAR: usize = 30;
 /// A bar turning in brackets.
@@ -515,6 +519,8 @@ struct App {
     cursor: usize,
     history: Vec<String>,
     history_at: Option<usize>,
+    /// When Esc was last pressed at the prompt, so a second one clears it.
+    last_esc: Option<Instant>,
     /// Lines scrolled up from the bottom of the conversation; 0 follows it.
     scroll_back: u16,
     /// How far up the conversation goes, as of the last draw.
@@ -565,6 +571,7 @@ impl App {
             cursor: 0,
             history: Vec::new(),
             history_at: None,
+            last_esc: None,
             scroll_back: 0,
             scroll_limit: std::cell::Cell::new(0),
             shown: std::cell::RefCell::new((Rect::default(), Vec::new())),
@@ -1123,6 +1130,9 @@ impl App {
 
     fn key_edit(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Any other key in between makes the next Esc a first one again.
+        let last_esc = self.last_esc.take();
+        let esc_again = key.code == KeyCode::Esc && last_esc.is_some_and(|t| t.elapsed() < DOUBLE_ESC);
         match key.code {
             KeyCode::Esc if self.token_entry => {
                 self.token_entry = false;
@@ -1130,6 +1140,14 @@ impl App {
                 self.cursor = 0;
             }
             KeyCode::Esc if self.turn.is_some() => self.stop_turn(),
+            // Esc twice clears the prompt, attachments and all.
+            KeyCode::Esc if esc_again => {
+                self.input.clear();
+                self.attachments.clear();
+                self.cursor = 0;
+                self.history_at = None;
+            }
+            KeyCode::Esc if !self.input.is_empty() => self.last_esc = Some(Instant::now()),
             // A new line in the prompt: Shift+Enter where the terminal tells
             // it apart, Alt+Enter and Ctrl+J everywhere.
             KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) && !self.token_entry => {
@@ -1174,12 +1192,18 @@ impl App {
                 self.cursor = self.input.chars().count();
                 self.scroll_back = 0;
             }
-            // In a prompt of several lines the arrows move between them; in
-            // one line they step through earlier prompts.
-            KeyCode::Up if self.input.contains('\n') => self.move_line(-1),
-            KeyCode::Down if self.input.contains('\n') => self.move_line(1),
-            KeyCode::Up => self.recall(-1),
-            KeyCode::Down => self.recall(1),
+            // The arrows move between the prompt's lines, and past its first
+            // or last one step through earlier prompts.
+            KeyCode::Up => {
+                if !self.move_line(-1) {
+                    self.recall(-1)
+                }
+            }
+            KeyCode::Down => {
+                if !self.move_line(1) {
+                    self.recall(1)
+                }
+            }
             KeyCode::PageUp => self.scroll(PAGE_LINES as i32),
             KeyCode::PageDown => self.scroll(-(PAGE_LINES as i32)),
             _ => {}
@@ -1225,8 +1249,9 @@ impl App {
         }
     }
 
-    /// Move the cursor to the same column one line up or down.
-    fn move_line(&mut self, step: isize) {
+    /// Move the cursor to the same column one line up or down, if there is
+    /// such a line.
+    fn move_line(&mut self, step: isize) -> bool {
         let chars: Vec<char> = self.input.chars().collect();
         let starts: Vec<usize> =
             std::iter::once(0).chain(chars.iter().enumerate().filter(|(_, c)| **c == '\n').map(|(i, _)| i + 1)).collect();
@@ -1234,11 +1259,12 @@ impl App {
         let col = self.cursor - starts[row];
         let target = row as isize + step;
         if target < 0 || target as usize >= starts.len() {
-            return;
+            return false;
         }
         let start = starts[target as usize];
         let end = starts.get(target as usize + 1).map_or(chars.len(), |s| s - 1);
         self.cursor = (start + col).min(end);
+        true
     }
 
     fn insert(&mut self, text: &str) {
@@ -1251,7 +1277,8 @@ impl App {
         self.input.char_indices().nth(chars).map_or(self.input.len(), |(i, _)| i)
     }
 
-    /// Step through earlier prompts, like a shell.
+    /// Step through earlier prompts, like a shell. Going back the cursor lands
+    /// on a prompt's first line, so the next Up goes on back past a long one.
     fn recall(&mut self, step: isize) {
         if self.history.is_empty() {
             return;
@@ -1266,7 +1293,10 @@ impl App {
             self.history_at = Some(at);
             self.input = self.history[at].clone();
         }
-        self.cursor = self.input.chars().count();
+        self.cursor = match self.input.find('\n') {
+            Some(i) if step < 0 => self.input[..i].chars().count(),
+            _ => self.input.chars().count(),
+        };
     }
 
     fn submit(&mut self) {
@@ -1800,6 +1830,8 @@ impl App {
             hints.extend(key_hints(&[("pgdn", "scroll down"), ("end", "latest")]));
         } else if self.token_entry {
             hints.extend(key_hints(&[("enter", "sign in"), ("esc", "cancel")]));
+        } else if self.last_esc.is_some_and(|t| t.elapsed() < DOUBLE_ESC) {
+            hints.extend(key_hints(&[("esc", "again to clear")]));
         } else if let Some(warning) = self.search_warning(area.width.saturating_sub(2) as usize) {
             // Takes the key hints' place, so a narrow terminal can't hide it.
             hints.extend(warning);
@@ -2259,7 +2291,8 @@ fn help_lines() -> Vec<Line<'static>> {
         ("[enter]", "send the prompt"),
         ("[shift+enter] [alt+enter]", "new line (also [ctrl+j])"),
         ("[esc]", "interrupt the reply"),
-        ("[↑] [↓]", "earlier prompts"),
+        ("[esc] [esc]", "clear the prompt"),
+        ("[↑] [↓]", "earlier prompts, past the prompt's first or last line"),
         ("wheel [pgup] [pgdn]", "scroll the conversation"),
         ("drag", "select and copy to the clipboard"),
         ("drop a file", "attach an image or document as [Image 1] or [Doc 1]"),
@@ -2732,11 +2765,51 @@ mod tests {
         let first = rows.iter().position(|r| r.starts_with("> [Doc 1]")).expect(&text);
         assert!(rows[first + 1].starts_with("  what does it conclude?"), "{}", text);
 
-        // Up moves between the prompt's lines rather than through history.
+        // Up moves between the prompt's lines before going through history.
         press(&mut app, KeyCode::Up, KeyModifiers::NONE);
         press(&mut app, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(app.cursor, "[Doc 1] \n".chars().count());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn esc_twice_clears_a_pasted_prompt() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.paste("a lot\nof text\npasted by mistake");
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.input, "a lot\nof text\npasted by mistake");
+        assert!(screen(&app, 80, 24).contains("[esc] again to clear"));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.input.is_empty() && app.cursor == 0);
+        // Esc, a key, then Esc again doesn't.
+        app.paste("kept");
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.input, "kept");
+    }
+
+    #[test]
+    fn up_goes_through_history_past_the_first_line() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.history = vec!["first".into(), "long\npasted\ntext".into()];
+        let press = |app: &mut App, code| app.key(KeyEvent::new(code, KeyModifiers::NONE));
+        app.paste("draft\nline two");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input, "draft\nline two");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input, "long\npasted\ntext");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input, "first");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.input, "long\npasted\ntext");
+        assert_eq!(app.cursor, app.input.chars().count());
+        press(&mut app, KeyCode::Down);
+        assert!(app.input.is_empty());
     }
 
     #[test]
