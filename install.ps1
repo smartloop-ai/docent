@@ -48,8 +48,9 @@ function Write-Banner {
     }
 
     Write-Host ""
-    Write-Host "$PINK$(& $render '#^< #^# #^^ #^^ #<  # ^#^')$NC"
-    Write-Host "$PINK$(& $render '#<^ #<# #<< ##< # ^<#  #')$NC  ${MUTED}by Smartloop${NC}"
+    Write-Host "$PINK$(& $render '#^^^< <^^^< <^^^^ #^^^^ #<  # ^^#^^')$NC"
+    Write-Host "$PINK$(& $render '#   # #   # #     #^^^  # ^<#   #')$NC  ${MUTED}by Smartloop${NC}"
+    Write-Host "$PINK$(& $render '^^^^   ^^^   ^^^^ ^^^^^ ^   ^   ^')$NC"
     Write-Host "${MUTED}Your private AI assistant${NC}"
     Write-Host ""
     Write-Host "${MUTED}Version: ${NC}$Version"
