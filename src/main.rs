@@ -15,17 +15,20 @@ mod progress;
 mod tui;
 mod usage;
 
-const LOGO: &str = r#"
-█▀▄ █▀█ █▀▀ █▀▀ █▄  █ ▀█▀
-█▄▀ █▄█ █▄▄ ██▄ █ ▀▄█  █
-"#;
+/// The Docent wordmark: `--help`, the setup checklist and the welcome card.
+/// `install.sh` prints its own copy.
+pub const BANNER: [&str; 3] = [
+    "█▀▀▀▄ ▄▀▀▀▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀",
+    "█   █ █   █ █     █▀▀▀  █ ▀▄█   █",
+    "▀▀▀▀   ▀▀▀   ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀",
+];
 
 #[derive(Parser)]
 #[command(
     name = "smartloop", 
     version, 
     author,
-    about=format!("{}\nDocent by Smartloop: your private AI assistant", LOGO),
+    about=format!("\n{}\n\nDocent by Smartloop: your private AI assistant", BANNER.join("\n")),
 )]
 
 struct Args {
@@ -1051,6 +1054,17 @@ fn main() {
                 .unwrap_or_else(|e| fail(format!("Failed to start async runtime: {}", e)));
             let chat = chat::openai_client(api_url());
             runtime.block_on(chat::run_plain(&chat, prompt, project, session));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_installer_prints_the_same_banner() {
+        let install = include_str!("../install.sh");
+        for row in super::BANNER {
+            assert!(install.contains(row), "install.sh is missing {:?}", row);
         }
     }
 }

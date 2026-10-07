@@ -70,11 +70,6 @@ const USAGE_BAR: usize = 30;
 /// A bar turning in brackets.
 const SPINNER: [&str; 4] = ["[-]", "[\\]", "[|]", "[/]"];
 
-const BANNER: [&str; 2] = [
-    "█▀▄ █▀█ █▀▀ █▀▀ █▄  █ ▀█▀",
-    "█▄▀ █▄█ █▄▄ ██▄ █ ▀▄█  █",
-];
-
 /// Run the app until the user quits, then print the session id so the
 /// conversation can be resumed with `--session`.
 pub fn run(client: &Client, prompt: Option<String>, project: Option<String>, session: Option<String>) {
@@ -1595,9 +1590,10 @@ impl App {
     /// ```text
     /// ╭───────────────────────────────────────────────────────────────────────────╮
     /// │                                                                           │
-    /// │ █▀▄ █▀█ █▀▀ █▀▀ █▄  █ ▀█▀         project  general_chat                   │
-    /// │ █▄▀ █▄█ █▄▄ ██▄ █ ▀▄█  █          agent    http://localhost:38540/v1      │
-    /// │ Your private AI assistant         version  CLI 1.0.14 · agent 1.2.7       │
+    /// │ █▀▀▀▄ ▄▀▀▀▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀    project  general_chat              │
+    /// │ █   █ █   █ █     █▀▀▀  █ ▀▄█   █      agent    http://localhost:38540/v1 │
+    /// │ ▀▀▀▀   ▀▀▀   ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀      version  CLI 1.0.14 · agent 1.2.7  │
+    /// │ Your private AI assistant                                                 │
     /// │ by Smartloop · ? for shortcuts                                            │
     /// │                                                                           │
     /// │ Here are some commands to get you started                                 │
@@ -1618,7 +1614,7 @@ impl App {
             ("version", format!("CLI {} · agent {}", env!("CARGO_PKG_VERSION"), framework::VERSION)),
         ];
         // Styled per span: the rows are taken apart into spans below.
-        let mut left: Vec<Line<'static>> = BANNER
+        let mut left: Vec<Line<'static>> = crate::BANNER
             .iter()
             .map(|row| Line::from(Span::styled(*row, Style::new().fg(pink()))))
             .collect();
@@ -2419,28 +2415,28 @@ mod tests {
         let text = screen(&app, 80, 24);
         let rows: Vec<&str> = text.lines().collect();
         // Short: the banner sits just above the prompt.
-        let banner = rows.iter().position(|r| r.contains("█▀▄ █▀█ █▀▀")).expect(&text);
+        let banner = rows.iter().position(|r| r.contains("█▀▀▀▄ ▄▀▀▀▄")).expect(&text);
         assert!(rows[banner].contains("project  Default"), "{}", text);
         assert!(rows[banner + 1].contains("agent    http://localhost:"), "{}", text);
         assert!(rows[banner + 1].contains("/v1"), "{}", text);
         assert!(rows[banner + 2].contains(&format!("version  CLI {} · agent", env!("CARGO_PKG_VERSION"))), "{}", text);
-        assert!(rows[banner + 2].contains("Your private AI assistant"), "{}", text);
-        assert!(rows[banner + 3].contains("by Smartloop"), "{}", text);
+        assert!(rows[banner + 3].contains("Your private AI assistant"), "{}", text);
+        assert!(rows[banner + 4].contains("by Smartloop"), "{}", text);
         // No account row (the /status tip mentions the word, not a value).
         assert!(!text.contains("account  "), "{}", text);
         // Only as wide as what it holds, not the screen.
         let wide = screen(&app, 120, 24);
         let top = wide.lines().find(|r| r.starts_with('╭')).expect(&wide);
         assert!(top.ends_with('╮') && top.chars().count() < 100, "{}", wide);
-        assert!(rows[banner + 5].contains("Here are some commands to get you started"), "{}", text);
-        assert!(rows[banner + 6].contains("/login"), "{}", text);
+        assert!(rows[banner + 6].contains("Here are some commands to get you started"), "{}", text);
+        assert!(rows[banner + 7].contains("/login"), "{}", text);
         assert!(!text.contains("search the web"), "{}", text);
-        assert!(rows[banner - 2].starts_with('╭') && rows[banner + 10].starts_with('╰'), "{}", text);
+        assert!(rows[banner - 2].starts_with('╭') && rows[banner + 11].starts_with('╰'), "{}", text);
         for i in 0..40 {
             app.entries.push(Entry::Notice(format!("line {}", i)));
         }
         let text = screen(&app, 80, 24);
-        assert!(!text.contains("█▀▄ █▀█ █▀▀"), "{}", text);
+        assert!(!text.contains("█▀▀▀▄ ▄▀▀▀▄"), "{}", text);
         assert!(text.contains("line 39"), "{}", text);
     }
 
@@ -2537,7 +2533,7 @@ mod tests {
             app.scroll(WHEEL_LINES as i32);
         }
         assert_eq!(app.scroll_back, limit);
-        assert!(screen(&app, 80, 24).contains("█▀▄ █▀█ █▀▀"), "the top shows the welcome card");
+        assert!(screen(&app, 80, 24).contains("█▀▀▀▄ ▄▀▀▀▄"), "the top shows the welcome card");
         app.scroll(-1000);
         assert_eq!(app.scroll_back, 0);
         assert!(screen(&app, 80, 24).contains("line 59"));
