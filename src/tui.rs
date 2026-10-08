@@ -492,6 +492,25 @@ struct Reply {
     stats: Option<TurnStats>,
     /// Why it ended early: stopped by the user, or an error.
     ended: Option<String>,
+    /// `text` as last drawn, with its length and width: the conversation
+    /// redraws every tick, and only a reply still streaming changes.
+    rendered: std::cell::RefCell<Option<(usize, u16, Vec<Line<'static>>)>>,
+}
+
+impl Reply {
+    /// `text` rendered as markdown at `width`.
+    fn body(&self, width: u16) -> Vec<Line<'static>> {
+        let text = self.text.trim_end();
+        let mut rendered = self.rendered.borrow_mut();
+        match &*rendered {
+            Some((len, at, lines)) if *len == text.len() && *at == width => lines.clone(),
+            _ => {
+                let lines = crate::markdown::render(text, width);
+                *rendered = Some((text.len(), width, lines.clone()));
+                lines
+            }
+        }
+    }
 }
 
 enum Overlay {
@@ -1937,7 +1956,7 @@ impl App {
                         ]));
                     }
                 }
-                Entry::Reply(reply) => reply_lines(reply, &mut lines),
+                Entry::Reply(reply) => reply_lines(reply, area.width, &mut lines),
                 Entry::Notice(text) => lines.push(Line::from(vec![
                     Span::styled("■ ", Style::new().fg(Color::Green)),
                     Span::raw(text.clone()),
@@ -2368,16 +2387,16 @@ impl App {
 
 /// A reply as Claude Code lays one out: the answer under a `■` (square, like the setup blocks), its
 /// sources, then `⎿` with the model that answered and how it went.
-fn reply_lines(reply: &Reply, lines: &mut Vec<Line<'static>>) {
+fn reply_lines(reply: &Reply, width: u16, lines: &mut Vec<Line<'static>>) {
     for warning in &reply.warnings {
         lines.push(Line::from(vec![
             Span::styled("■ ", Style::new().fg(Color::Yellow)),
             Span::styled(warning.clone(), dim()),
         ]));
     }
-    for (i, line) in reply.text.trim_end().lines().enumerate() {
+    for (i, line) in reply.body(width.saturating_sub(2)).into_iter().enumerate() {
         let mark = if i == 0 { Span::raw("■ ") } else { Span::raw("  ") };
-        lines.push(Line::from(vec![mark, Span::raw(line.to_string())]));
+        lines.push(Line::from(std::iter::once(mark).chain(line.spans).collect::<Vec<_>>()));
     }
     if !reply.citations.is_empty() {
         lines.push(Line::default());
@@ -2646,10 +2665,12 @@ fn dim() -> Style {
 /// Smartloop brand pink (#e55d9c), in 24-bit color where the terminal
 /// supports it and the nearest 256-color shade elsewhere.
 fn pink() -> Color {
-    let truecolor = std::env::var("COLORTERM")
-        .map(|v| v.contains("truecolor") || v.contains("24bit"))
-        .unwrap_or(false);
-    if truecolor { Color::Rgb(229, 93, 156) } else { Color::Indexed(169) }
+    if truecolor() { Color::Rgb(229, 93, 156) } else { Color::Indexed(169) }
+}
+
+/// Whether the terminal says it shows 24-bit color.
+pub fn truecolor() -> bool {
+    std::env::var("COLORTERM").map(|v| v.contains("truecolor") || v.contains("24bit")).unwrap_or(false)
 }
 
 fn truncate(label: &str, max: usize) -> String {
@@ -2748,15 +2769,16 @@ mod tests {
         app.entries.push(Entry::Reply(Reply {
             warnings: Vec::new(),
             model: Some("sl-mini".into()),
-            text: "Drafted nda-northwind-labs.docx from your template:\n\
-                   1. Mutual NDA between Smartloop Inc. and Northwind Labs, Inc.\n\
-                   2. 2-year term from signing; confidentiality survives 3 years (section 5)\n\
-                   3. Governed by California law, venue in San Francisco (section 9)\n\
+            text: "Drafted `nda-northwind-labs.docx` from your template:\n\n\
+                   1. **Mutual NDA** between Smartloop Inc. and Northwind Labs, Inc.\n\
+                   2. **2-year term** from signing; confidentiality survives 3 years (section 5)\n\
+                   3. Governed by **California law**, venue in San Francisco (section 9)\n\n\
                    Signature blocks are left blank for both parties."
                 .into(),
             citations: vec!["mutual-nda-template.docx".into()],
             stats: Some(TurnStats { tokens: 96, elapsed: Duration::from_secs(14) }),
             ended: None,
+            ..Default::default()
         }));
         app.entries.push(Entry::User("[Doc 2] Compare it with their redlines and flag anything risky".into()));
         app.entries.push(Entry::Reply(Reply::default()));
@@ -2777,6 +2799,7 @@ mod tests {
         let color = |c: Color| match c {
             Color::Rgb(r, g, b) => format!("#{:02x}{:02x}{:02x}", r, g, b),
             Color::Indexed(169) => "#e55d9c".to_string(),
+            Color::Indexed(147) => "#b1b9f9".to_string(),
             Color::Reset => String::new(),
             other => format!("{:?}", other),
         };
@@ -3288,6 +3311,41 @@ mod tests {
     }
 
     #[test]
+    fn replies_render_as_markdown() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.entries.push(Entry::Reply(Reply {
+            text: "## Plan\n\n- **one** step that is long enough to wrap here\n- `two`\n\n```rust\nfn main() {}\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |".into(),
+            ..Default::default()
+        }));
+        let text = screen(&app, 40, 30);
+        let rows: Vec<&str> = text.lines().collect();
+        let top = rows.iter().position(|r| r.starts_with("■ Plan")).expect(&text);
+        assert_eq!(
+            &rows[top..top + 13],
+            [
+                "■ Plan",
+                "",
+                "  - one step that is long enough to wrap",
+                "    here",
+                "  - two",
+                "",
+                "    fn main() {}",
+                "",
+                "  ┌───┬───┐",
+                "  │ a │ b │",
+                "  ├───┼───┤",
+                "  │ 1 │ 2 │",
+                "  └───┴───┘",
+            ],
+            "{}",
+            text
+        );
+        assert!(!text.contains("**") && !text.contains("```"), "{}", text);
+    }
+
+    #[test]
     fn conversation_logs_steps_and_status_sits_above_the_prompt() {
         let mut app = app();
         app.phase = Phase::Ready;
@@ -3300,6 +3358,7 @@ mod tests {
             citations: vec!["roadmap.pdf".into()],
             stats: Some(TurnStats { tokens: 12, elapsed: Duration::from_secs(2) }),
             ended: None,
+            ..Default::default()
         }));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         app.turn = Some(Turn {

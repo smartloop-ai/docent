@@ -10,6 +10,7 @@ use progress::Steps;
 mod agent;
 mod chat;
 mod framework;
+mod markdown;
 mod mcp;
 mod progress;
 mod tui;

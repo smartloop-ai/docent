@@ -213,7 +213,9 @@ docent
 `docent` on its own is short for `docent run`. In a terminal this opens a full-screen app, laid out like Claude Code. While
 a reply runs, a live status line above the prompt shows the agent's current
 step (web search, document lookup, model selection) and for how long, with a
-line per running download. The finished reply keeps its sources and the model
+line per running download. Replies render as markdown, as in Claude Code:
+headings, bold and italics, lists, quotes, syntax-highlighted code, and tables
+drawn to fit the width. The finished reply keeps its sources and the model
 that answered:
 
 ```
