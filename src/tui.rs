@@ -117,6 +117,9 @@ enum AppEvent {
     Setup(StepEvent),
     SetupDone(Result<(), String>),
     Projects(Result<Vec<serde_json::Value>, String>),
+    /// Chat in this project from now on: one just created, imported, or
+    /// named with `/project <name>`.
+    SwitchProject(Project),
     Models(Result<Vec<ModelRow>, String>),
     /// The project's MCP servers, for `/mcp`.
     Mcp(Result<Vec<mcp::Server>, String>),
@@ -434,6 +437,34 @@ fn bar_spans(done: u64, total: u64, width: usize) -> Vec<Span<'static>> {
     ]
 }
 
+/// A project as `/project` lists it.
+#[derive(Clone, Debug, PartialEq)]
+struct Project {
+    id: String,
+    name: String,
+    description: String,
+    /// Made by the agent itself, e.g. the default one.
+    system: bool,
+}
+
+impl Project {
+    fn from_json(project: &serde_json::Value) -> Self {
+        let field = |k: &str| project[k].as_str().unwrap_or_default().to_string();
+        Project {
+            id: field("id"),
+            name: field("name"),
+            description: field("description"),
+            system: project["system"].as_bool().unwrap_or_default(),
+        }
+    }
+
+    /// Whether `/project <wanted>` means this one: its id, or its name in
+    /// any case.
+    fn named(&self, wanted: &str) -> bool {
+        self.id == wanted || self.name.eq_ignore_ascii_case(wanted)
+    }
+}
+
 /// A model download started from the models panel.
 struct Download {
     model: String,
@@ -468,8 +499,10 @@ enum Overlay {
     Models { rows: Option<Result<Vec<ModelRow>, String>>, selected: usize },
     /// `/mcp`: the project's MCP servers.
     Mcp { rows: Option<Result<Vec<mcp::Server>, String>>, selected: usize },
-    /// `/project`: the projects to switch to, as (id, name).
-    Projects { rows: Option<Result<Vec<(String, String)>, String>>, selected: usize },
+    /// `/project`: the projects to switch to, then "+ New project".
+    /// `deleting` once ctrl+d has asked to delete the selected one, until
+    /// it's pressed again.
+    Projects { rows: Option<Result<Vec<Project>, String>>, selected: usize, deleting: bool },
     Help,
     /// `/status`: rows fill in once the agent answers.
     Status(Option<Vec<(String, String)>>),
@@ -746,6 +779,7 @@ impl App {
             }
             AppEvent::SetupDone(Err(e)) => self.setup.failure = Some(e),
             AppEvent::Projects(result) => self.projects_loaded(result),
+            AppEvent::SwitchProject(project) => self.switch_project((project.id, project.name)),
             AppEvent::Models(result) => {
                 if let Overlay::Models { rows, selected } = &mut self.overlay {
                     if let Ok(list) = &result {
@@ -848,22 +882,25 @@ impl App {
                     self.send_turn(prompt.clone(), prompt, Vec::new());
                 }
             }
-            None => self.entries.push(Entry::Error(
-                "No projects found; create one with `docent project create`".to_string(),
-            )),
+            None => self.entries.push(Entry::Error("No projects found; create one with /project new <name>".to_string())),
         }
     }
 
-    /// Fill the `/project` panel, the current project selected.
+    /// Fill the `/project` panel: on opening, the current project selected;
+    /// a reload (after a delete, or ctrl+r) keeps the selection where it was.
     fn project_list_loaded(&mut self, result: Result<Vec<serde_json::Value>, String>) {
-        let Overlay::Projects { rows, selected } = &mut self.overlay else { return };
-        let field = |p: &serde_json::Value, k: &str| p[k].as_str().unwrap_or_default().to_string();
-        let list: Vec<(String, String)> = match result {
-            Ok(projects) => projects.iter().map(|p| (field(p, "id"), field(p, "name"))).collect(),
+        let Overlay::Projects { rows, selected, deleting } = &mut self.overlay else { return };
+        *deleting = false;
+        let list: Vec<Project> = match result {
+            Ok(projects) => projects.iter().map(Project::from_json).collect(),
             Err(e) => return *rows = Some(Err(e)),
         };
         let current = self.project.as_ref().map(|(id, _)| id.clone());
-        *selected = list.iter().position(|(id, _)| Some(id) == current.as_ref()).unwrap_or(0);
+        *selected = match rows {
+            None => list.iter().position(|p| Some(&p.id) == current.as_ref()).unwrap_or(0),
+            // The row after the list is "+ New project".
+            Some(_) => (*selected).min(list.len()),
+        };
         *rows = Some(Ok(list));
     }
 
@@ -991,6 +1028,7 @@ impl App {
                 return;
             }
             (KeyCode::Char('o'), true) => return self.open_models(),
+            (KeyCode::Char('p'), true) => return self.open_projects(),
             (KeyCode::Char('s'), true) => return self.toggle_web_search(),
             _ => {}
         }
@@ -1031,13 +1069,91 @@ impl App {
         self.load_mcp();
     }
 
-    /// `/project`: list the projects to switch to.
+    /// `/project`: list the projects to switch to. Also with none to chat
+    /// in yet, so one can be created.
     fn open_projects(&mut self) {
-        if self.project.is_none() {
+        if !matches!(self.phase, Phase::Ready) {
             return;
         }
-        self.overlay = Overlay::Projects { rows: None, selected: 0 };
+        self.overlay = Overlay::Projects { rows: None, selected: 0, deleting: false };
         self.load_projects();
+    }
+
+    /// Ask for the new project's name in the prompt, as `/project new `.
+    fn start_new_project(&mut self) {
+        self.overlay = Overlay::None;
+        self.input = "/project new ".to_string();
+        self.cursor = self.input.chars().count();
+        self.history_at = None;
+    }
+
+    /// `/project new <name>`: create a blank project and switch to it.
+    fn create_project(&mut self, name: String) {
+        if name.is_empty() {
+            return self.entries.push(Entry::Error("Name the project: /project new <name>".to_string()));
+        }
+        self.spawn(move |client, tx| {
+            let _ = tx.send(match crate::try_create_project(&client, &name, None) {
+                Ok(project) => {
+                    let _ = tx.send(AppEvent::Notice(format!("Project {} created", name)));
+                    AppEvent::SwitchProject(Project::from_json(&project))
+                }
+                Err(e) => AppEvent::Error(e),
+            });
+        });
+    }
+
+    /// `/project import <zip>`: create a project from an exported archive,
+    /// typed or dropped as a path, and switch to it.
+    fn import_project(&mut self, path: &str) {
+        let path = match dropped_files(path).as_deref() {
+            Some([path]) => path.display().to_string(),
+            _ if path.is_empty() => {
+                return self.entries.push(Entry::Error("Give the archive: /project import <zip>".to_string()));
+            }
+            _ => return self.entries.push(Entry::Error(format!("No such file: {}", path))),
+        };
+        self.entries.push(Entry::Notice(format!("Importing {}", path)));
+        self.spawn(move |client, tx| {
+            let _ = tx.send(match crate::try_import_project(&client, &path, None) {
+                Ok(project) => {
+                    let project = Project::from_json(&project);
+                    let _ = tx.send(AppEvent::Notice(format!("Project {} imported", project.name)));
+                    AppEvent::SwitchProject(project)
+                }
+                Err(e) => AppEvent::Error(e),
+            });
+        });
+    }
+
+    /// `/project <name or id>`: switch straight to it.
+    fn find_project(&mut self, wanted: String) {
+        self.spawn(move |client, tx| {
+            let _ = tx.send(match crate::try_fetch_projects(&client) {
+                Ok(list) => match list.iter().map(Project::from_json).find(|p| p.named(&wanted)) {
+                    Some(project) => AppEvent::SwitchProject(project),
+                    None => AppEvent::Error(format!("No project named {}; /project lists them", wanted)),
+                },
+                Err(e) => AppEvent::Error(e),
+            });
+        });
+    }
+
+    /// Delete a project other than the one in use, then reload the panel.
+    fn delete_project(&mut self, project: Project) {
+        if self.project.as_ref().is_some_and(|(id, _)| *id == project.id) {
+            return self.entries.push(Entry::Error(format!(
+                "{} is the project in use; switch to another before deleting it",
+                project.name
+            )));
+        }
+        self.spawn(move |client, tx| {
+            let _ = tx.send(match crate::try_delete_project(&client, &project.id) {
+                Ok(()) => AppEvent::Notice(format!("Project {} deleted", project.name)),
+                Err(e) => AppEvent::Error(e),
+            });
+            let _ = tx.send(AppEvent::Projects(crate::try_fetch_projects(&client)));
+        });
     }
 
     fn load_mcp(&self) {
@@ -1389,7 +1505,15 @@ impl App {
                 Some(url) if url.contains("://") => self.add_mcp(url),
                 Some(other) => self.entries.push(Entry::Error(format!("Unknown /mcp {}; try /mcp add <url>", other))),
             },
-            "/project" | "/projects" => self.open_projects(),
+            "/project" | "/projects" => {
+                let rest = words.clone().skip(1).collect::<Vec<_>>().join(" ");
+                match words.next() {
+                    None | Some("list") => self.open_projects(),
+                    Some("new") => self.create_project(rest),
+                    Some("import") => self.import_project(&rest),
+                    Some(_) => self.find_project(input.split_once(' ').map_or("", |(_, name)| name).trim().to_string()),
+                }
+            }
             "/help" | "/?" => self.overlay = Overlay::Help,
             "/status" => self.open_status(),
             "/usage" => self.open_usage(),
@@ -1525,19 +1649,38 @@ impl App {
     }
 
     /// The projects panel's keys; false for any other, which is typing.
+    /// The last row, "+ New project" (or ctrl+n), starts `/project new ` in
+    /// the prompt for the name. Deleting takes ctrl+d twice, as nothing
+    /// brings a project back.
     fn key_projects(&mut self, key: KeyEvent) -> bool {
-        let Overlay::Projects { rows, selected, .. } = &mut self.overlay else { return false };
+        let Overlay::Projects { rows, selected, deleting } = &mut self.overlay else { return false };
         let list = rows.as_ref().and_then(|r| r.as_ref().ok());
         let count = list.map_or(0, Vec::len);
+        let chosen = list.and_then(|l| l.get(*selected)).cloned();
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let delete = matches!((key.code, ctrl), (KeyCode::Char('d'), true) | (KeyCode::Delete, _));
+        // Any key but a second delete takes the question back.
+        let asked = std::mem::take(deleting);
         match key.code {
+            _ if delete => match chosen {
+                Some(project) if asked => self.delete_project(project),
+                Some(_) => *deleting = true,
+                None => {}
+            },
+            KeyCode::Esc if asked => {}
             KeyCode::Esc => self.overlay = Overlay::None,
             KeyCode::Up => *selected = selected.saturating_sub(1),
-            KeyCode::Down => *selected = (*selected + 1).min(count.saturating_sub(1)),
-            KeyCode::Enter => {
-                let Some(project) = list.and_then(|l| l.get(*selected)).cloned() else { return true };
-                self.overlay = Overlay::None;
-                self.switch_project(project);
-            }
+            KeyCode::Down => *selected = (*selected + 1).min(count),
+            KeyCode::Char('r') if ctrl => self.load_projects(),
+            KeyCode::Char('n') if ctrl => self.start_new_project(),
+            KeyCode::Enter => match chosen {
+                Some(project) => {
+                    self.overlay = Overlay::None;
+                    self.switch_project((project.id, project.name));
+                }
+                None if list.is_some() => self.start_new_project(),
+                None => {}
+            },
             _ => return false,
         }
         true
@@ -1576,7 +1719,7 @@ impl App {
             Overlay::None => frame.render_widget(Paragraph::new(hints), footer),
             Overlay::Models { rows, selected } => self.draw_models(frame, footer, rows, *selected),
             Overlay::Mcp { rows, selected } => self.draw_mcp(frame, footer, rows, *selected),
-            Overlay::Projects { rows, selected, .. } => self.draw_projects(frame, footer, rows, *selected),
+            Overlay::Projects { rows, selected, deleting } => self.draw_projects(frame, footer, rows, *selected, *deleting),
             Overlay::Help => {
                 let block = panel(&bar_hints(&[("esc", "close")]));
                 frame.render_widget(Paragraph::new(help_lines()).block(block), footer);
@@ -1600,7 +1743,7 @@ impl App {
             Overlay::Models { .. } => 1,
             Overlay::Mcp { rows: Some(Ok(list)), .. } => list.len().max(1),
             Overlay::Mcp { .. } => 1,
-            Overlay::Projects { rows: Some(Ok(list)), .. } => list.len().max(1),
+            Overlay::Projects { rows: Some(Ok(list)), .. } => list.len() + 1,
             Overlay::Projects { .. } => 1,
             Overlay::Help => help_lines().len(),
             Overlay::Status(rows) => self.status_panel_lines(rows).len(),
@@ -2043,42 +2186,71 @@ impl App {
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
-    /// The projects to switch to, the one in use marked.
-    fn draw_projects(&self, frame: &mut Frame, area: Rect, rows: &Option<Result<Vec<(String, String)>, String>>, selected: usize) {
-        let block = panel(&bar_hints(&[("↑↓", "select"), ("enter", "switch"), ("esc", "close")]));
+    /// The projects to switch to, the one in use marked, each with its
+    /// description; "+ New project" last.
+    fn draw_projects(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        rows: &Option<Result<Vec<Project>, String>>,
+        selected: usize,
+        deleting: bool,
+    ) {
+        let list = rows.as_ref().and_then(|r| r.as_ref().ok());
+        let hint = match list.and_then(|l| l.get(selected)).filter(|_| deleting) {
+            Some(project) => {
+                let mut spans = vec![Span::raw(" "), Span::styled(format!("Delete {}? ", project.name), Style::new().fg(Color::Red))];
+                spans.extend(key_hints(&[("ctrl+d", "delete"), ("esc", "cancel")]));
+                spans.push(Span::raw(" "));
+                spans
+            }
+            None => bar_hints(&[
+                ("↑↓", "select"),
+                ("enter", "switch"),
+                ("ctrl+n", "new"),
+                ("ctrl+d", "delete"),
+                ("ctrl+r", "refresh"),
+                ("esc", "close"),
+            ]),
+        };
+        let block = panel(&hint);
         frame.render_widget(Clear, area);
         let list = match rows {
             None => return frame.render_widget(Paragraph::new(format!(" Loading projects {}", self.spinner())).block(block), area),
             Some(Err(e)) => return frame.render_widget(Paragraph::new(e.clone()).block(block).wrap(Wrap { trim: false }), area),
-            Some(Ok(list)) if list.is_empty() => {
-                let line = Line::from(vec![
-                    Span::styled("No projects yet; create one with ", dim()),
-                    Span::styled("docent project create", key_style()),
-                ]);
-                return frame.render_widget(Paragraph::new(line).block(block), area);
-            }
             Some(Ok(list)) => list,
         };
         let current = self.project.as_ref().map(|(id, _)| id.as_str());
-        let name_width = list.iter().map(|(_, name)| name.chars().count()).max().unwrap_or(0).min(40) + 2;
-        let lines: Vec<Line> = list
+        let name_width = list.iter().map(|p| p.name.chars().count()).max().unwrap_or(0).min(40) + 2;
+        let mut lines: Vec<Line> = list
             .iter()
             .enumerate()
-            .map(|(i, (id, name))| {
+            .map(|(i, p)| {
                 let chosen = i == selected;
                 let mut spans = vec![
                     Span::styled(if chosen { "› " } else { "  " }, Style::new().fg(pink()).bold()),
                     Span::styled(
-                        format!("{:<w$}", truncate(name, name_width - 2), w = name_width),
+                        format!("{:<w$}", truncate(&p.name, name_width - 2), w = name_width),
                         if chosen { Style::new().fg(pink()).bold() } else { Style::new() },
                     ),
                 ];
-                if Some(id.as_str()) == current {
-                    spans.push(Span::styled("✓ current", Style::new().fg(Color::Green)));
-                }
+                let state = match (current == Some(p.id.as_str()), p.system) {
+                    (true, _) => Span::styled("✓ current", Style::new().fg(Color::Green)),
+                    (false, true) => Span::styled("system", dim()),
+                    (false, false) => Span::raw(""),
+                };
+                let state_width = state.width();
+                spans.push(state);
+                spans.push(Span::raw(" ".repeat(12usize.saturating_sub(state_width))));
+                spans.push(Span::styled(p.description.clone(), dim()));
                 Line::from(spans)
             })
             .collect();
+        let chosen = selected == list.len();
+        lines.push(Line::from(vec![
+            Span::styled(if chosen { "› " } else { "  " }, Style::new().fg(pink()).bold()),
+            Span::styled("+ New project", if chosen { Style::new().fg(pink()).bold() } else { dim() }),
+        ]));
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
@@ -2388,7 +2560,7 @@ const COMMANDS: [(&str, &str); 11] = [
     ("/logout", "log out"),
     ("/models", "enable, disable and download models"),
     ("/mcp", "MCP servers; /mcp add <url> to connect one"),
-    ("/project", "switch to another project"),
+    ("/project", "switch, create and delete projects"),
     ("/status", "account, model, agent and versions"),
     ("/usage", "web searches left, tokens and cost saved"),
     ("/upgrade", "Pro plan: 1,000 web searches a month"),
@@ -2412,7 +2584,10 @@ fn help_lines() -> Vec<Line<'static>> {
         ("[ctrl+s]", "turn web search on or off for the project"),
         ("/mcp", "MCP servers: list, remove"),
         ("/mcp add <url>", "connect an MCP server by its URL"),
-        ("/project", "switch project; starts a new session"),
+        ("[ctrl+p] /project", "projects: switch (in a new session), create, delete"),
+        ("/project <name>", "switch to a project by its name or ID"),
+        ("/project new <name>", "create a project and switch to it"),
+        ("/project import <zip>", "import an exported project"),
         ("/status", "account, model, agent and versions"),
         ("/login", "sign in in the browser (--token to paste one)"),
         ("/logout", "log out"),
@@ -2796,6 +2971,91 @@ mod tests {
         assert_eq!(app.project, Some(("p2".into(), "Research".into())));
         assert_ne!(app.session, "cli-test");
         assert!(matches!(&app.entries[..], [Entry::Notice(n)] if n == "Switched to project Research"));
+    }
+
+    #[test]
+    fn projects_create_delete_and_switch_from_the_panel() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p2".into(), "Research".into()));
+        let project = |id: &str, name: &str, system| {
+            serde_json::json!({ "id": id, "name": name, "description": format!("about {}", name), "system": system })
+        };
+        let list = || vec![project("p1", "general_chat", true), project("p2", "Research", false), project("p3", "Legal", false)];
+        app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(matches!(app.overlay, Overlay::Projects { rows: None, .. }));
+        app.apply(AppEvent::Projects(Ok(list())));
+        let text = screen(&app, 100, 30);
+        assert!(text.contains("  general_chat  system      about general_chat"), "{}", text);
+        assert!(text.contains("› Research      ✓ current   about Research"), "{}", text);
+        assert!(text.contains("  + New project"), "{}", text);
+        assert!(text.contains("[enter] switch  [ctrl+n] new  [ctrl+d] delete"), "{}", text);
+
+        // The project in use can't be deleted out from under the chat.
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        app.key(ctrl_d);
+        assert!(screen(&app, 100, 30).contains("Delete Research? [ctrl+d] delete  [esc] cancel"));
+        app.key(ctrl_d);
+        assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("Research is the project in use")));
+
+        // Esc takes the question back before it closes the panel.
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.key(ctrl_d);
+        assert!(matches!(app.overlay, Overlay::Projects { deleting: true, .. }));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.overlay, Overlay::Projects { deleting: false, .. }));
+
+        // A reload after a delete keeps the selection, the new row included.
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(screen(&app, 100, 30).contains("› + New project"));
+        app.apply(AppEvent::Projects(Ok(list()[..2].to_vec())));
+        assert!(screen(&app, 100, 30).contains("› + New project"));
+
+        // The last row asks for a name in the prompt; ctrl+d does nothing there.
+        app.key(ctrl_d);
+        assert!(matches!(app.overlay, Overlay::Projects { deleting: false, .. }));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!((app.input.as_str(), app.cursor), ("/project new ", 13));
+        // ctrl+n does the same from any row, even while the list loads.
+        app.input.clear();
+        app.overlay = Overlay::Projects { rows: None, selected: 0, deleting: false };
+        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "/project new ");
+
+        // A project just created or imported is switched to, and a reply
+        // still running stops: its session is gone.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        app.entries.push(Entry::Reply(Reply::default()));
+        app.turn = Some(Turn { started: Instant::now(), task: runtime.spawn(async {}), entry: app.entries.len() - 1, tokens: 0, activity: None });
+        app.apply(AppEvent::SwitchProject(Project::from_json(&project("p4", "Contracts", false))));
+        assert!(app.turn.is_none());
+        assert_eq!(app.project, Some(("p4".into(), "Contracts".into())));
+        assert!(matches!(&app.entries[..], [Entry::Notice(n)] if n == "Switched to project Contracts"));
+    }
+
+    #[test]
+    fn project_commands_check_what_they_are_given() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.input = "/project new".into();
+        app.submit();
+        assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("/project new <name>")));
+        app.input = "/project import /no/such/archive.zip".into();
+        app.submit();
+        assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e == "No such file: /no/such/archive.zip"));
+
+        // With no project to chat in yet, the panel still opens, to make one.
+        app.project = None;
+        app.input = "/project".into();
+        app.submit();
+        app.apply(AppEvent::Projects(Ok(Vec::new())));
+        assert!(screen(&app, 80, 24).contains("› + New project"));
+
+        let research = Project { id: "abc123".into(), name: "Research Notes".into(), description: String::new(), system: false };
+        assert!(research.named("abc123") && research.named("research notes"));
+        assert!(!research.named("Research"));
     }
 
     #[test]

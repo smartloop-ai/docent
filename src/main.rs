@@ -297,6 +297,11 @@ fn select_project(client: &Client) -> String {
 /// Create an empty project — the blank template is a project with no skills,
 /// which the API seeds with the workspace defaults.
 fn create_project(client: &Client, name: String, description: Option<String>) {
+    report_created(try_create_project(client, &name, description).unwrap_or_else(|e| fail(e)), "Project created");
+}
+
+/// Create an empty project and return it as the agent lists it.
+pub fn try_create_project(client: &Client, name: &str, description: Option<String>) -> Result<serde_json::Value, String> {
     let mut body = serde_json::json!({
         "name": name,
         "system": false,
@@ -311,13 +316,13 @@ fn create_project(client: &Client, name: String, description: Option<String>) {
         .post(projects_url())
         .json(&body)
         .send()
-        .unwrap_or_else(|e| fail(format!("Failed to create project: {}", e)));
+        .map_err(|e| format!("Failed to create project: {}", e))?;
 
     if !response.status().is_success() {
-        fail(error_message("create project", response));
+        return Err(error_message("create project", response));
     }
 
-    report_created(response, "Project created");
+    response.json().map_err(|e| format!("Failed to parse response as JSON: {}", e))
 }
 
 /// Upload a file for a chat message to reference: the agent turns documents
@@ -346,9 +351,14 @@ pub fn upload_asset(client: &Client, path: &std::path::Path) -> Result<String, S
 
 /// Create a project from a zip archive produced by an earlier export.
 fn import_project(client: &Client, path: String, name: Option<String>) {
+    report_created(try_import_project(client, &path, name).unwrap_or_else(|e| fail(e)), "Project imported");
+}
+
+/// Import a project archive and return the new project.
+pub fn try_import_project(client: &Client, path: &str, name: Option<String>) -> Result<serde_json::Value, String> {
     let mut form = multipart::Form::new()
-        .file("file", &path)
-        .unwrap_or_else(|e| fail(format!("Failed to read {}: {}", path, e)));
+        .file("file", path)
+        .map_err(|e| format!("Failed to read {}: {}", path, e))?;
 
     if let Some(name) = name {
         form = form.text("name", name);
@@ -358,21 +368,17 @@ fn import_project(client: &Client, path: String, name: Option<String>) {
         .post(format!("{}/import", projects_url()))
         .multipart(form)
         .send()
-        .unwrap_or_else(|e| fail(format!("Failed to import project: {}", e)));
+        .map_err(|e| format!("Failed to import project: {}", e))?;
 
     if !response.status().is_success() {
-        fail(error_message("import project", response));
+        return Err(error_message("import project", response));
     }
 
-    report_created(response, "Project imported");
+    response.json().map_err(|e| format!("Failed to parse response as JSON: {}", e))
 }
 
 /// Print the confirmation line and a one-row table for a newly created project.
-fn report_created(response: Response, action: &str) {
-    let project: serde_json::Value = response
-        .json()
-        .unwrap_or_else(|e| fail(format!("Failed to parse response as JSON: {}", e)));
-
+fn report_created(project: serde_json::Value, action: &str) {
     println!("{} successfully", action);
     print_projects(&[project]);
 }
@@ -982,16 +988,20 @@ pub fn try_logout(client: &Client) -> Result<(), String> {
 }
 
 fn delete_project(client: &Client, id: String) {
+    try_delete_project(client, &id).unwrap_or_else(|e| fail(e));
+    println!("Project deleted successfully");
+}
+
+pub fn try_delete_project(client: &Client, id: &str) -> Result<(), String> {
     let response = client
         .delete(format!("{}/{}", projects_url(), id))
         .send()
-        .unwrap_or_else(|e| fail(format!("Failed to delete project: {}", e)));
+        .map_err(|e| format!("Failed to delete project: {}", e))?;
 
     if !response.status().is_success() {
-        fail(error_message("delete project", response));
+        return Err(error_message("delete project", response));
     }
-
-    println!("Project deleted successfully");
+    Ok(())
 }
 
 fn main() {

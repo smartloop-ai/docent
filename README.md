@@ -243,6 +243,7 @@ On exit it prints the session id, to resume with `--session`.
 | wheel, `PgUp`/`PgDn` | scroll; drag to select and copy |
 | drop a file | attach an image (PNG, JPEG) or document (PDF, Office, CSV, text) |
 | `Ctrl+O` | models: enable, disable, download |
+| `Ctrl+P` | projects: switch, create, delete |
 | `Ctrl+S` | web search on or off |
 
 | Command | Does |
@@ -250,7 +251,10 @@ On exit it prints the session id, to resume with `--session`.
 | `/login`, `/logout` | sign in in the browser (`--token` to paste one) |
 | `/models` | enable, disable and download models |
 | `/mcp` | MCP servers; `/mcp add <url>` connects one |
-| `/project` | switch project, in a new session |
+| `/project` | projects: switch (in a new session), create, delete |
+| `/project <name>` | switch to a project by its name or ID |
+| `/project new <name>` | create a project and switch to it |
+| `/project import <zip>` | import an exported project and switch to it |
 | `/status` | account, model, agent and versions |
 | `/usage` | web searches left, tokens and cost saved |
 | `/upgrade` | Pro plan: 1,000 web searches a month |
