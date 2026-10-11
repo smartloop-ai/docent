@@ -8,7 +8,7 @@
 //! [✓] Agent 1.2.7                        667 MB
 //! [✓] Start agent                    port 38540
 //! [✓] Embeddings (bge-m3)                417 MB
-//! [•] Base model sl-mini
+//! [•] Decision model sl-mini
 //!     ██████████████▋░░░░░░░░░░░░░░░   49%  377 MB/769 MB
 //! [ ] Default project
 //! [ ] Load model
@@ -60,8 +60,8 @@ struct Step {
 pub trait Steps {
     /// Queue a step, shown as pending until it starts.
     fn add(&mut self, label: &str) -> usize;
-    /// Name what a step works on once it's known, e.g. "Base model" becomes
-    /// "Base model sl-mini".
+    /// Name what a step works on once it's known, e.g. "Decision model" becomes
+    /// "Decision model sl-mini".
     fn add_name(&mut self, step: usize, name: &str);
     /// Set the dim text shown right of the label, e.g. "port 38540".
     fn set_detail(&mut self, step: usize, detail: &str);

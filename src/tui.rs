@@ -56,6 +56,8 @@ const BLOCKS: usize = 16;
 /// An active step shows its elapsed time once it has run this long.
 const SHOW_ELAPSED_AFTER: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(100);
+/// How often the welcome card's agent state is re-read.
+const AGENT_EVERY: Duration = Duration::from_secs(3);
 /// The most lines the prompt grows to before it scrolls.
 const PROMPT_LINES: u16 = 6;
 /// Lines one wheel notch scrolls, and one page key.
@@ -106,6 +108,11 @@ pub fn run(client: &Client, prompt: Option<String>, project: Option<String>, ses
     ratatui::restore();
     // A chat turn may still be streaming; don't wait for it.
     runtime.shutdown_background();
+    // An agent this session started goes with it, unless another session
+    // still uses it.
+    if crate::is_local() && framework::stop_launched() {
+        eprintln!("Stopped the agent this session started");
+    }
     match result {
         Ok(session) => eprintln!("session: {}", session),
         Err(e) => crate::fail(e),
@@ -136,6 +143,15 @@ enum AppEvent {
     /// The project's web search switch, read or just toggled; `toggled`
     /// says whether to announce it.
     WebSearch { enabled: bool, toggled: bool },
+    /// What the agent is doing, for the welcome card; `None` when it
+    /// doesn't answer.
+    Agent(Option<crate::AgentState>),
+    /// Who's signed in, for the welcome card; `None` when no one is.
+    Account(Option<String>),
+    /// The MCP servers of this project, by id, for the welcome card.
+    Connections(String, Vec<mcp::Server>),
+    /// The skills of this project, by id, for the slash-command hints.
+    Skills(String, Vec<(String, String)>),
 }
 
 /// One `Steps` call, carried from a worker thread to the app.
@@ -325,7 +341,7 @@ impl StepList {
     /// ╭ Booting up …           ──────────────────────────────────╮
     /// │                                                          │
     /// │  [x] Start agent          ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰  port 38540   │
-    /// │  [•] Base model sl-mini   ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱  49%          │
+    /// │  [•] Decision model sl-mini   ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱  49%          │
     /// │  [ ] Default project      ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱               │
     /// │                                                          │
     /// ╰──────────────────────────────── 377 MB of 769 MB · 23s ──╯
@@ -499,7 +515,8 @@ enum Overlay {
     Models { rows: Option<Result<Vec<ModelRow>, String>>, selected: usize },
     /// `/mcp`: the project's MCP servers.
     Mcp { rows: Option<Result<Vec<mcp::Server>, String>>, selected: usize },
-    /// `/project`: the projects to switch to, then "+ New project".
+    /// `/project`: the projects to switch to, then "+ New project" and
+    /// "+ Import project".
     /// `deleting` once ctrl+d has asked to delete the selected one, until
     /// it's pressed again.
     Projects { rows: Option<Result<Vec<Project>, String>>, selected: usize, deleting: bool },
@@ -573,6 +590,19 @@ struct App {
     attachments: Vec<Attachment>,
     /// The highlighted slash-command hint while typing a command.
     hint_at: usize,
+    /// The project's skills as `(name, description)`, hinted and run as
+    /// `/<name>`.
+    skills: Vec<(String, String)>,
+    /// What the agent is doing, as the welcome card shows it; `None` until
+    /// first asked.
+    agent: Option<crate::AgentState>,
+    /// Who's signed in, as the welcome card shows it: `None` until known,
+    /// then the account or `None` for signed out.
+    account: Option<Option<String>>,
+    /// The project's MCP servers, once read: ready, and still connecting.
+    connections: Option<(usize, usize)>,
+    /// When the agent's state was last asked for; `None` while asking.
+    agent_asked: Option<Instant>,
     /// This month's web search usage, shown in the footer once known.
     search: Option<SearchUsage>,
     /// The project's web search switch (ctrl+s), once read.
@@ -612,6 +642,11 @@ impl App {
             token_entry: false,
             attachments: Vec::new(),
             hint_at: 0,
+            skills: Vec::new(),
+            agent: None,
+            account: None,
+            connections: None,
+            agent_asked: Some(Instant::now() - AGENT_EVERY),
             search: None,
             web_search: None,
             quit: false,
@@ -649,7 +684,10 @@ impl App {
                         self.apply(event);
                     }
                 }
-                _ = tick.tick() => self.ticks += 1,
+                _ = tick.tick() => {
+                    self.ticks += 1;
+                    self.poll_agent();
+                }
             }
         }
         Ok(self.session)
@@ -789,6 +827,10 @@ impl App {
                 }
             }
             AppEvent::Mcp(result) => {
+                // The card counts them too.
+                if let Ok(list) = &result {
+                    self.connections = Some(connection_counts(list));
+                }
                 if let Overlay::Mcp { rows, selected } = &mut self.overlay {
                     if let Ok(list) = &result {
                         *selected = (*selected).min(list.len().saturating_sub(1));
@@ -837,6 +879,23 @@ impl App {
                     *loading = false;
                 }
             }
+            AppEvent::Account(account) => self.account = Some(account),
+            AppEvent::Connections(project, servers) => {
+                if self.project.as_ref().is_some_and(|(id, _)| *id == project) {
+                    self.connections = Some(connection_counts(&servers));
+                }
+            }
+            AppEvent::Agent(state) => {
+                let down = || crate::AgentState { state: "not responding".to_string(), memory: None, documents: 0 };
+                self.agent = Some(state.unwrap_or_else(down));
+                self.agent_asked = Some(Instant::now());
+            }
+            // Only for the project still chatted in.
+            AppEvent::Skills(project, skills) => {
+                if self.project.as_ref().is_some_and(|(id, _)| *id == project) {
+                    self.skills = skills;
+                }
+            }
             AppEvent::WebSearch { enabled, toggled } => {
                 self.web_search = Some(enabled);
                 if toggled {
@@ -878,6 +937,9 @@ impl App {
             Some(project) => {
                 self.project = Some(project);
                 self.load_web_search();
+                self.load_skills();
+                self.load_connections();
+                self.load_account();
                 if let Some(prompt) = self.pending_prompt.take() {
                     self.send_turn(prompt.clone(), prompt, Vec::new());
                 }
@@ -898,8 +960,10 @@ impl App {
         let current = self.project.as_ref().map(|(id, _)| id.clone());
         *selected = match rows {
             None => list.iter().position(|p| Some(&p.id) == current.as_ref()).unwrap_or(0),
-            // The row after the list is "+ New project".
-            Some(_) => (*selected).min(list.len()),
+            // The two rows after the list, "+ New project" and "+ Import
+            // project", stay chosen as the list shrinks.
+            Some(Ok(old)) if *selected >= old.len() => list.len() + (*selected - old.len()).min(1),
+            Some(_) => (*selected).min(list.len() + 1),
         };
         *rows = Some(Ok(list));
     }
@@ -917,10 +981,14 @@ impl App {
         self.session = chat::new_session_id();
         self.scroll_back = 0;
         self.web_search = None;
+        self.skills.clear();
+        self.connections = None;
         self.entries.push(Entry::Notice(format!("Switched to project {}", project.1)));
         let id = project.0.clone();
         self.project = Some(project);
         self.load_web_search();
+        self.load_skills();
+        self.load_connections();
         if cfg!(test) {
             return;
         }
@@ -1087,6 +1155,15 @@ impl App {
         self.history_at = None;
     }
 
+    /// Ask for the archive in the prompt, as `/project import `, where a
+    /// dropped zip lands as its path.
+    fn start_import_project(&mut self) {
+        self.overlay = Overlay::None;
+        self.input = "/project import ".to_string();
+        self.cursor = self.input.chars().count();
+        self.history_at = None;
+    }
+
     /// `/project new <name>`: create a blank project and switch to it.
     fn create_project(&mut self, name: String) {
         if name.is_empty() {
@@ -1243,6 +1320,56 @@ impl App {
         });
     }
 
+    /// Re-read what the agent is doing every `AGENT_EVERY`, one ask at a
+    /// time, once it's set up.
+    fn poll_agent(&mut self) {
+        if !matches!(self.phase, Phase::Ready) || !self.agent_asked.is_some_and(|at| at.elapsed() >= AGENT_EVERY) {
+            return;
+        }
+        self.agent_asked = None;
+        let project = self.project.as_ref().map(|(id, _)| id.clone());
+        self.spawn(move |client, tx| {
+            let _ = tx.send(AppEvent::Agent(crate::agent_state(&client, project.as_deref())));
+        });
+    }
+
+    /// Read the project's MCP servers, for the welcome card.
+    fn load_connections(&self) {
+        let Some((project, _)) = self.project.clone() else { return };
+        if cfg!(test) {
+            return;
+        }
+        self.spawn(move |client, tx| {
+            if let Ok(servers) = mcp::list(&client, &project) {
+                let _ = tx.send(AppEvent::Connections(project, servers));
+            }
+        });
+    }
+
+    /// Read who's signed in, for the welcome card.
+    fn load_account(&self) {
+        if cfg!(test) {
+            return;
+        }
+        self.spawn(|client, tx| {
+            let _ = tx.send(AppEvent::Account(crate::account(&client)));
+        });
+    }
+
+    /// Read the project's skills for the hints; without them, `/<skill>`
+    /// still reaches the agent, just unhinted.
+    fn load_skills(&self) {
+        let Some((project, _)) = self.project.clone() else { return };
+        if cfg!(test) {
+            return;
+        }
+        self.spawn(move |client, tx| {
+            if let Ok(skills) = crate::project_skills(&client, &project) {
+                let _ = tx.send(AppEvent::Skills(project, skills));
+            }
+        });
+    }
+
     fn load_web_search(&self) {
         let Some((project, _)) = self.project.clone() else { return };
         self.spawn(move |client, tx| {
@@ -1255,7 +1382,7 @@ impl App {
     fn key_chat(&mut self, key: KeyEvent) {
         let hints = self.command_hints();
         if !hints.is_empty() {
-            let selected = hints[self.hint_at.min(hints.len() - 1)].0;
+            let selected = hints[self.hint_at.min(hints.len() - 1)].0.clone();
             match key.code {
                 KeyCode::Up => return self.hint_at = self.hint_at.saturating_sub(1),
                 KeyCode::Down => return self.hint_at = (self.hint_at + 1).min(hints.len() - 1),
@@ -1265,7 +1392,7 @@ impl App {
                     return;
                 }
                 KeyCode::Enter => {
-                    self.input = selected.to_string();
+                    self.input = selected;
                     return self.submit();
                 }
                 KeyCode::Esc => {
@@ -1284,12 +1411,37 @@ impl App {
     }
 
     /// The slash commands matching what's typed so far, while it's still one
-    /// word starting with `/`.
-    fn command_hints(&self) -> Vec<(&'static str, &'static str)> {
+    /// word starting with `/`: the CLI's own and the project's skills
+    /// together, by name.
+    fn command_hints(&self) -> Vec<(String, String)> {
         if self.token_entry || !self.input.starts_with('/') || self.input.contains(' ') {
             return Vec::new();
         }
-        COMMANDS.iter().copied().filter(|(name, _)| name.starts_with(self.input.as_str())).collect()
+        let typed = self.input.to_lowercase();
+        // A skill named like a command can't be reached by its name.
+        let skills = self
+            .skills
+            .iter()
+            .filter(|(name, _)| !is_command(&format!("/{}", name)))
+            .map(|(name, what)| {
+                // Its description, or its name when it has none.
+                (format!("/{}", name), if what.is_empty() { name.clone() } else { what.clone() })
+            });
+        let mut hints: Vec<(String, String)> = COMMANDS
+            .iter()
+            .map(|(name, what)| (name.to_string(), what.to_string()))
+            .chain(skills)
+            .filter(|(name, _)| name.to_lowercase().starts_with(&typed))
+            .collect();
+        hints.sort_by_key(|(name, _)| name.to_lowercase());
+        hints
+    }
+
+    /// Whether `/<word>` names one of the project's skills, as the agent
+    /// matches it: ignoring case, spaces, dashes and underscores.
+    fn is_skill(&self, command: &str) -> bool {
+        let wanted = skill_key(command.trim_start_matches('/'));
+        !wanted.is_empty() && self.skills.iter().any(|(name, _)| skill_key(name) == wanted)
     }
 
     fn key_edit(&mut self, key: KeyEvent) {
@@ -1387,14 +1539,29 @@ impl App {
             return self.insert(text.trim());
         }
         match dropped_files(text) {
+            // The archive for `/project import`, as its path.
+            Some(_) if self.input.trim_start().starts_with("/project import") => {
+                if !self.input.ends_with(' ') {
+                    self.insert(" ");
+                }
+                self.insert(text.trim());
+            }
+            // An exported project, on an empty prompt: the import, to confirm
+            // with Enter. Not straight away, as it switches projects.
+            Some(paths) if self.input.trim().is_empty() && matches!(paths.as_slice(), [path] if is_archive(path)) => {
+                self.input = format!("/project import {}", text.trim());
+                self.cursor = self.input.chars().count();
+            }
             Some(paths) => {
                 for path in paths {
                     if !is_image(&path) && !is_document(&path) {
                         let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
-                        self.entries.push(Entry::Error(format!(
-                            "Can't attach {}: only PNG and JPEG images, and PDF, Word, PowerPoint, Excel, CSV, text, HTML and JSON documents",
-                            name
-                        )));
+                        let why = if is_archive(&path) {
+                            "to import it as a project, drop it on an empty prompt".to_string()
+                        } else {
+                            "only PNG and JPEG images, and PDF, Word, PowerPoint, Excel, CSV, text, HTML and JSON documents".to_string()
+                        };
+                        self.entries.push(Entry::Error(format!("Can't attach {}: {}", name, why)));
                         continue;
                     }
                     let kind = if is_image(&path) { "Image" } else { "Doc" };
@@ -1494,6 +1661,7 @@ impl App {
                     });
                     refresh_models(&client, &tx, project);
                     let _ = tx.send(AppEvent::Usage(crate::usage::fetch(&client)));
+                    let _ = tx.send(AppEvent::Account(crate::account(&client)));
                 })
             }
             "/quit" | "/exit" | "/q" | "exit" => self.quit = true,
@@ -1530,7 +1698,8 @@ impl App {
                 self.session = chat::new_session_id();
                 self.scroll_back = 0;
             }
-            _ if command.starts_with('/') => {
+            // `/<skill>` goes to the agent, which runs that skill.
+            _ if command.starts_with('/') && !self.is_skill(command) => {
                 self.entries.push(Entry::Error(format!("Unknown command {}; try /help", command)));
             }
             _ => {
@@ -1568,6 +1737,7 @@ impl App {
             });
             refresh_models(&client, &tx, project);
             let _ = tx.send(AppEvent::Usage(crate::usage::fetch(&client)));
+            let _ = tx.send(AppEvent::Account(crate::account(&client)));
         });
     }
 
@@ -1587,6 +1757,7 @@ impl App {
             });
             refresh_models(&client, &tx, project);
             let _ = tx.send(AppEvent::Usage(crate::usage::fetch(&client)));
+            let _ = tx.send(AppEvent::Account(crate::account(&client)));
         });
     }
 
@@ -1649,8 +1820,8 @@ impl App {
     }
 
     /// The projects panel's keys; false for any other, which is typing.
-    /// The last row, "+ New project" (or ctrl+n), starts `/project new ` in
-    /// the prompt for the name. Deleting takes ctrl+d twice, as nothing
+    /// The last rows, "+ New project" (or ctrl+n) and "+ Import project",
+    /// start `/project new ` or `/project import ` in the prompt. Deleting takes ctrl+d twice, as nothing
     /// brings a project back.
     fn key_projects(&mut self, key: KeyEvent) -> bool {
         let Overlay::Projects { rows, selected, deleting } = &mut self.overlay else { return false };
@@ -1670,7 +1841,7 @@ impl App {
             KeyCode::Esc if asked => {}
             KeyCode::Esc => self.overlay = Overlay::None,
             KeyCode::Up => *selected = selected.saturating_sub(1),
-            KeyCode::Down => *selected = (*selected + 1).min(count),
+            KeyCode::Down => *selected = (*selected + 1).min(count + 1),
             KeyCode::Char('r') if ctrl => self.load_projects(),
             KeyCode::Char('n') if ctrl => self.start_new_project(),
             KeyCode::Enter => match chosen {
@@ -1678,7 +1849,8 @@ impl App {
                     self.overlay = Overlay::None;
                     self.switch_project((project.id, project.name));
                 }
-                None if list.is_some() => self.start_new_project(),
+                None if list.is_some() && *selected == count => self.start_new_project(),
+                None if list.is_some() => self.start_import_project(),
                 None => {}
             },
             _ => return false,
@@ -1692,7 +1864,7 @@ impl App {
         let status = self.status_lines();
         // Command hints take the footer's place while a command is typed,
         // and an open panel takes it in the same way, under the prompt.
-        let hints = self.hint_lines();
+        let hints = self.hint_lines(frame.area().width as usize);
         let room = frame.area().height.saturating_sub(12);
         let under = match self.panel_height() {
             Some(height) => height.min(room),
@@ -1743,7 +1915,7 @@ impl App {
             Overlay::Models { .. } => 1,
             Overlay::Mcp { rows: Some(Ok(list)), .. } => list.len().max(1),
             Overlay::Mcp { .. } => 1,
-            Overlay::Projects { rows: Some(Ok(list)), .. } => list.len() + 1,
+            Overlay::Projects { rows: Some(Ok(list)), .. } => list.len() + 2,
             Overlay::Projects { .. } => 1,
             Overlay::Help => help_lines().len(),
             Overlay::Status(rows) => self.status_panel_lines(rows).len(),
@@ -1809,11 +1981,11 @@ impl App {
     /// ```text
     /// ╭───────────────────────────────────────────────────────────────────────────╮
     /// │                                                                           │
-    /// │ █▀▀▀▄ ▄▀▀▀▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀    project  general_chat              │
-    /// │ █   █ █   █ █     █▀▀▀  █ ▀▄█   █      agent    http://localhost:38540/v1 │
-    /// │ ▀▀▀▀   ▀▀▀   ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀      version  CLI 1.0.14 · agent 1.2.7  │
-    /// │ Your private AI assistant                                                 │
-    /// │ by Smartloop · ? for shortcuts                                            │
+    /// │ █▀▀▀▄ ▄▀▀▀▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀    project  notes                     │
+    /// │ █   █ █   █ █     █▀▀▀  █ ▀▄█   █               5 docs · 2 connections    │
+    /// │ ▀▀▀▀   ▀▀▀   ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀      agent    ▰▰▰▱▱▱▱▱▱▱ 31% memory     │
+    /// │ Frontier quality. Local first.         account  mehfuz@smartloop.ai       │
+    /// │ by Smartloop · ? for shortcuts                  CLI 1.0.42 · agent 1.2.10 │
     /// │                                                                           │
     /// │ Here are some commands to get you started                                 │
     /// │   /login     sign in for web search and more models                       │
@@ -1822,30 +1994,83 @@ impl App {
     /// │                                                                           │
     /// ╰───────────────────────────────────────────────────────────────────────────╯
     /// ```
+    /// The agent's state at a glance: a green square when it's healthy, the
+    /// spinner while it indexes or is first asked, and a red square with what's
+    /// wrong otherwise.
+    fn agent_mark(&self) -> Span<'static> {
+        match self.agent.as_ref().map(|a| a.state.as_str()) {
+            Some("healthy") => Span::styled("■", Style::new().fg(Color::Green)),
+            None | Some("indexing") => Span::styled(self.spinner(), Style::new().fg(pink())),
+            Some(problem) => Span::styled(format!("■ {}", problem), Style::new().fg(Color::Red)),
+        }
+    }
+
+    /// The card's details, by label: the project and what it holds, the
+    /// agent's state and memory, who's signed in, and the versions.
+    fn card_details(&self) -> Vec<(&'static str, Vec<Span<'static>>)> {
+        let project = vec![Span::raw(self.project.as_ref().map_or("…".to_string(), |(_, name)| name.clone()))];
+        // What it holds, on a row of its own under it.
+        let documents = self.agent.as_ref().map_or(0, |a| a.documents);
+        let (ready, connecting) = self.connections.unwrap_or_default();
+        let plural = |n: usize, what: &str| format!("{} {}{}", n, what, if n == 1 { "" } else { "s" });
+        let mut holds = vec![Span::styled(
+            format!("{} · {}", plural(documents, "doc"), plural(ready + connecting, "connection")),
+            dim(),
+        )];
+        // The spinner while some are still connecting.
+        if connecting > 0 {
+            holds.push(Span::styled(format!(" {}", self.spinner()), Style::new().fg(pink())));
+        }
+        // How much memory the enabled models take, which also says it's up;
+        // the spinner before it while indexing. Without a figure, the mark
+        // alone, as for a problem.
+        let state = self.agent.as_ref().map(|a| a.state.as_str());
+        let memory = self.agent.as_ref().and_then(|a| a.memory).filter(|_| matches!(state, Some("healthy" | "indexing")));
+        let mut agent = Vec::new();
+        match memory {
+            Some(memory) => {
+                if state == Some("indexing") {
+                    agent.push(self.agent_mark());
+                    agent.push(Span::raw(" "));
+                }
+                agent.extend(memory_bar(memory));
+                agent.push(Span::styled(format!(" {}% memory", memory), dim()));
+            }
+            None => agent.push(self.agent_mark()),
+        }
+        let account = match &self.account {
+            None => vec![Span::styled("…", dim())],
+            Some(Some(who)) => vec![Span::raw(who.clone())],
+            Some(None) => vec![Span::styled("not signed in · /login", dim())],
+        };
+        let versions = format!("CLI {} · agent {}", env!("CARGO_PKG_VERSION"), framework::VERSION);
+        vec![
+            ("project", project),
+            ("", holds),
+            ("agent", agent),
+            ("account", account),
+            ("", vec![Span::styled(versions, dim())]),
+        ]
+    }
+
     fn welcome(&self, width: u16) -> Vec<Line<'static>> {
         let width = width as usize;
         let border = dim();
-        let project = self.project.as_ref().map_or("…".to_string(), |(_, name)| name.clone());
-        let right = [
-            ("project", project),
-            // The endpoint the chat and every call go to.
-            ("agent", crate::api_url()),
-            ("version", format!("CLI {} · agent {}", env!("CARGO_PKG_VERSION"), framework::VERSION)),
-        ];
+        let right = self.card_details();
         // Styled per span: the rows are taken apart into spans below.
         let mut left: Vec<Line<'static>> = crate::BANNER
             .iter()
             .map(|row| Line::from(Span::styled(*row, Style::new().fg(pink()))))
             .collect();
-        left.push(Line::from(Span::styled("Your private AI assistant", dim())));
+        left.push(Line::from(Span::styled("Frontier quality. Local first.", dim())));
         left.push(Line::from(Span::styled("by Smartloop · ? for shortcuts", dim())));
         let left_width = left.iter().map(Line::width).max().unwrap_or(0) + 4;
 
-        let row = |label: &str, value: &str| {
-            Line::from(vec![
-                Span::styled(format!("{:<9}", label), dim()),
-                Span::raw(value.to_string()),
-            ])
+        // The label, then the value cut to `room`.
+        let row = |label: &str, value: &[Span<'static>], room: usize| {
+            let mut spans = vec![Span::styled(format!("{:<9}", label), dim())];
+            spans.extend(fit(value, room));
+            Line::from(spans)
         };
         // Room inside the border at most; the card itself is only as wide as
         // what it holds.
@@ -1858,8 +2083,7 @@ impl App {
                     let used: usize = spans.iter().map(|s| s.width()).sum();
                     spans.push(Span::raw(" ".repeat(left_width.saturating_sub(used))));
                     if let Some((label, value)) = right.get(i) {
-                        let room = inner.saturating_sub(left_width + 9);
-                        spans.extend(row(label, &truncate(value, room)).spans);
+                        spans.extend(row(label, value, inner.saturating_sub(left_width + 9)).spans);
                     }
                     Line::from(spans)
                 })
@@ -1867,7 +2091,7 @@ impl App {
         } else {
             let mut body = left;
             body.push(Line::default());
-            body.extend(right.iter().map(|(l, v)| row(l, &truncate(v, inner.saturating_sub(9)))));
+            body.extend(right.iter().map(|(l, v)| row(l, v, inner.saturating_sub(9))));
             body
         };
 
@@ -2013,11 +2237,20 @@ impl App {
     }
 
     /// `  /models     models: enable, disable, download`, one per matching
-    /// command, the highlighted one in pink.
-    fn hint_lines(&self) -> Vec<Line<'static>> {
+    /// command, the highlighted one in pink. A table `width` wide: names in
+    /// a column as wide as the longest, descriptions wrapped under their
+    /// own column. At most `HINT_ROWS` rows show, around the highlighted
+    /// one.
+    fn hint_lines(&self, width: usize) -> Vec<Line<'static>> {
         let hints = self.command_hints();
         let at = self.hint_at.min(hints.len().saturating_sub(1));
-        hints
+        // Sized over every match, not just those shown, so the column holds
+        // still while scrolling.
+        let longest = hints.iter().map(|(name, _)| name.chars().count()).max().unwrap_or(0);
+        let column = longest.clamp(HINT_NAME_MIN, HINT_NAME_MAX);
+        // The mark before the name, and the gap after it.
+        let described = width.saturating_sub(column + 4).max(1);
+        let rows: Vec<Vec<Line<'static>>> = hints
             .iter()
             .enumerate()
             .map(|(i, (name, what))| {
@@ -2026,12 +2259,34 @@ impl App {
                 } else {
                     ("  ", dim())
                 };
-                Line::from(vec![
-                    Span::styled(format!("{}{:<14}", mark, name), style),
-                    Span::styled(what.to_string(), if i == at { Style::new() } else { dim() }),
-                ])
+                let text = if i == at { Style::new() } else { dim() };
+                wrap(what, described)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, part)| {
+                        let lead = if n == 0 {
+                            Span::styled(format!("{}{:<column$}  ", mark, truncate(name, column)), style)
+                        } else {
+                            Span::raw(" ".repeat(column + 4))
+                        };
+                        Line::from(vec![lead, Span::styled(part, text)])
+                    })
+                    .collect()
             })
-            .collect()
+            .collect();
+        // Back from the highlighted hint as far as fits, then on after it.
+        let mut first = at;
+        let mut used = rows.get(at).map_or(0, Vec::len);
+        while first > 0 && used + rows[first - 1].len() <= HINT_ROWS {
+            first -= 1;
+            used += rows[first].len();
+        }
+        let mut last = at;
+        while last + 1 < rows.len() && used + rows[last + 1].len() <= HINT_ROWS {
+            last += 1;
+            used += rows[last].len();
+        }
+        rows.into_iter().skip(first).take(last + 1 - first).flatten().collect()
     }
 
     /// Key hints under the prompt.
@@ -2045,6 +2300,9 @@ impl App {
             hints.extend(key_hints(&[("pgdn", "scroll down"), ("end", "latest")]));
         } else if self.token_entry {
             hints.extend(key_hints(&[("enter", "sign in"), ("esc", "cancel")]));
+        } else if self.input.trim() == "/project import" {
+            // Asked from the projects panel, or typed: what it wants next.
+            hints.push(Span::styled("Drop an exported project's .zip here, or type its path", dim()));
         } else if self.last_esc.is_some_and(|t| t.elapsed() < DOUBLE_ESC) {
             hints.extend(key_hints(&[("esc", "again to clear")]));
         } else if let Some(warning) = self.search_warning(area.width.saturating_sub(2) as usize) {
@@ -2187,7 +2445,7 @@ impl App {
     }
 
     /// The projects to switch to, the one in use marked, each with its
-    /// description; "+ New project" last.
+    /// description; "+ New project" and "+ Import project" last.
     fn draw_projects(
         &self,
         frame: &mut Frame,
@@ -2246,11 +2504,13 @@ impl App {
                 Line::from(spans)
             })
             .collect();
-        let chosen = selected == list.len();
-        lines.push(Line::from(vec![
-            Span::styled(if chosen { "› " } else { "  " }, Style::new().fg(pink()).bold()),
-            Span::styled("+ New project", if chosen { Style::new().fg(pink()).bold() } else { dim() }),
-        ]));
+        for (i, label) in ["+ New project", "+ Import project"].into_iter().enumerate() {
+            let chosen = selected == list.len() + i;
+            lines.push(Line::from(vec![
+                Span::styled(if chosen { "› " } else { "  " }, Style::new().fg(pink()).bold()),
+                Span::styled(label, if chosen { Style::new().fg(pink()).bold() } else { dim() }),
+            ]));
+        }
         frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
@@ -2545,6 +2805,11 @@ fn is_image(path: &std::path::Path) -> bool {
     matches!(ext.as_str(), "png" | "jpg" | "jpeg")
 }
 
+/// An exported project, for `/project import`.
+fn is_archive(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+}
+
 /// The documents the agent reads as text; it has a parser for these and
 /// stores anything else as bytes the model never sees.
 fn is_document(path: &std::path::Path) -> bool {
@@ -2560,13 +2825,63 @@ const COMMANDS: [(&str, &str); 11] = [
     ("/logout", "log out"),
     ("/models", "enable, disable and download models"),
     ("/mcp", "MCP servers; /mcp add <url> to connect one"),
-    ("/project", "switch, create and delete projects"),
+    ("/project", "switch, create, import and delete projects"),
     ("/status", "account, model, agent and versions"),
     ("/usage", "web searches left, tokens and cost saved"),
     ("/upgrade", "Pro plan: 1,000 web searches a month"),
     ("/clear", "clear the chat and start a new session"),
     ("/quit", "quit"),
 ];
+
+/// Whether `command` is one of the CLI's own, aliases included.
+fn is_command(command: &str) -> bool {
+    let command = command.to_lowercase();
+    COMMANDS.iter().any(|(name, _)| *name == command) || ["/exit", "/q", "/projects", "/?"].contains(&command.as_str())
+}
+
+/// A skill name as the agent compares it: lowercase, without spaces,
+/// dashes or underscores.
+fn skill_key(name: &str) -> String {
+    name.chars().filter(|c| !c.is_whitespace() && *c != '-' && *c != '_').flat_map(char::to_lowercase).collect()
+}
+
+/// The welcome card's memory bar, in cells.
+const MEMORY_BAR: usize = 10;
+
+/// Memory use as a meter, `MEMORY_BAR` cells wide and drawn as the setup
+/// steps' bars are: each filled cell
+/// colored for the pressure it stands for, green to 70%, yellow to 90%, red
+/// past it, as the search budget warns.
+fn memory_bar(percent: u8) -> Vec<Span<'static>> {
+    let filled = ((percent.min(100) as usize * MEMORY_BAR) + 50) / 100;
+    (0..MEMORY_BAR)
+        .map(|cell| {
+            if cell >= filled {
+                return Span::styled("▱", dim());
+            }
+            let level = (cell + 1) * 100 / MEMORY_BAR;
+            let color = match level {
+                91.. => Color::Red,
+                71.. => Color::Yellow,
+                _ => Color::Green,
+            };
+            Span::styled("▰", Style::new().fg(color))
+        })
+        .collect()
+}
+
+/// MCP servers ready, and still connecting.
+fn connection_counts(servers: &[mcp::Server]) -> (usize, usize) {
+    let connecting = servers.iter().filter(|s| s.connecting()).count();
+    let ready = servers.iter().filter(|s| s.state == "ready").count();
+    (ready, connecting)
+}
+
+/// At most this many rows of command hints show at once; the rest scroll.
+const HINT_ROWS: usize = 12;
+/// The hints' name column fits the longest name, within these bounds.
+const HINT_NAME_MIN: usize = 12;
+const HINT_NAME_MAX: usize = 28;
 
 /// Every key and command, for the help panel.
 fn help_lines() -> Vec<Line<'static>> {
@@ -2594,6 +2909,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/usage", "web searches left, tokens and cost saved"),
         ("/upgrade", "Pro plan: 1,000 web searches a month"),
         ("/clear", "clear the chat and start a new session"),
+        ("/<skill> [prompt]", "run one of the project's skills"),
         ("[ctrl+c] /quit", "quit"),
     ];
     rows.iter()
@@ -2650,6 +2966,53 @@ fn pink() -> Color {
         .map(|v| v.contains("truecolor") || v.contains("24bit"))
         .unwrap_or(false);
     if truecolor { Color::Rgb(229, 93, 156) } else { Color::Indexed(169) }
+}
+
+/// `text` in lines at most `width` wide, broken between words; a word
+/// longer than a line is broken inside it.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = vec![String::new()];
+    for word in text.split_whitespace() {
+        let mut word: Vec<char> = word.chars().collect();
+        let line = lines.last_mut().expect("a line");
+        let used = line.chars().count();
+        if used > 0 && used + 1 + word.len() <= width {
+            line.push(' ');
+            line.extend(word);
+            continue;
+        }
+        if used > 0 {
+            lines.push(String::new());
+        }
+        while word.len() > width {
+            let rest = word.split_off(width);
+            *lines.last_mut().expect("a line") = word.into_iter().collect();
+            lines.push(String::new());
+            word = rest;
+        }
+        lines.last_mut().expect("a line").extend(word);
+    }
+    lines
+}
+
+/// `spans` cut to `width` cells, the last one that fits ending in `…`.
+fn fit(spans: &[Span<'static>], width: usize) -> Vec<Span<'static>> {
+    let mut left = width;
+    let mut kept = Vec::new();
+    for span in spans {
+        let n = span.content.chars().count();
+        if n <= left {
+            left -= n;
+            kept.push(span.clone());
+        } else {
+            if left > 0 {
+                kept.push(Span::styled(truncate(&span.content, left), span.style));
+            }
+            break;
+        }
+    }
+    kept
 }
 
 fn truncate(label: &str, max: usize) -> String {
@@ -2709,13 +3072,37 @@ mod tests {
         // Short: the banner sits just above the prompt.
         let banner = rows.iter().position(|r| r.contains("█▀▀▀▄ ▄▀▀▀▄")).expect(&text);
         assert!(rows[banner].contains("project  Default"), "{}", text);
-        assert!(rows[banner + 1].contains("agent    http://localhost:"), "{}", text);
-        assert!(rows[banner + 1].contains("/v1"), "{}", text);
-        assert!(rows[banner + 2].contains(&format!("version  CLI {} · agent", env!("CARGO_PKG_VERSION"))), "{}", text);
-        assert!(rows[banner + 3].contains("Your private AI assistant"), "{}", text);
-        assert!(rows[banner + 4].contains("by Smartloop"), "{}", text);
-        // No account row (the /status tip mentions the word, not a value).
-        assert!(!text.contains("account  "), "{}", text);
+        assert!(rows[banner + 1].contains("         0 docs · 0 connections"), "{}", text);
+        assert!(rows[banner + 2].contains(&format!("agent    {}", app.spinner())), "{}", text);
+        assert!(rows[banner + 3].contains("account  …"), "{}", text);
+        let versions = format!("         CLI {} · agent {}", env!("CARGO_PKG_VERSION"), framework::VERSION);
+        assert!(rows[banner + 3].contains("Frontier quality. Local first."), "{}", text);
+        assert!(rows[banner + 4].contains("by Smartloop") && rows[banner + 4].contains(&versions), "{}", text);
+
+        // Filled in as the agent and the platform answer.
+        let state = |state: &str| crate::AgentState { state: state.into(), memory: Some(31), documents: 5 };
+        app.apply(AppEvent::Agent(Some(state("healthy"))));
+        let server = |state: &str| mcp::Server {
+            id: state.into(), name: state.into(), location: String::new(), state: state.into(), tools: 0, error: None,
+        };
+        app.apply(AppEvent::Connections("p1".into(), vec![server("ready"), server("provisioning"), server("failed")]));
+        app.apply(AppEvent::Connections("p0".into(), Vec::new()));
+        app.apply(AppEvent::Account(Some("mehfuz@smartloop.ai".into())));
+        let filled = screen(&app, 80, 30);
+        assert!(filled.contains("project  Default"), "{}", filled);
+        assert!(filled.contains(&format!("         5 docs · 2 connections {}", app.spinner())), "{}", filled);
+        assert!(filled.contains("agent    ▰▰▰▱▱▱▱▱▱▱ 31% memory"), "{}", filled);
+        app.apply(AppEvent::Agent(Some(state("indexing"))));
+        assert!(screen(&app, 80, 30).contains(&format!("agent    {} ▰▰▰▱▱▱▱▱▱▱ 31% memory", app.spinner())));
+        app.apply(AppEvent::Agent(Some(crate::AgentState { memory: None, ..state("healthy") })));
+        // No figure to draw: the square says it's up.
+        assert!(screen(&app, 80, 30).contains("agent    ■ "));
+        assert!(filled.contains("account  mehfuz@smartloop.ai"), "{}", filled);
+        assert!(!filled.contains("healthy"), "{}", filled);
+        app.apply(AppEvent::Account(None));
+        assert!(screen(&app, 80, 30).contains("account  not signed in · /login"));
+        app.apply(AppEvent::Agent(None));
+        assert!(screen(&app, 80, 30).contains("agent    ■ not responding"));
         // Only as wide as what it holds, not the screen.
         let wide = screen(&app, 120, 24);
         let top = wide.lines().find(|r| r.starts_with('╭')).expect(&wide);
@@ -2742,6 +3129,9 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         app.project = Some(("p1".into(), "general_chat".into()));
+        app.agent = Some(crate::AgentState { state: "healthy".into(), memory: Some(42), documents: 12 });
+        app.connections = Some((2, 0));
+        app.account = Some(Some("you@example.com".into()));
         app.entries.push(Entry::User(
             "[Doc 1] Issue a mutual NDA to Northwind Labs from our template: 2-year term, California law".into(),
         ));
@@ -2989,6 +3379,7 @@ mod tests {
         assert!(text.contains("  general_chat  system      about general_chat"), "{}", text);
         assert!(text.contains("› Research      ✓ current   about Research"), "{}", text);
         assert!(text.contains("  + New project"), "{}", text);
+        assert!(text.contains("  + Import project"), "{}", text);
         assert!(text.contains("[enter] switch  [ctrl+n] new  [ctrl+d] delete"), "{}", text);
 
         // The project in use can't be deleted out from under the chat.
@@ -3022,6 +3413,20 @@ mod tests {
         app.overlay = Overlay::Projects { rows: None, selected: 0, deleting: false };
         app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
         assert_eq!(app.input, "/project new ");
+
+        // The row under it asks for the archive, which a drop then fills in.
+        app.input.clear();
+        app.overlay = Overlay::Projects { rows: None, selected: 0, deleting: false };
+        app.apply(AppEvent::Projects(Ok(list())));
+        for _ in 0..5 {
+            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert!(screen(&app, 100, 30).contains("› + Import project"));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!((app.input.as_str(), app.cursor), ("/project import ", 16));
+        assert!(screen(&app, 100, 30).contains("Drop an exported project's .zip here, or type its path"));
+        app.input.clear();
 
         // A project just created or imported is switched to, and a reply
         // still running stops: its session is gone.
@@ -3082,6 +3487,35 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_zip_fills_in_the_import() {
+        let dir = std::env::temp_dir().join(format!("slp-zip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("my project.zip");
+        std::fs::write(&archive, b"zip").unwrap();
+        // As a terminal drops it: the space escaped.
+        let dropped = archive.display().to_string().replace(' ', "\\ ");
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+
+        // On an empty prompt (a drop on the projects panel closes it first).
+        app.paste(&dropped);
+        assert_eq!(app.input, format!("/project import {}", dropped));
+        assert_eq!(app.cursor, app.input.chars().count());
+        assert!(app.attachments.is_empty() && app.entries.is_empty());
+        // Nothing's imported until Enter, and then it's the file dropped.
+        assert!(app.turn.is_none());
+
+        // After a typed `/project import`, as its path.
+        app.input = "/project import".into();
+        app.cursor = app.input.chars().count();
+        app.paste(&dropped);
+        assert_eq!(app.input, format!("/project import {}", dropped));
+        assert_eq!(dropped_files(app.input.split_once("import ").unwrap().1).unwrap(), [archive.clone()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn dropped_files_become_chips() {
         let dir = std::env::temp_dir().join(format!("slp-drop-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3120,7 +3554,7 @@ mod tests {
         app.paste(&archive.display().to_string());
         assert_eq!(app.input, "compare [Image 1] ");
         assert_eq!(app.attachments.len(), 1);
-        assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("Can't attach bundle.zip")));
+        assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("Can't attach bundle.zip: to import it")));
         // Nor an image the vision model can't read.
         let heic = dir.join("IMG_0001.HEIC");
         std::fs::write(&heic, b"heic").unwrap();
@@ -3230,6 +3664,92 @@ mod tests {
     }
 
     #[test]
+    fn slash_hints_and_runs_the_projects_skills() {
+        // Sending a turn spawns it on the runtime.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        let skills = vec![
+            ("morning".to_string(), "the day's brief".to_string()),
+            ("Meeting_Notes".to_string(), String::new()),
+            ("status".to_string(), "shadowed by /status".to_string()),
+        ];
+        // A late answer for a project switched away from is dropped.
+        app.apply(AppEvent::Skills("p0".into(), skills.clone()));
+        assert!(app.skills.is_empty());
+        app.apply(AppEvent::Skills("p1".into(), skills));
+
+        app.input = "/m".into();
+        let names: Vec<String> = app.command_hints().into_iter().map(|(name, _)| name).collect();
+        assert_eq!(names, ["/mcp", "/Meeting_Notes", "/models", "/morning"]);
+        app.input = "/".into();
+        let names: Vec<String> = app.command_hints().into_iter().map(|(name, _)| name).collect();
+        assert_eq!(names.last().map(String::as_str), Some("/usage"));
+        assert!(names.windows(2).all(|w| w[0].to_lowercase() <= w[1].to_lowercase()), "{:?}", names);
+        assert!(!app.command_hints().iter().any(|(_, what)| what.contains("shadowed")));
+        app.input = "/mor".into();
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("› /morning"), "{}", text);
+        assert!(text.contains("the day's brief"), "{}", text);
+        assert!(!text.contains("skill:"), "{}", text);
+        // A long name widens the column instead of running into its text.
+        app.apply(AppEvent::Skills("p1".into(), vec![
+            ("weekly-competitor-digest".to_string(), "rivals' news this week".to_string()),
+            ("wiki".to_string(), "notes kept as linked pages, compiled from what you add and kept up to date as sources change".to_string()),
+        ]));
+        app.input = "/w".into();
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("› /weekly-competitor-digest  rivals' news this week"), "{}", text);
+        // The rest wraps under the description column, not cut off.
+        assert!(text.contains("  /wiki                      notes kept as linked pages, compiled from what you"), "{}", text);
+        let column = |needle: &str| text.lines().find_map(|l| l.find(needle)).unwrap();
+        let rest = text.lines().find(|l| l.contains("add and kept up to date as sources change")).unwrap();
+        assert_eq!(rest.trim_start().len(), rest.len() - column("notes kept"), "{}", text);
+        assert!(!text.lines().any(|l| (l.contains("notes kept") || l.contains("add and kept")) && l.contains('…')), "{}", text);
+        app.apply(AppEvent::Skills("p1".into(), vec![
+            ("morning".to_string(), "the day's brief".to_string()),
+            ("Meeting_Notes".to_string(), String::new()),
+            ("status".to_string(), "shadowed by /status".to_string()),
+        ]));
+        app.input = "/mee".into();
+        assert_eq!(app.command_hints(), [("/Meeting_Notes".to_string(), "Meeting_Notes".to_string())]);
+
+        // Sent to the agent as typed, which runs the skill, in any spelling.
+        app.input = "/meeting-notes summarize today".into();
+        app.submit();
+        assert!(matches!(app.entries.last(), Some(Entry::Reply(_))));
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::User(t) if t == "/meeting-notes summarize today")));
+        app.stop_turn();
+        app.input = "/nightly".into();
+        app.submit();
+        assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("Unknown command /nightly")));
+    }
+
+    #[test]
+    fn memory_bar_colors_each_cell_by_its_pressure() {
+        let colors = |percent| memory_bar(percent).into_iter().map(|s| (s.content.to_string(), s.style.fg)).collect::<Vec<_>>();
+        let bar = colors(95);
+        assert_eq!(bar.iter().map(|(c, _)| c.as_str()).collect::<String>(), "▰▰▰▰▰▰▰▰▰▰");
+        assert_eq!(bar[6].1, Some(Color::Green));
+        assert_eq!((bar[7].1, bar[8].1), (Some(Color::Yellow), Some(Color::Yellow)));
+        assert_eq!(bar[9].1, Some(Color::Red));
+        let low = colors(31);
+        assert_eq!(low.iter().map(|(c, _)| c.as_str()).collect::<String>(), "▰▰▰▱▱▱▱▱▱▱");
+        assert!(low[..3].iter().all(|(_, c)| *c == Some(Color::Green)));
+        assert_eq!(colors(0).iter().filter(|(c, _)| c == "▰").count(), 0);
+    }
+
+    #[test]
+    fn wraps_between_words() {
+        assert_eq!(wrap("the day's brief", 40), ["the day's brief"]);
+        assert_eq!(wrap("one two three four", 9), ["one two", "three", "four"]);
+        assert_eq!(wrap("abcdefghij kl", 4), ["abcd", "efgh", "ij", "kl"]);
+        assert_eq!(wrap("", 10), [""]);
+    }
+
+    #[test]
     fn mcp_lists_the_servers_and_checks_the_url() {
         let mut app = app();
         app.phase = Phase::Ready;
@@ -3270,7 +3790,7 @@ mod tests {
             StepEvent::Add("Start agent".into()),
             StepEvent::Detail(1, "port 38540".into()),
             StepEvent::Done(1),
-            StepEvent::Add("Base model".into()),
+            StepEvent::Add("Decision model".into()),
             StepEvent::Add("Default project".into()),
             StepEvent::Name(2, "sl-mini".into()),
             StepEvent::Progress(2, 377 << 20, 769 << 20),
@@ -3282,7 +3802,7 @@ mod tests {
         let top = rows.iter().position(|r| r.starts_with("╭ Booting up…")).expect(&text);
         assert!(rows[top + 2].contains("[x] Agent 1.2.7") && rows[top + 2].contains("▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰"), "{}", text);
         assert!(rows[top + 3].contains("[x] Start agent") && rows[top + 3].contains("port 38540"), "{}", text);
-        assert!(rows[top + 4].contains("[•] Base model sl-mini") && rows[top + 4].contains("▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱  49%"), "{}", text);
+        assert!(rows[top + 4].contains("[•] Decision model sl-mini") && rows[top + 4].contains("▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱  49%"), "{}", text);
         assert!(rows[top + 5].contains("[ ] Default project") && rows[top + 5].contains("▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱"), "{}", text);
         assert!(rows[top + 7].starts_with('╰') && rows[top + 7].contains("377 MB of 769 MB"), "{}", text);
     }
