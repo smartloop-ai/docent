@@ -28,7 +28,7 @@ pub const BANNER: [&str; 3] = [
     name = "smartloop", 
     version, 
     author,
-    about=format!("\n{}\n\nDocent by Smartloop: your private AI assistant", BANNER.join("\n")),
+    about=format!("\n{}\n\nDocent by Smartloop: frontier quality, local first", BANNER.join("\n")),
 )]
 
 struct Args {
@@ -39,26 +39,6 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Sign in through app.smartloop.ai in the browser, or with a token
-    Login {
-        /// Sign in with a token instead; prompts for it (input hidden) when
-        /// given without a value
-        #[arg(long, num_args = 0..=1, default_missing_value = "")]
-        token: Option<String>,
-    },
-    /// Clear stored credentials
-    Logout,
-    /// Manage projects
-    Project {
-        /// Name of the project
-        #[command(subcommand)]
-        command: ProjectCommands,
-    },
-    /// List, enable, and disable the models the orchestrator can pick
-    Model {
-        #[command(subcommand)]
-        command: ModelCommands,
-    },
     /// Start, stop, and inspect the local agent
     Agent {
         #[command(subcommand)]
@@ -90,56 +70,6 @@ enum AgentCommands {
     Start,
     /// Stop the local agent
     Stop,
-}
-
-#[derive(Subcommand)]
-enum ModelCommands {
-    /// List available models and whether each is downloaded and enabled
-    List {
-        /// Project ID; defaults to the current project
-        #[arg(long, short)]
-        project: Option<String>,
-    },
-    /// Enable a model for a project, downloading it first when needed
-    Enable {
-        /// Model name, as shown by `docent model list`
-        name: String,
-        /// Project ID; defaults to the current project
-        #[arg(long, short)]
-        project: Option<String>,
-    },
-    /// Disable a model for a project and unload it
-    Disable {
-        /// Model name, as shown by `docent model list`
-        name: String,
-        /// Project ID; defaults to the current project
-        #[arg(long, short)]
-        project: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum ProjectCommands {
-    /// List all projects
-    List,
-    /// Create a project from a blank template, or from an exported archive
-    Create {
-        /// Name of the project; optional with --import, where it renames the imported project
-        #[arg(long)]
-        name: Option<String>,
-        /// Description of the project
-        #[arg(long, conflicts_with = "import")]
-        description: Option<String>,
-        /// Path to a zip archive produced by an earlier project export
-        #[arg(long, value_name = "ZIP")]
-        import: Option<String>,
-    },
-    /// Delete a project by ID
-    Delete {
-        /// ID of the project to delete
-        #[arg(long)]
-        id: String,
-    },
 }
 
 /// Base URL of the Smartloop agent, overridable for non-default installs.
@@ -197,35 +127,6 @@ fn error_message(action: &str, response: Response) -> String {
     }
 }
 
-fn print_projects(projects: &[serde_json::Value]) {
-
-    let mut table = Table::new();
-
-    table.add_row(Row::new(vec![
-        Cell::new("ID"),
-        Cell::new("Name"),
-        Cell::new("System"),
-    ]));
-
-    for project in projects {
-        let id = project["id"].as_str().unwrap_or_default();
-        let name = project["name"].as_str().unwrap_or_default();
-        let system = if project["system"].as_bool().unwrap_or_default() {
-            Cell::new("true").with_style(Attr::ForegroundColor(color::MAGENTA))
-        } else {
-            Cell::new("false")
-        };
-        table.add_row(Row::new(vec![
-            Cell::new(id),
-            Cell::new(name),
-            system,
-        ]));
-    }
-
-    table.printstd();
-
-}
-
 fn fetch_projects(client: &Client) -> Vec<serde_json::Value> {
     try_fetch_projects(client).unwrap_or_else(|e| fail(e))
 }
@@ -238,10 +139,6 @@ pub fn try_fetch_projects(client: &Client) -> Result<Vec<serde_json::Value>, Str
     }
 }
 
-fn list_projects(client: &Client) {
-    print_projects(&fetch_projects(client));
-}
-
 /// Pick the project a `run` session chats in. The chat request has to name a
 /// project: without one the server's supervisor handles the stream itself and
 /// drops it after the first event. Offers a numbered list on a terminal,
@@ -250,7 +147,7 @@ fn list_projects(client: &Client) {
 fn select_project(client: &Client) -> String {
     let projects = fetch_projects(client);
     if projects.is_empty() {
-        fail("No projects found; create one with `docent project create`".to_string());
+        fail("No projects found; create one with /project new in `docent`".to_string());
     }
 
     let default = projects
@@ -292,12 +189,6 @@ fn select_project(client: &Client) -> String {
             _ => eprintln!("Enter a number from 1 to {}", projects.len()),
         }
     }
-}
-
-/// Create an empty project — the blank template is a project with no skills,
-/// which the API seeds with the workspace defaults.
-fn create_project(client: &Client, name: String, description: Option<String>) {
-    report_created(try_create_project(client, &name, description).unwrap_or_else(|e| fail(e)), "Project created");
 }
 
 /// Create an empty project and return it as the agent lists it.
@@ -349,11 +240,6 @@ pub fn upload_asset(client: &Client, path: &std::path::Path) -> Result<String, S
         .ok_or_else(|| format!("The agent returned no asset id for {}", name))
 }
 
-/// Create a project from a zip archive produced by an earlier export.
-fn import_project(client: &Client, path: String, name: Option<String>) {
-    report_created(try_import_project(client, &path, name).unwrap_or_else(|e| fail(e)), "Project imported");
-}
-
 /// Import a project archive and return the new project.
 pub fn try_import_project(client: &Client, path: &str, name: Option<String>) -> Result<serde_json::Value, String> {
     let mut form = multipart::Form::new()
@@ -375,12 +261,6 @@ pub fn try_import_project(client: &Client, path: &str, name: Option<String>) -> 
     }
 
     response.json().map_err(|e| format!("Failed to parse response as JSON: {}", e))
-}
-
-/// Print the confirmation line and a one-row table for a newly created project.
-fn report_created(project: serde_json::Value, action: &str) {
-    println!("{} successfully", action);
-    print_projects(&[project]);
 }
 
 /// GET a JSON document from the agent, `None` when it is unreachable or
@@ -506,28 +386,8 @@ fn agent_status(client: &Client) {
     table.printstd();
 }
 
-/// The given project, or the server's current one (the first when none is
-/// marked current).
-fn resolve_project(client: &Client, project: Option<String>) -> String {
-    if let Some(project) = project {
-        return project;
-    }
-    let projects = fetch_projects(client);
-    projects
-        .iter()
-        .find(|p| p["current"].as_bool().unwrap_or_default())
-        .or_else(|| projects.first())
-        .and_then(|p| p["id"].as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| fail("No projects found; create one with `docent project create`".to_string()))
-}
-
 fn project_models_url(project_id: &str) -> String {
     format!("{}/{}/models", projects_url(), project_id)
-}
-
-fn get_json_or_fail(client: &Client, url: String, action: &str) -> serde_json::Value {
-    request_json(client, url, action).unwrap_or_else(|e| fail(e))
 }
 
 fn request_json(client: &Client, url: String, action: &str) -> Result<serde_json::Value, String> {
@@ -599,44 +459,6 @@ pub fn model_rows(client: &Client, project_id: &str) -> Result<Vec<ModelRow>, St
         .collect())
 }
 
-fn list_models(client: &Client, project_id: &str) {
-    let rows = model_rows(client, project_id).unwrap_or_else(|e| fail(e));
-
-    let flag = |on: bool| {
-        if on {
-            Cell::new("true").with_style(Attr::ForegroundColor(color::GREEN))
-        } else {
-            Cell::new("false")
-        }
-    };
-
-    let mut table = Table::new();
-    table.add_row(Row::new(vec![
-        Cell::new("Name"),
-        Cell::new("Capabilities"),
-        Cell::new("Access"),
-        Cell::new("Downloaded"),
-        Cell::new("Enabled"),
-    ]));
-
-    for row in &rows {
-        let access = if row.accessible {
-            Cell::new(&row.access)
-        } else {
-            Cell::new(&format!("{} (sign in)", row.access)).with_style(Attr::ForegroundColor(color::YELLOW))
-        };
-        table.add_row(Row::new(vec![
-            Cell::new(&row.name),
-            Cell::new(&row.capabilities),
-            access,
-            flag(row.downloaded),
-            flag(row.enabled),
-        ]));
-    }
-
-    table.printstd();
-}
-
 /// PATCH a project's model entry; the server canonicalizes the name.
 pub fn patch_project_model(client: &Client, project_id: &str, name: &str, enabled: bool) -> Result<(), String> {
     let action = if enabled { "enable model" } else { "disable model" };
@@ -677,6 +499,87 @@ pub fn web_search_enabled(client: &Client, project_id: &str) -> Result<bool, Str
     Ok(reply["enabled"].as_bool().unwrap_or_default())
 }
 
+/// The agent as the welcome card shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentState {
+    /// `healthy`, `indexing`, or what's wrong.
+    pub state: String,
+    /// The memory the project's enabled models need, as a percentage of the
+    /// device's.
+    pub memory: Option<u8>,
+    /// The project's documents indexed so far.
+    pub documents: usize,
+}
+
+/// What the agent is doing, for the welcome card: `healthy`, or
+/// `indexing` while the project's documents go in. `None` when it doesn't
+/// answer.
+pub fn agent_state(client: &Client, project_id: Option<&str>) -> Option<AgentState> {
+    let health = get_json(client, format!("{}/health", base_url()))?;
+    // Every document with its status: `/health` lists only the indexed ones,
+    // so one being converted or indexed would read as ready.
+    let documents = project_id
+        .and_then(|id| get_json(client, format!("{}/{}/documents", projects_url(), id)))
+        .and_then(|reply| reply["documents"].as_array().cloned());
+    let indexed = match &documents {
+        Some(docs) => docs.iter().filter(|d| matches!(d["status"].as_str(), Some("indexed" | "processed"))).count(),
+        None => health["indexing"]["documents"].as_array().map_or(0, Vec::len),
+    };
+    Some(AgentState {
+        state: describe_agent(&health, documents.as_deref()),
+        memory: health["memory_percent"].as_u64().map(|p| p.min(100) as u8),
+        documents: indexed,
+    })
+}
+
+/// Who's signed in: `Name <email>`, or the email alone; `None` when no one
+/// is, or the agent can't say.
+pub fn account(client: &Client) -> Option<String> {
+    let status = request_json(client, format!("{}/auth/status", api_url()), "read sign-in status").ok()?;
+    let user = &status["user"];
+    user["email"].as_str().map(|email| match user["name"].as_str() {
+        Some(name) if !name.is_empty() => format!("{} <{}>", name, email),
+        _ => email.to_string(),
+    })
+}
+
+/// `healthy`, or `indexing` while any of the project's documents are on
+/// their way in, from `/health` and the project's documents when they could
+/// be read; otherwise what's wrong.
+fn describe_agent(health: &serde_json::Value, documents: Option<&[serde_json::Value]>) -> String {
+    let status = health["status"].as_str().unwrap_or("unknown");
+    if status != "healthy" {
+        return status.to_string();
+    }
+    let indexing = &health["indexing"];
+    if indexing["status"] == "failed" {
+        return "indexing failed".to_string();
+    }
+    // `/health` counts only what's still queued; a document being converted
+    // or indexed has left the queue.
+    let busy = documents
+        .unwrap_or_default()
+        .iter()
+        .any(|d| matches!(d["status"].as_str().unwrap_or("pending"), "pending" | "converting" | "indexing"));
+    let queued = indexing["queued"].as_u64().unwrap_or_default() > 0;
+    let scanning = indexing["workspace"]["scanning"].as_bool().unwrap_or_default();
+    if busy || queued || scanning { "indexing" } else { "healthy" }.to_string()
+}
+
+/// The project's own skills, as `(name, description)`: the agent runs one
+/// when a prompt starts with `/<name>`. Its built-in skills aren't listed.
+pub fn project_skills(client: &Client, project_id: &str) -> Result<Vec<(String, String)>, String> {
+    let reply = request_json(client, format!("{}/{}/skills", projects_url(), project_id), "list skills")?;
+    let text = |skill: &serde_json::Value, key: &str| skill[key].as_str().unwrap_or_default().trim().to_string();
+    Ok(reply["skills"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|skill| (text(skill, "name"), text(skill, "description")))
+        .filter(|(name, _)| !name.is_empty())
+        .collect())
+}
+
 /// Turn web search on or off for the project; returns the new state.
 pub fn set_web_search(client: &Client, project_id: &str, enabled: bool) -> Result<bool, String> {
     let action = if enabled { "turn on web search" } else { "turn off web search" };
@@ -690,18 +593,6 @@ pub fn set_web_search(client: &Client, project_id: &str, enabled: bool) -> Resul
     }
     let reply: serde_json::Value = response.json().map_err(|e| format!("Failed to {}: {}", action, e))?;
     Ok(reply["enabled"].as_bool().unwrap_or(enabled))
-}
-
-/// Same sequence as the studio app's model toggle: weights are fetched
-/// through `/v1/init` (scoped to the project) when they aren't on disk yet,
-/// and only then is the model switched on, so it is never enabled without
-/// weights.
-fn enable_model(client: &Client, project_id: &str, name: &str) {
-    let mut list = progress::Checklist::new();
-    enable_steps(&mut list, client, project_id, name);
-    // Clear the progress bar before printing below it.
-    drop(list);
-    println!("Model {} enabled", name);
 }
 
 /// The steps of enabling `name`, reported on `list`: the checklist, or the
@@ -741,55 +632,6 @@ pub fn enable_steps(list: &mut dyn Steps, client: &Client, project_id: &str, nam
         list.fail(enable, e);
     }
     list.done(enable);
-}
-
-fn disable_model(client: &Client, project_id: &str, name: &str) {
-    // A model the project never registered has nothing to switch off; the
-    // PATCH would answer 404 for it.
-    let registered = project_model_state(client, project_id)
-        .unwrap_or_else(|e| fail(e))
-        .contains_key(name);
-    let catalog_has = get_json_or_fail(client, format!("{}/models", api_url()), "list models")
-        .as_array()
-        .is_some_and(|c| c.iter().any(|m| m["name"] == name));
-    if !registered && catalog_has {
-        println!("Model {} is not enabled", name);
-        return;
-    }
-    patch_project_model(client, project_id, name, false).unwrap_or_else(|e| fail(e));
-    println!("Model {} disabled", name);
-}
-
-/// Sign in: in the browser by default, or with a token from `--token` or
-/// piped in. The agent owns the credential store and uses it for every
-/// platform call.
-fn login(client: &Client, token: Option<String>) {
-    if token.is_none() && std::io::stdin().is_terminal() {
-        let result = browser_login(client, |url| {
-            println!("Opening {} to sign in…", url);
-            println!("Waiting for the browser; ctrl+c to cancel");
-        });
-        match result {
-            Ok(who) => println!("{}", who),
-            Err(e) => fail(e),
-        }
-        return;
-    }
-    let token = token.filter(|t| !t.is_empty()).unwrap_or_else(|| {
-        if !std::io::stdin().is_terminal() {
-            let mut input = String::new();
-            std::io::stdin()
-                .read_line(&mut input)
-                .unwrap_or_else(|e| fail(format!("Failed to read token: {}", e)));
-            return input;
-        }
-        rpassword::prompt_password("Paste your token: ")
-            .unwrap_or_else(|e| fail(format!("Failed to read token: {}", e)))
-    });
-    match try_login(client, &token) {
-        Ok(who) => println!("{}", who),
-        Err(e) => fail(e),
-    }
 }
 
 /// Send `token` to the agent as a developer token, the kind meant for the
@@ -908,26 +750,12 @@ pub fn open_browser(url: &str) {
         .spawn();
 }
 
-fn logout(client: &Client) {
-    try_logout(client).unwrap_or_else(|e| fail(e));
-    println!("Logged out");
-}
-
 /// What `/status` in the chat app shows, as label and value: who's signed
 /// in, the agent and its health, the loaded model and the agent process.
 /// The account can take a platform round trip; this runs off the UI.
 pub fn status_rows(client: &Client) -> Vec<(String, String)> {
     let mut rows = Vec::new();
-    let account = request_json(client, format!("{}/auth/status", api_url()), "read sign-in status")
-        .ok()
-        .and_then(|status| {
-            let user = &status["user"];
-            user["email"].as_str().map(|email| match user["name"].as_str() {
-                Some(name) if !name.is_empty() => format!("{} <{}>", name, email),
-                _ => email.to_string(),
-            })
-        })
-        .unwrap_or_else(|| "not signed in · /login".to_string());
+    let account = account(client).unwrap_or_else(|| "not signed in · /login".to_string());
     rows.push(("account".to_string(), account));
 
     let health = get_json(client, format!("{}/health", base_url()));
@@ -987,11 +815,6 @@ pub fn try_logout(client: &Client) -> Result<(), String> {
     Ok(())
 }
 
-fn delete_project(client: &Client, id: String) {
-    try_delete_project(client, &id).unwrap_or_else(|e| fail(e));
-    println!("Project deleted successfully");
-}
-
 pub fn try_delete_project(client: &Client, id: &str) -> Result<(), String> {
     let response = client
         .delete(format!("{}/{}", projects_url(), id))
@@ -1023,40 +846,6 @@ fn main() {
     // Bare `smartloop` is `smartloop run`.
     let command = args.command.unwrap_or(Commands::Run { prompt: None, project: None, session: None, plain: false });
     match command {
-        Commands::Login { token } => login(&agent_client(), token),
-        Commands::Logout => logout(&agent_client()),
-        Commands::Project { command } => {
-            let client = agent_client();
-            match command {
-                ProjectCommands::List => list_projects(&client),
-                ProjectCommands::Create { name, description, import } => {
-                    match import {
-                        Some(path) => import_project(&client, path, name),
-                        None => match name {
-                            Some(name) => create_project(&client, name, description),
-                            None => fail(
-                                "--name is required when creating a project without --import".to_string(),
-                            ),
-                        },
-                    }
-                }
-                ProjectCommands::Delete { id } => delete_project(&client, id),
-            }
-        }
-        Commands::Model { command } => {
-            let client = agent_client();
-            match command {
-                ModelCommands::List { project } => {
-                    list_models(&client, &resolve_project(&client, project))
-                }
-                ModelCommands::Enable { name, project } => {
-                    enable_model(&client, &resolve_project(&client, project), &name)
-                }
-                ModelCommands::Disable { name, project } => {
-                    disable_model(&client, &resolve_project(&client, project), &name)
-                }
-            }
-        }
         Commands::Agent { command } => match command {
             AgentCommands::Status => agent_status(&Client::new()),
             AgentCommands::Start => {
@@ -1089,6 +878,26 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::describe_agent;
+    use serde_json::json;
+
+    #[test]
+    fn describes_what_the_agent_is_doing() {
+        let health = |indexing: serde_json::Value| json!({ "status": "healthy", "indexing": indexing });
+        let docs = |states: &[&str]| states.iter().map(|s| json!({ "status": s })).collect::<Vec<_>>();
+        let idle = health(json!({ "status": "running", "queued": 0 }));
+        assert_eq!(describe_agent(&json!({ "status": "healthy" }), None), "healthy");
+        assert_eq!(describe_agent(&json!({ "status": "degraded" }), None), "degraded");
+        assert_eq!(describe_agent(&idle, Some(&docs(&["indexed", "failed"]))), "healthy");
+        // Out of the queue but not indexed yet: still indexing.
+        assert_eq!(describe_agent(&idle, Some(&docs(&["indexed", "converting"]))), "indexing");
+        assert_eq!(describe_agent(&idle, Some(&docs(&["pending"]))), "indexing");
+        assert_eq!(describe_agent(&health(json!({ "status": "running", "queued": 3 })), None), "indexing");
+        let scanning = health(json!({ "status": "running", "queued": 0, "workspace": { "scanning": true } }));
+        assert_eq!(describe_agent(&scanning, Some(&[])), "indexing");
+        assert_eq!(describe_agent(&health(json!({ "status": "failed" })), None), "indexing failed");
+    }
+
     #[test]
     fn the_installer_prints_the_same_banner() {
         let install = include_str!("../install.sh");

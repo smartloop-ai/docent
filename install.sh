@@ -281,7 +281,7 @@ print_banner() {
     say "${PINK}█▀▀▀▄ ▄▀▀▀▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀${NC}"
     say "${PINK}█   █ █   █ █     █▀▀▀  █ ▀▄█   █${NC}  ${MUTED}by Smartloop${NC}"
     say "${PINK}▀▀▀▀   ▀▀▀   ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀${NC}"
-    say "${MUTED}Your private AI assistant${NC}"
+    say "${MUTED}Frontier quality. Local first.${NC}"
     say ""
     say "${MUTED}Version: ${NC}${VERSION}"
     say ""

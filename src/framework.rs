@@ -11,6 +11,7 @@ use std::fs;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
@@ -375,7 +376,7 @@ impl SetupSteps {
 fn queue_setup(list: &mut dyn Steps) -> SetupSteps {
     SetupSteps {
         embeddings: list.add("Embeddings (bge-m3)"),
-        model: list.add("Base model"),
+        model: list.add("Decision model"),
         project: list.add("Default project"),
         load: list.add("Load model"),
         services: list.add("Skills and connections"),
@@ -549,7 +550,7 @@ pub fn stream_progress(
             .and_then(|b| b["detail"].as_str().map(str::to_string))
             .unwrap_or_else(|| status.to_string());
         let hint = if matches!(status.as_u16(), 401 | 403) {
-            "; sign in with `docent login`"
+            "; sign in with /login in `docent`"
         } else {
             ""
         };
@@ -628,6 +629,40 @@ fn model_name_in(message: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// The agent this process started, if it did; 0 when it didn't.
+static LAUNCHED: AtomicU32 = AtomicU32::new(0);
+
+/// Stop the agent this process started, as the TUI does on the way out,
+/// unless another CLI session is still open to use it. One that was already
+/// running, or that lost the port race to another, is left alone.
+pub fn stop_launched() -> bool {
+    let launched = LAUNCHED.swap(0, Ordering::SeqCst);
+    let system = processes();
+    let Some(pid) = find_agent(&system).filter(|pid| launched != 0 && pid.as_u32() == launched) else {
+        return false;
+    };
+    if other_sessions(&system, pid) {
+        return false;
+    }
+    kill_agent(pid);
+    true
+}
+
+/// Whether another `smartloop` is running besides this one and `agent`,
+/// whose workers (`<exe> -m <module>`) run the same binary.
+fn other_sessions(system: &System, agent: Pid) -> bool {
+    let (Ok(exe), me) = (std::env::current_exe(), Pid::from_u32(std::process::id())) else { return false };
+    let exe = fs::canonicalize(&exe).unwrap_or(exe);
+    let agent = process_tree(system, agent);
+    system.processes().iter().any(|(pid, p)| {
+        *pid != me
+            && !agent.contains(pid)
+            && p.status() != ProcessStatus::Zombie
+            && p.exe().is_some_and(|e| fs::canonicalize(e).unwrap_or_else(|_| e.to_path_buf()) == exe)
+            && !args_of(p).iter().any(|a| a == SERVE_SUBCOMMAND || a == "-m")
+    })
+}
+
 /// Start this binary's agent as `step`, detached from this process and
 /// logging to `~/.smartloop/server.log`, and wait until `/health` answers.
 fn launch(list: &mut dyn Steps, step: usize, client: &Client) {
@@ -674,12 +709,14 @@ fn launch(list: &mut dyn Steps, step: usize, client: &Client) {
         .stderr(log_err);
     detach(&mut cmd);
 
-    // Never waited on once healthy: the agent outlives the CLI on purpose.
+    // Never waited on once healthy: the agent outlives a one-off command on
+    // purpose, though the TUI stops one it started (`stop_launched`).
     #[allow(clippy::zombie_processes)]
     let child = cmd
         .spawn()
         .unwrap_or_else(|e| list.fail(step, format!("Failed to start {}: {}", binary.display(), e)));
     write_pid(child.id());
+    LAUNCHED.store(child.id(), Ordering::SeqCst);
     await_agent(list, step, client, Some(child));
 }
 

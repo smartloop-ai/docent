@@ -1,6 +1,6 @@
 # Docent
 
-Your private AI assistant. Chat with your PDFs and Office files, search the web, and connect MCP servers, all from the terminal. If no local agent is running, the CLI downloads the framework and models it needs and starts one itself.
+Frontier quality. Local first. Chat with your PDFs and Office files, search the web, and connect MCP servers, all from the terminal. If no local agent is running, the CLI downloads the framework and models it needs and starts one itself.
 
 It installs as both `docent` and `smartloop`; the two are the same command.
 
@@ -74,7 +74,7 @@ docent
 The first run downloads and starts the local agent for you (see
 [First run](#first-run)). Everything below is optional:
 
-- **AI search:** `docent login` signs you in and enables web (AI) search.
+- **AI search:** `/login` in the chat signs you in and enables web (AI) search.
 - **Agent control:** `docent agent stop` stops the local agent and
   `docent agent start` starts it again.
 
@@ -88,12 +88,13 @@ listens on a free port it picks itself and writes it to
 
 1. Start the agent, which is built into the CLI (SLP framework 1.2.9), in
    the background with `SLP_HOME=~/.smartloop`, logging to
-   `~/.smartloop/server.log`. The agent keeps running after the CLI exits.
-   An agent Studio desktop runs on the same home is used instead, when it is
+   `~/.smartloop/server.log`. An agent the chat started stops when it exits
+   (unless another `docent` is still open); one started with
+   `docent agent start` keeps running. An agent Studio desktop runs on the same home is used instead, when it is
    the same framework version.
 2. Download the embedding model (`bge-m3-Q4_K_M.gguf`, ~417 MB) into the
    workspace's `models/embeddings/` folder for document search.
-3. Run the agent's bootstrap, which downloads the default base model, creates
+3. Run the agent's bootstrap, which downloads the decision model, creates
    the default project and loads the model.
 
 Each step is skipped when its files are already there. Progress shows as a
@@ -103,7 +104,7 @@ the active download's bar in Smartloop pink:
 ```
 [✓] Start agent                    port 50578
 [✓] Embeddings (bge-m3)                417 MB
-[•] Base model sl-mini
+[•] Decision model sl-mini
     ██████████████▋░░░░░░░░░░░░░░░   49%  377 MB/769 MB
 [ ] Default project
 [ ] Load model
@@ -114,7 +115,8 @@ A step without a bar shows its elapsed time once it runs past a couple of
 seconds, and it ends with `✓ Setup complete in 1min 12s`.
 
 When stderr isn't a terminal, each step prints one line as it finishes
-instead. `docent model enable` shows the same checklist for its download.
+instead. Enabling a model with `/models` shows the same checklist for its
+download.
 
 To do this up front, or to stop (and later restart) the agent. Optional; the
 agent starts on its own when needed:
@@ -124,63 +126,14 @@ docent agent start
 docent agent stop
 ```
 
-### Login (optional)
+### Login, projects and models
 
-Signing in isn't required to use Docent. It unlocks AI search (web search) and
-the models marked `(sign in)`.
+These live in the chat: `/login` signs in (optional; it unlocks AI search and
+the models marked `(sign in)`), `/project` switches, creates, imports and
+deletes projects, and `/models` enables and disables models. See the command
+table under [the chat](#agent-status-and-chat).
 
-```sh
-docent login
-```
-
-Opens app.smartloop.ai in the browser to sign in, the same way the desktop app
-does: once you're in, the page hands the session to the local agent, which
-stores it and uses it for every platform call. The command waits (up to five
-minutes) and prints the account it signed in as. If the browser doesn't open,
-visit the URL it prints.
-
-To sign in with a token instead, run `docent login --token` and paste it at
-the prompt (input is hidden), or use `--token <token>` or pipe it on stdin in
-scripts. `docent logout` clears the stored credentials.
-
-### Projects
-
-List projects:
-
-```sh
-docent project list
-```
-
-Output is rendered as a table showing each project's ID, name, and whether it is a system project.
-
-Create a project from a blank template:
-
-```sh
-docent project create --name my-project
-docent project create --name my-project --description "Research notes"
-```
-
-A blank project starts with no skills; the service seeds it with the workspace
-defaults. Everything the project stores — skills, documents, its index — lives
-under the service's own project directory, so there is no working directory to
-choose.
-
-Import a project from an archive produced by an earlier export:
-
-```sh
-docent project create --import my-project.zip
-docent project create --import my-project.zip --name restored-project
-```
-
-`--name` is optional here — pass it to rename the imported project. The import
-gets a fresh project ID, and MCP OAuth credentials are stripped from the
-archive on the way in.
-
-Delete a project:
-
-```sh
-docent project delete --id <project-id>
-```
+### Agent status and chat
 
 Check which endpoint the CLI uses, whether the local agent is running there,
 which model it has loaded, and the per-project agents it has started:
@@ -242,8 +195,9 @@ On exit it prints the session id, to resume with `--session`.
 | `Esc` | interrupt the reply |
 | wheel, `PgUp`/`PgDn` | scroll; drag to select and copy |
 | drop a file | attach an image (PNG, JPEG) or document (PDF, Office, CSV, text) |
+| drop a `.zip` | on an empty prompt, fills in `/project import` for it |
 | `Ctrl+O` | models: enable, disable, download |
-| `Ctrl+P` | projects: switch, create, delete |
+| `Ctrl+P` | projects: switch, create, import, delete |
 | `Ctrl+S` | web search on or off |
 
 | Command | Does |
@@ -251,7 +205,7 @@ On exit it prints the session id, to resume with `--session`.
 | `/login`, `/logout` | sign in in the browser (`--token` to paste one) |
 | `/models` | enable, disable and download models |
 | `/mcp` | MCP servers; `/mcp add <url>` connects one |
-| `/project` | projects: switch (in a new session), create, delete |
+| `/project` | projects: switch (in a new session), create, import, delete |
 | `/project <name>` | switch to a project by its name or ID |
 | `/project new <name>` | create a project and switch to it |
 | `/project import <zip>` | import an exported project and switch to it |
@@ -259,6 +213,7 @@ On exit it prints the session id, to resume with `--session`.
 | `/usage` | web searches left, tokens and cost saved |
 | `/upgrade` | Pro plan: 1,000 web searches a month |
 | `/clear` | clear the chat and start a new session |
+| `/<skill> [prompt]` | run one of the project's skills; `/` lists them with the commands |
 | `/help`, `/quit` | |
 
 Pass an initial prompt to send immediately:
@@ -289,36 +244,13 @@ References
 [1] https://releases.rs/
 ```
 
-### Models
-
-The orchestrator picks which model serves each turn from the models enabled
-for the project. List what's available and its state for the current project:
-
-```sh
-docent model list
-```
-
-Enable or disable a model:
-
-```sh
-docent model enable gemma4-e2b
-docent model disable gemma4-e2b
-```
-
-`enable` downloads the weights first when they aren't on disk yet, showing
-progress, and only then switches the model on. Weights are shared across
-projects, so each model downloads once. Models marked `(sign in)` need
-`docent login` first. `disable` also unloads the model from memory. All
-three take `--project <project-id>` to act on a project other than the current
-one. The `sl-mini` orchestrator is always on and isn't listed.
-
 ## Configuration
 
 The CLI connects to the local agent on whatever port it picked
 (`~/.smartloop/server.port`). Point it elsewhere with `SMARTLOOP_API_URL`:
 
 ```sh
-SMARTLOOP_API_URL=http://localhost:9000 docent project list
+SMARTLOOP_API_URL=http://localhost:9000 docent agent status
 ```
 
 With `SMARTLOOP_API_URL` set, the CLI only connects: it never installs or starts
