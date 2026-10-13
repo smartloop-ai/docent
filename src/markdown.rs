@@ -80,6 +80,10 @@ struct Renderer {
     lists: Vec<Option<u64>>,
     /// Each open link's URL and where its text starts in `inline`.
     links: Vec<(String, usize)>,
+    /// The text just added, with its style and the spans it became in
+    /// `inline`: the parser splits text at characters such as `*`, so an
+    /// address can arrive in pieces.
+    last_text: Option<(std::ops::Range<usize>, String, Style)>,
     /// The open code block's language and text.
     code: Option<(Option<String>, String)>,
     table: Option<Table>,
@@ -97,6 +101,7 @@ impl Renderer {
             containers: Vec::new(),
             lists: Vec::new(),
             links: Vec::new(),
+            last_text: None,
             code: None,
             table: None,
             gap: false,
@@ -189,6 +194,10 @@ impl Renderer {
             Tag::Emphasis => self.styles.push(Style::new().add_modifier(Modifier::ITALIC)),
             Tag::Strong => self.styles.push(Style::new().add_modifier(Modifier::BOLD)),
             Tag::Strikethrough => self.styles.push(Style::new().add_modifier(Modifier::CROSSED_OUT)),
+            Tag::Link { dest_url, .. } if crate::links::opens(&dest_url) => {
+                self.links.push((dest_url.to_string(), self.inline.len()));
+                self.styles.push(crate::links::style(&dest_url));
+            }
             Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
                 self.links.push((dest_url.to_string(), self.inline.len()));
                 self.styles.push(Style::new().add_modifier(Modifier::UNDERLINED));
@@ -234,6 +243,7 @@ impl Renderer {
                 self.containers.pop();
             }
             TagEnd::TableCell => {
+                self.last_text = None;
                 let cell = std::mem::take(&mut self.inline);
                 if let Some(row) = self.table.as_mut().and_then(|t| t.rows.last_mut()) {
                     row.push(cell);
@@ -254,7 +264,13 @@ impl Renderer {
                     let text: String = self.inline[from.min(self.inline.len())..].iter().map(|s| s.content.as_ref()).collect();
                     let text = text.trim();
                     if !url.is_empty() && !url.starts_with('#') && text != url && text != url.trim_start_matches("mailto:") {
-                        self.inline.push(Span::styled(format!(" ({})", url), dim()));
+                        // The address opens the link too, where it isn't an
+                        // image's.
+                        let style = match tag {
+                            TagEnd::Link if crate::links::opens(&url) => crate::links::mark(dim(), &url),
+                            _ => dim(),
+                        };
+                        self.inline.push(Span::styled(format!(" ({})", url), style));
                     }
                 }
             }
@@ -266,9 +282,26 @@ impl Renderer {
         self.styles.iter().fold(Style::default(), |style, s| style.patch(*s))
     }
 
+    /// Text in the current style; a bare web address in it, outside a link,
+    /// becomes one.
     fn text(&mut self, text: &str) {
         let style = self.style();
-        self.inline.push(Span::styled(text.to_string(), style));
+        if !self.links.is_empty() {
+            return self.inline.push(Span::styled(text.to_string(), style));
+        }
+        // The piece before, when nothing came between them, is looked
+        // through again with this one.
+        let mut joined = text.to_string();
+        if let Some((spans, before, was)) = self.last_text.take()
+            && spans.end == self.inline.len()
+            && was == style
+        {
+            self.inline.truncate(spans.start);
+            joined.insert_str(0, &before);
+        }
+        let from = self.inline.len();
+        self.inline.extend(crate::links::linkify(&joined, style));
+        self.last_text = Some((from..self.inline.len(), joined, style));
     }
 
     /// Lay out the paragraph collected so far, if any.
@@ -276,6 +309,7 @@ impl Renderer {
         if self.inline.is_empty() || self.table.is_some() {
             return;
         }
+        self.last_text = None;
         let inline = std::mem::take(&mut self.inline);
         self.emit_wrapped(&inline);
     }
@@ -654,6 +688,27 @@ mod tests {
         let lines = render("See [the docs](https://smartloop.ai/docs) or <https://smartloop.ai>.", 80);
         assert_eq!(text(&lines), "See the docs (https://smartloop.ai/docs) or https://smartloop.ai.");
         assert!(span(&lines, "the docs").style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn links_and_bare_addresses_open_but_code_does_not() {
+        let link = |lines: &[Line<'static>], wanted: &str| {
+            let id = crate::links::id(span(lines, wanted).style);
+            id.and_then(crate::links::url)
+        };
+        let lines = render(
+            "Read [the docs](https://smartloop.ai/docs), https://a.io/x_y_z*1 and `https://not.a/link`.\n\n```\nhttps://nor.this\n```",
+            200,
+        );
+        assert_eq!(link(&lines, "the docs").as_deref(), Some("https://smartloop.ai/docs"));
+        assert_eq!(link(&lines, "(https://smartloop.ai/docs)").as_deref(), Some("https://smartloop.ai/docs"));
+        assert_eq!(span(&lines, "https://a.io").content, "https://a.io/x_y_z*1");
+        assert_eq!(link(&lines, "https://a.io").as_deref(), Some("https://a.io/x_y_z*1"));
+        assert_eq!(link(&lines, "not.a"), None);
+        assert_eq!(link(&lines, "nor.this"), None);
+        let local = render("[notes](notes.md) and [top](#top)", 80);
+        assert_eq!(link(&local, "notes"), None);
+        assert_eq!(link(&local, "top"), None);
     }
 
     #[test]
