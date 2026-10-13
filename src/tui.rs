@@ -520,6 +520,58 @@ struct Reply {
     stats: Option<TurnStats>,
     /// Why it ended early: stopped by the user, or an error.
     ended: Option<String>,
+    /// `text` as last drawn, with its length and width: the conversation
+    /// redraws every tick, and only a reply still streaming changes.
+    rendered: std::cell::RefCell<Option<(usize, u16, Vec<Line<'static>>)>>,
+}
+
+impl Reply {
+    /// `text` rendered as markdown at `width`.
+    fn body(&self, width: u16) -> Vec<Line<'static>> {
+        let text = self.text.trim_end();
+        let mut rendered = self.rendered.borrow_mut();
+        match &*rendered {
+            Some((len, at, lines)) if *len == text.len() && *at == width => lines.clone(),
+            _ => {
+                let options = tui_markdown::Options::new(Markdown).table_width(width).table_row_dividers(true);
+                let lines: Vec<Line<'static>> = tui_markdown::from_str_with_options(text, &options)
+                    .lines
+                    .into_iter()
+                    .map(|line| {
+                        let spans = line.spans.into_iter().map(|s| Span::styled(s.content.into_owned(), s.style));
+                        Line::from(spans.collect::<Vec<_>>()).style(line.style)
+                    })
+                    .collect();
+                *rendered = Some((text.len(), width, lines.clone()));
+                lines
+            }
+        }
+    }
+}
+
+/// tui-markdown's styles, but with table borders dim like ours (its dark
+/// gray is the background color in some themes), and headings and code
+/// without their `#` and ``` markers.
+#[derive(Clone)]
+struct Markdown;
+
+impl tui_markdown::StyleSheet for Markdown {
+    /// Dim, like our other borders, in place of the default dark gray,
+    /// which is the background color in some themes and hides the table.
+    fn table_border(&self) -> Style {
+        dim()
+    }
+
+    /// The ``` drawn above and below a code block by default; none drops
+    /// both lines.
+    fn code_block_fence(&self) -> &str {
+        ""
+    }
+
+    /// The `#`s drawn before a heading by default; none drops them.
+    fn heading_marker(&self, _level: u8) -> &str {
+        ""
+    }
 }
 
 enum Overlay {
@@ -2384,7 +2436,7 @@ impl App {
                         ]));
                     }
                 }
-                Entry::Reply(reply) => reply_lines(reply, &mut lines),
+                Entry::Reply(reply) => reply_lines(reply, area.width, &mut lines),
                 Entry::Notice(text) => lines.push(Line::from(vec![
                     Span::styled("■ ", Style::new().fg(Color::Green)),
                     Span::raw(text.clone()),
@@ -2856,16 +2908,16 @@ fn sync_root() -> Option<std::path::PathBuf> {
 
 /// A reply as Claude Code lays one out: the answer under a `■` (square, like the setup blocks), its
 /// sources, then `⎿` with the model that answered and how it went.
-fn reply_lines(reply: &Reply, lines: &mut Vec<Line<'static>>) {
+fn reply_lines(reply: &Reply, width: u16, lines: &mut Vec<Line<'static>>) {
     for warning in &reply.warnings {
         lines.push(Line::from(vec![
             Span::styled("■ ", Style::new().fg(Color::Yellow)),
             Span::styled(warning.clone(), dim()),
         ]));
     }
-    for (i, line) in reply.text.trim_end().lines().enumerate() {
+    for (i, line) in reply.body(width.saturating_sub(2)).into_iter().enumerate() {
         let mark = if i == 0 { Span::raw("■ ") } else { Span::raw("  ") };
-        lines.push(Line::from(vec![mark, Span::raw(line.to_string())]));
+        lines.push(Line::from(std::iter::once(mark).chain(line.spans).collect::<Vec<_>>()));
     }
     if !reply.citations.is_empty() {
         lines.push(Line::default());
@@ -3427,15 +3479,16 @@ mod tests {
         app.entries.push(Entry::Reply(Reply {
             warnings: Vec::new(),
             model: Some("sl-mini".into()),
-            text: "Drafted nda-northwind-labs.docx from your template:\n\
-                   1. Mutual NDA between Smartloop Inc. and Northwind Labs, Inc.\n\
-                   2. 2-year term from signing; confidentiality survives 3 years (section 5)\n\
-                   3. Governed by California law, venue in San Francisco (section 9)\n\
+            text: "Drafted `nda-northwind-labs.docx` from your template:\n\n\
+                   1. **Mutual NDA** between Smartloop Inc. and Northwind Labs, Inc.\n\
+                   2. **2-year term** from signing; confidentiality survives 3 years (section 5)\n\
+                   3. Governed by **California law**, venue in San Francisco (section 9)\n\n\
                    Signature blocks are left blank for both parties."
                 .into(),
             citations: vec!["mutual-nda-template.docx".into()],
             stats: Some(TurnStats { tokens: 96, elapsed: Duration::from_secs(14) }),
             ended: None,
+            ..Default::default()
         }));
         app.entries.push(Entry::User("[Doc 2] Compare it with their redlines and flag anything risky".into()));
         app.entries.push(Entry::Reply(Reply::default()));
@@ -3456,6 +3509,7 @@ mod tests {
         let color = |c: Color| match c {
             Color::Rgb(r, g, b) => format!("#{:02x}{:02x}{:02x}", r, g, b),
             Color::Indexed(169) => "#e55d9c".to_string(),
+            Color::Indexed(147) => "#b1b9f9".to_string(),
             Color::Reset => String::new(),
             other => format!("{:?}", other),
         };
@@ -4097,6 +4151,42 @@ mod tests {
     }
 
     #[test]
+    fn replies_render_as_markdown() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.entries.push(Entry::Reply(Reply {
+            text: "## Plan\n\n- **one** step\n- `two`\n\n```rust\nfn main() {}\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |".into(),
+            ..Default::default()
+        }));
+        let text = screen(&app, 40, 30);
+        let rows: Vec<&str> = text.lines().collect();
+        let top = rows.iter().position(|r| r.starts_with("■ Plan")).expect(&text);
+        assert_eq!(
+            &rows[top..top + 14],
+            [
+                "■ Plan",
+                "",
+                "  - one step",
+                "  - two",
+                "",
+                "  fn main() {}",
+                "",
+                "  ┌───┬───┐",
+                "  │ a │ b │",
+                "  ├───┼───┤",
+                "  │ 1 │ 2 │",
+                "  ├───┼───┤",
+                "  │ 3 │ 4 │",
+                "  └───┴───┘",
+            ],
+            "{}",
+            text
+        );
+        assert!(!text.contains("**") && !text.contains("```") && !text.contains('#'), "{}", text);
+    }
+
+    #[test]
     fn conversation_logs_steps_and_status_sits_above_the_prompt() {
         let mut app = app();
         app.phase = Phase::Ready;
@@ -4109,6 +4199,7 @@ mod tests {
             citations: vec!["roadmap.pdf".into()],
             stats: Some(TurnStats { tokens: 12, elapsed: Duration::from_secs(2) }),
             ended: None,
+            ..Default::default()
         }));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         app.turn = Some(Turn {
