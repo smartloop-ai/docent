@@ -592,12 +592,14 @@ struct App {
     /// How far up the conversation goes, as of the last draw.
     scroll_limit: std::cell::Cell<u16>,
     /// The conversation pane as last drawn, row by row, for copying a
-    /// selection out of it.
-    shown: std::cell::RefCell<(Rect, Vec<Vec<String>>)>,
+    /// selection out of it, and the link under each cell, for clicking.
+    shown: std::cell::RefCell<Shown>,
     /// Text being selected with the mouse, in screen cells.
     selection: Option<Selection>,
     /// What the last selection copied, flashed in the footer for a moment.
     copied: Option<(usize, Instant)>,
+    /// The link last clicked, flashed in the footer as it opens.
+    opened: Option<(String, Instant)>,
     /// Kept for the app's life: on X11 the clipboard empties when its owner
     /// goes away.
     clipboard: Option<arboard::Clipboard>,
@@ -653,9 +655,10 @@ impl App {
             last_esc: None,
             scroll_back: 0,
             scroll_limit: std::cell::Cell::new(0),
-            shown: std::cell::RefCell::new((Rect::default(), Vec::new())),
+            shown: std::cell::RefCell::new(Shown::default()),
             selection: None,
             copied: None,
+            opened: None,
             clipboard: None,
             ticks: 0,
             token_entry: false,
@@ -1044,23 +1047,28 @@ impl App {
     // ----- keys ------------------------------------------------------------
 
     /// The wheel scrolls; a left-button drag over the conversation selects,
-    /// and letting go copies the selection.
+    /// and letting go copies the selection; a click on a link opens it.
     fn mouse(&mut self, mouse: MouseEvent) {
         let at = (mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll(WHEEL_LINES as i32),
             MouseEventKind::ScrollDown => self.scroll(-(WHEEL_LINES as i32)),
             MouseEventKind::Down(MouseButton::Left) => {
-                let area = self.shown.borrow().0;
+                let area = self.shown.borrow().area;
                 self.selection = area.contains(at.into()).then_some(Selection { anchor: at, head: at });
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(selection) = &mut self.selection {
-                    let area = self.shown.borrow().0;
+                    let area = self.shown.borrow().area;
                     selection.head = clamp_to(area, at);
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                let clicked = self.selection.as_ref().filter(|s| s.anchor == s.head).map(|s| s.anchor);
+                if let Some(url) = clicked.and_then(|at| self.shown.borrow().link_at(at)) {
+                    self.selection = None;
+                    return self.open(url);
+                }
                 let text = self.selection.as_ref().filter(|s| s.anchor != s.head).map(|s| self.selected_text(s));
                 match text.filter(|t| !t.trim().is_empty()) {
                     Some(text) => self.copy(text),
@@ -1074,7 +1082,7 @@ impl App {
     /// The selected cells' text, a line per screen row, trailing blanks off.
     fn selected_text(&self, selection: &Selection) -> String {
         let shown = self.shown.borrow();
-        let (area, rows) = (&shown.0, &shown.1);
+        let (area, rows) = (&shown.area, &shown.rows);
         selection
             .rows(*area)
             .map(|(y, from, to)| {
@@ -1084,6 +1092,14 @@ impl App {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Open a clicked link in the browser.
+    fn open(&mut self, url: String) {
+        if !cfg!(test) {
+            crate::open_browser(&url);
+        }
+        self.opened = Some((url, Instant::now()));
     }
 
     /// Put `text` on the system clipboard, or where there's none (over SSH),
@@ -2139,14 +2155,16 @@ impl App {
         lines
     }
 
-    /// Remember the conversation as drawn, for copying, and highlight the
-    /// selection over it.
+    /// Remember the conversation as drawn, for copying and for clicking its
+    /// links, make the links hyperlinks, and highlight the selection over it.
     fn keep_shown(&self, frame: &mut Frame, area: Rect) {
         let buffer = frame.buffer_mut();
         let rows = (area.top()..area.bottom())
             .map(|y| (area.left()..area.right()).map(|x| buffer[(x, y)].symbol().to_string()).collect())
             .collect();
-        *self.shown.borrow_mut() = (area, rows);
+        // Tests read the screen back as text, so they go without the escapes.
+        let links = crate::links::apply(buffer, area, !cfg!(test));
+        *self.shown.borrow_mut() = Shown { area, rows, links };
         if let Some(selection) = &self.selection {
             for (y, from, to) in selection.rows(area) {
                 for x in from..=to {
@@ -2311,9 +2329,14 @@ impl App {
     /// Key hints under the prompt.
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let mut hints = vec![Span::raw("  ")];
-        if let Some((chars, _)) = self.copied.filter(|(_, at)| at.elapsed() < Duration::from_secs(2)) {
+        let recent = |at: &Instant| at.elapsed() < Duration::from_secs(2);
+        let opened = self.opened.as_ref().filter(|(_, at)| recent(at));
+        if let Some((chars, _)) = self.copied.filter(|(_, at)| recent(at)) {
             hints.push(Span::styled("✓ ", Style::new().fg(Color::Green)));
             hints.push(Span::styled(format!("Copied {} characters", chars), dim()));
+        } else if let Some((url, _)) = opened {
+            hints.push(Span::styled("↗ ", Style::new().fg(Color::Green)));
+            hints.push(Span::styled(format!("Opening {}", url), dim()));
         } else if self.scroll_back > 0 {
             hints.push(Span::styled(format!("↓ {} lines below  ", self.scroll_back), dim()));
             hints.extend(key_hints(&[("pgdn", "scroll down"), ("end", "latest")]));
@@ -2662,7 +2685,9 @@ fn reply_lines(reply: &Reply, width: u16, lines: &mut Vec<Line<'static>>) {
         lines.push(Line::default());
         lines.push(Line::styled("  References", dim()));
         for (i, label) in reply.citations.iter().enumerate() {
-            lines.push(Line::from(vec![Span::styled(format!("  [{}] ", i + 1), dim()), Span::raw(label.clone())]));
+            let mut spans = vec![Span::styled(format!("  [{}] ", i + 1), dim())];
+            spans.extend(crate::links::linkify(label, Style::new()));
+            lines.push(Line::from(spans));
         }
     }
     match (&reply.ended, &reply.stats) {
@@ -2700,6 +2725,25 @@ fn error_line(text: &str) -> Line<'static> {
 fn refresh_models(client: &Client, tx: &UnboundedSender<AppEvent>, project: Option<(String, String)>) {
     if let Some((id, _)) = project {
         let _ = tx.send(AppEvent::Models(crate::model_rows(client, &id)));
+    }
+}
+
+/// The conversation pane as last drawn.
+#[derive(Default)]
+struct Shown {
+    area: Rect,
+    /// Each cell's text, row by row.
+    rows: Vec<Vec<String>>,
+    /// Each cell's link, if it's in one.
+    links: Vec<Vec<Option<u32>>>,
+}
+
+impl Shown {
+    /// The URL of the link at screen position `at`, if one's there.
+    fn link_at(&self, (x, y): (u16, u16)) -> Option<String> {
+        let (x, y) = (x.checked_sub(self.area.x)?, y.checked_sub(self.area.y)?);
+        let id = (*self.links.get(y as usize)?.get(x as usize)?)?;
+        crate::links::url(id)
     }
 }
 
@@ -3242,6 +3286,48 @@ mod tests {
         app.scroll(-1000);
         assert_eq!(app.scroll_back, 0);
         assert!(screen(&app, 80, 24).contains("line 59"));
+    }
+
+    #[test]
+    fn clicking_a_link_opens_it_and_dragging_over_one_copies() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.entries.push(Entry::Reply(Reply {
+            text: "Read [the docs](https://smartloop.ai/docs) first.".into(),
+            citations: vec!["Guide (https://smartloop.ai/guide)".into()],
+            ..Default::default()
+        }));
+        let text = screen(&app, 80, 24);
+        let rows: Vec<&str> = text.lines().collect();
+        let find = |wanted: &str| {
+            let y = rows.iter().position(|r| r.contains(wanted)).expect(&text);
+            let x = rows[y][..rows[y].find(wanted).unwrap()].chars().count();
+            (x as u16, y as u16)
+        };
+        let mouse = |kind, (column, row): (u16, u16)| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+        let click = |app: &mut App, at| {
+            app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), at));
+            app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), at));
+            app.opened.take().map(|(url, _)| url)
+        };
+
+        let (x, y) = find("the docs");
+        assert_eq!(click(&mut app, (x + 4, y)).as_deref(), Some("https://smartloop.ai/docs"));
+        assert_eq!(click(&mut app, find("(https://smartloop.ai/docs)")).as_deref(), Some("https://smartloop.ai/docs"));
+        assert_eq!(click(&mut app, find("https://smartloop.ai/guide")).as_deref(), Some("https://smartloop.ai/guide"));
+        assert_eq!(click(&mut app, find("Read")), None, "plain text opens nothing");
+        assert_eq!(app.copied, None);
+
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), (x, y)));
+        app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), (x + 7, y)));
+        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), (x + 7, y)));
+        assert_eq!(app.opened, None);
+        assert_eq!(app.copied.map(|(n, _)| n), Some(8));
+
+        app.copied = None;
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), (x, y)));
+        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), (x, y)));
+        assert!(screen(&app, 80, 24).contains("Opening https://smartloop.ai/docs"));
     }
 
     #[test]
