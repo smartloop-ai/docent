@@ -2,10 +2,11 @@
 //! step with it.
 //!
 //! `.docent/manifest.json` maps every document and skill pushed to a Smartloop
-//! project: what it was, its hash, and the id or name it has there. `docent
-//! sync` scans the project, diffs the scan against that map and pushes only
-//! what was added, changed or removed, so the Smartloop project follows the
-//! repo. `--watch` repeats the pass until stopped.
+//! project: what it was, its hash, and the id or name it has there. Once
+//! `/sync` links a folder to a project, the chat scans the folder every few
+//! seconds, diffs the scan against that map and pushes only what was added,
+//! changed or removed, so the Smartloop project follows the folder. Nothing
+//! is linked, and no project created, on its own.
 //!
 //! Documents are the files under the project root with a supported extension
 //! (hidden folders, `.gitignore` and `.docentignore` are honoured). Skills are
@@ -14,8 +15,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::{Client, multipart};
@@ -23,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{error_message, projects_url, request_json, try_create_project, try_fetch_projects};
+use crate::{error_message, projects_url, request_json, try_fetch_projects};
 
 pub const DIR: &str = ".docent";
 const MANIFEST: &str = "manifest.json";
@@ -31,10 +33,11 @@ const SKILLS: &str = "skills";
 const IGNORE_FILE: &str = ".docentignore";
 /// What the agent can turn into searchable documents.
 const EXTENSIONS: [&str; 7] = ["pdf", "docx", "pptx", "xlsx", "csv", "md", "txt"];
-/// A document the agent hasn't listed this long after its upload is gone.
-const REGISTER_GRACE: u64 = 120;
 /// How many changes a pass pushes at once.
 const PARALLEL: usize = 4;
+/// A first sync pushing more documents than this, or more bytes, asks first.
+const LARGE_FILES: usize = 200;
+const LARGE_BYTES: u64 = 500 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct Entry {
@@ -44,12 +47,19 @@ struct Entry {
     /// The document's name in the project's inbox, or the skill's id.
     remote: String,
     synced_at: u64,
+    /// The project has listed the document since its upload, so its absence
+    /// there now means it was deleted, not that it's still being registered.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    registered: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Manifest {
     #[serde(default)]
     project: Option<String>,
+    /// Set by `/sync stop`: the chat leaves the folder alone until `/sync`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    paused: bool,
     /// Keyed by path relative to the project root, with `/` separators.
     #[serde(default)]
     documents: BTreeMap<String, Entry>,
@@ -154,24 +164,30 @@ fn found(path: &Path, known: Option<&Entry>) -> std::io::Result<Found> {
     Ok(Found { path: path.to_path_buf(), hash, size: meta.len(), mtime })
 }
 
-/// The project's documents, by relative path.
-fn scan_documents(root: &Path, known: &BTreeMap<String, Entry>) -> BTreeMap<String, Found> {
-    let walk = ignore::WalkBuilder::new(root)
+/// The documents under `root`: files of a kind the agent reads, past the
+/// ignore files and hidden folders.
+fn walk(root: &Path) -> impl Iterator<Item = ignore::DirEntry> {
+    ignore::WalkBuilder::new(root)
         .add_custom_ignore_filename(IGNORE_FILE)
         .require_git(false)
-        .build();
+        .build()
+        .flatten()
+        .filter(|entry| {
+            let supported = entry
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+            supported && entry.file_type().is_some_and(|t| t.is_file())
+        })
+}
+
+/// The project's documents, by relative path.
+fn scan_documents(root: &Path, known: &BTreeMap<String, Entry>) -> BTreeMap<String, Found> {
     let mut files = BTreeMap::new();
-    for entry in walk.flatten() {
-        let path = entry.path();
-        let supported = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
-        if !supported || !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let key = relative_key(root, path);
-        if let Ok(file) = found(path, known.get(&key)) {
+    for entry in walk(root) {
+        let key = relative_key(root, entry.path());
+        if let Ok(file) = found(entry.path(), known.get(&key)) {
             files.insert(key, file);
         }
     }
@@ -352,22 +368,32 @@ impl Remote<'_> {
 }
 
 /// Entries the project no longer has are dropped from the manifest, so the
-/// next diff adds them again. A document gets `REGISTER_GRACE` seconds after
-/// its upload to show up, as the agent registers it only when it next scans.
-fn forget_missing(manifest: &mut Manifest, remote: &Remote, now: u64) -> Result<(), String> {
+/// next diff adds them again. A document counts as gone only once the project
+/// has listed it: the agent registers an upload when it next scans its inbox,
+/// which takes as long as the indexing ahead of it, and pushing one again
+/// before then would only index it twice.
+fn forget_missing(manifest: &mut Manifest, remote: &Remote) -> Result<(), String> {
     let stored: HashSet<String> = remote
         .documents()?
         .iter()
         .filter_map(|d| d["path"].as_str().and_then(|p| Path::new(p).file_name()?.to_str().map(str::to_string)))
         .collect();
-    manifest
-        .documents
-        .retain(|_, e| stored.contains(&e.remote) || now.saturating_sub(e.synced_at) < REGISTER_GRACE);
+    reconcile(&mut manifest.documents, &stored);
 
     let ids: HashSet<String> =
         remote.skills()?.iter().filter_map(|s| s["id"].as_str().map(str::to_string)).collect();
     manifest.skills.retain(|_, e| ids.contains(&e.remote));
     Ok(())
+}
+
+/// Mark the documents the project lists as registered, and drop those it
+/// listed once and no longer does.
+fn reconcile(documents: &mut BTreeMap<String, Entry>, stored: &HashSet<String>) {
+    documents.retain(|_, e| {
+        let listed = stored.contains(&e.remote);
+        e.registered |= listed;
+        listed || !e.registered
+    });
 }
 
 /// One change, pushed; returns what the project now stores it as, `None`
@@ -425,7 +451,7 @@ fn record(
     let entries = if skill { &mut manifest.skills } else { &mut manifest.documents };
     match (stored, file) {
         (Some(stored), Some(file)) => {
-            let entry = Entry { hash: file.hash.clone(), size: file.size, mtime: file.mtime, remote: stored, synced_at: now() };
+            let entry = Entry { hash: file.hash.clone(), size: file.size, mtime: file.mtime, remote: stored, synced_at: now(), registered: false };
             entries.insert(key.to_string(), entry);
         }
         _ => {
@@ -443,42 +469,6 @@ fn plan(root: &Path, manifest: &Manifest) -> (Plan, BTreeMap<String, Found>, BTr
         skills: diff(&skills, &manifest.skills),
     };
     (plan, documents, skills)
-}
-
-/// Pick the Smartloop project to sync to: the one asked for, else the one
-/// the manifest names, else one named after the folder, created when needed.
-/// Pointing at a different project than before starts the map afresh.
-fn resolve_project(
-    client: &Client,
-    root: &Path,
-    manifest: &mut Manifest,
-    requested: Option<&str>,
-) -> Result<String, String> {
-    let projects = try_fetch_projects(client)?;
-    let field = |p: &Value, key: &str| p[key].as_str().unwrap_or_default().to_string();
-    let find = |wanted: &str| {
-        projects
-            .iter()
-            .find(|p| field(p, "id") == wanted || field(p, "name").eq_ignore_ascii_case(wanted))
-            .map(|p| field(p, "id"))
-    };
-
-    let folder = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "docent".into());
-    let id = match requested {
-        Some(wanted) => find(wanted).ok_or_else(|| format!("No project named {}", wanted))?,
-        None => match manifest.project.as_deref().and_then(find).or_else(|| find(&folder)) {
-            Some(id) => id,
-            None => field(&try_create_project(client, &folder, None)?, "id"),
-        },
-    };
-
-    if manifest.project.as_deref() != Some(id.as_str()) {
-        manifest.documents.clear();
-        manifest.skills.clear();
-        manifest.project = Some(id.clone());
-        manifest.save(root)?;
-    }
-    Ok(id)
 }
 
 #[derive(Default)]
@@ -507,40 +497,36 @@ impl Summary {
 pub enum Event {
     /// A pass starts pushing this many changes.
     Working(usize),
-    /// One change pushed: `+ README.md`.
-    Change(String),
     /// How a pass ended: `2 added, 0 updated, 0 removed`.
     Summary(String),
     /// A change that didn't go through, or a pass that couldn't run.
     Failure(String),
 }
 
-/// Hold the sync back until `idle` says so, checking once a second.
-fn wait_for(idle: &dyn Fn() -> bool) {
-    while !idle() {
+/// Hold the sync back until `idle` says so, checking once a second; false
+/// when it was stopped meanwhile.
+fn wait_for(idle: &dyn Fn() -> bool, stop: &AtomicBool) -> bool {
+    while !idle() && !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_secs(1));
     }
+    !stop.load(Ordering::Relaxed)
 }
 
-/// One pass: bring the project at Smartloop in line with the folder. A pass
-/// with nothing to do reports nothing when `quiet_when_idle`. Each change
-/// waits for `idle`, so what it sets the agent indexing doesn't compete with
-/// a reply being written.
+/// One pass: bring the project at Smartloop in line with the folder. Each
+/// batch waits for `idle`, so what it sets the agent indexing doesn't
+/// compete with a reply being written, and none starts once stopped.
 fn sync_once(
     remote: &Remote,
     root: &Path,
     manifest: &mut Manifest,
-    quiet_when_idle: bool,
     idle: &dyn Fn() -> bool,
+    stop: &AtomicBool,
     emit: &mut dyn FnMut(Event),
 ) -> Result<Summary, String> {
-    forget_missing(manifest, remote, now())?;
+    forget_missing(manifest, remote)?;
     let (plan, documents, skills) = plan(root, manifest);
     let mut summary = Summary::default();
     if plan.is_empty() {
-        if !quiet_when_idle {
-            emit(Event::Summary("Up to date".to_string()));
-        }
         manifest.save(root)?;
         return Ok(summary);
     }
@@ -554,7 +540,9 @@ fn sync_once(
         .collect();
     let file = |skill: bool, key: &str| if skill { skills.get(key) } else { documents.get(key) };
     for batch in work.chunks(PARALLEL) {
-        wait_for(idle);
+        if !wait_for(idle, stop) {
+            break;
+        }
         // The batch goes out together; the manifest catches up one by one.
         let pushed: Vec<Result<Option<String>, String>> = std::thread::scope(|scope| {
             let handles: Vec<_> = batch
@@ -572,7 +560,6 @@ fn sync_once(
             let label = if skill { format!("skill {}", key) } else { key.to_string() };
             match stored.and_then(|stored| record(root, manifest, skill, key, stored, file(skill, key))) {
                 Ok(()) => {
-                    emit(Event::Change(format!("{} {}", change.symbol(), label)));
                     match change {
                         Change::Add => summary.added += 1,
                         Change::Update => summary.updated += 1,
@@ -590,22 +577,20 @@ fn sync_once(
     Ok(summary)
 }
 
-/// Pass after pass, `interval` seconds apart, until the process ends. A
-/// failure is reported when it first happens, not on every pass after. A
-/// pass starts only once `idle`.
+/// Pass after pass, `interval` seconds apart, until `stop`. A failure is
+/// reported when it first happens, not on every pass after. A pass starts
+/// only once `idle`.
 fn watch(
     remote: &Remote,
     root: &Path,
     manifest: &mut Manifest,
     interval: u64,
-    quiet_first: bool,
     idle: &dyn Fn() -> bool,
+    stop: &AtomicBool,
     emit: &mut dyn FnMut(Event),
-) -> ! {
+) {
     let mut reported: HashSet<String> = HashSet::new();
-    let mut quiet = quiet_first;
-    loop {
-        wait_for(idle);
+    while wait_for(idle, stop) {
         let mut failures = HashSet::new();
         let mut relay = |event: Event| match event {
             Event::Failure(text) => {
@@ -616,98 +601,152 @@ fn watch(
             }
             other => emit(other),
         };
-        if let Err(e) = sync_once(remote, root, manifest, quiet, idle, &mut relay) {
+        if let Err(e) = sync_once(remote, root, manifest, idle, stop, &mut relay) {
             relay(Event::Failure(e));
         }
         reported = failures;
-        quiet = true;
-        std::thread::sleep(Duration::from_secs(interval.max(1)));
+        for _ in 0..interval.max(1) {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
 }
 
-/// True when the chat may sync `root` on its own: any folder opened as a
-/// project, but never the home folder or one holding it, where it would
-/// push everything a person owns.
-pub fn enabled(root: &Path) -> bool {
+/// Held by whatever writes a manifest from outside a pass, and by a sync for
+/// as long as it runs, so a new one starts only once the old one is done
+/// saving.
+static SYNC: Mutex<()> = Mutex::new(());
+
+fn lock() -> MutexGuard<'static, ()> {
+    SYNC.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Why `root` may not be synced: the home folder, or one holding it, where
+/// it would push everything a person owns.
+pub fn refusal(root: &Path) -> Option<String> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .and_then(|h| fs::canonicalize(h).ok());
     let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    root.parent().is_some() && !home.is_some_and(|home| home.starts_with(&root))
+    let holds_home = root.parent().is_none() || home.is_some_and(|home| home.starts_with(&root));
+    holds_home.then(|| format!("{} holds your whole home folder; open docent in a project folder to sync it", root.display()))
 }
 
-/// Make sure `root` has its project at Smartloop, creating it when missing,
-/// and record it in the manifest, so the chat can open in it.
-pub fn link(client: &Client, root: &Path) -> Result<(), String> {
+/// The documents a first sync of `root` would push, without reading them.
+#[derive(Debug, Default, PartialEq)]
+pub struct Size {
+    pub files: usize,
+    pub bytes: u64,
+}
+
+impl Size {
+    /// Too much to push without asking first.
+    pub fn large(&self) -> bool {
+        self.files > LARGE_FILES || self.bytes > LARGE_BYTES
+    }
+}
+
+pub fn measure(root: &Path) -> Size {
+    let mut size = Size::default();
+    for entry in walk(root) {
+        size.files += 1;
+        size.bytes += entry.metadata().map_or(0, |m| m.len());
+    }
+    size
+}
+
+/// The Smartloop project `root` syncs to, and whether its sync is paused.
+pub struct Link {
+    pub project: String,
+    pub paused: bool,
+}
+
+pub fn linked(root: &Path) -> Option<Link> {
+    let manifest = Manifest::load(root).ok()?;
+    Some(Link { project: manifest.project?, paused: manifest.paused })
+}
+
+/// Sync `root` to `project` from now on; one it synced elsewhere before
+/// starts its map afresh.
+pub fn link(root: &Path, project: &str) -> Result<(), String> {
+    let _held = lock();
     let mut manifest = Manifest::load(root)?;
-    resolve_project(client, root, &mut manifest, None).map(|_| ())
+    if manifest.project.as_deref() != Some(project) {
+        manifest.documents.clear();
+        manifest.skills.clear();
+        manifest.project = Some(project.to_string());
+    }
+    manifest.paused = false;
+    manifest.save(root)
 }
 
-/// The Smartloop project `root` last synced to.
-pub fn linked_project(root: &Path) -> Option<String> {
-    Manifest::load(root).ok()?.project
+/// Stop syncing `root` until it's linked again, waiting for a sync still
+/// running to finish its save.
+pub fn pause(root: &Path) -> Result<(), String> {
+    let _held = lock();
+    let mut manifest = Manifest::load(root)?;
+    if manifest.project.is_none() || manifest.paused {
+        return Ok(());
+    }
+    manifest.paused = true;
+    manifest.save(root)
 }
 
-/// Keep `root` in step with its Smartloop project for as long as the process
-/// lives; for the chat, which reports through `emit` rather than printing
-/// and holds changes back while `idle` says it's busy.
-pub fn follow(client: &Client, root: &Path, interval: u64, idle: &dyn Fn() -> bool, emit: &mut dyn FnMut(Event)) {
+/// Where `root` stands against its last sync, from the folder alone.
+pub struct Status {
+    pub documents: usize,
+    pub skills: usize,
+    /// What the next pass would push: `+ notes.md`.
+    pub changes: Vec<String>,
+}
+
+pub fn status(root: &Path) -> Result<Status, String> {
+    let manifest = Manifest::load(root)?;
+    let (plan, _, _) = plan(root, &manifest);
+    let changes = plan
+        .skills
+        .iter()
+        .map(|(key, change)| format!("{} skill {}", change.symbol(), key))
+        .chain(plan.documents.iter().map(|(key, change)| format!("{} {}", change.symbol(), key)))
+        .collect();
+    Ok(Status { documents: manifest.documents.len(), skills: manifest.skills.len(), changes })
+}
+
+/// Keep `root` in step with the project it's linked to until `stop`; for
+/// the chat, which reports through `emit` and holds changes back while
+/// `idle` says it's busy. A project that's gone is never made again: the
+/// folder has to be linked to another.
+pub fn follow(
+    client: &Client,
+    root: &Path,
+    interval: u64,
+    idle: &dyn Fn() -> bool,
+    stop: &AtomicBool,
+    emit: &mut dyn FnMut(Event),
+) {
+    let _held = lock();
+    if stop.load(Ordering::Relaxed) {
+        return;
+    }
     let mut manifest = match Manifest::load(root) {
         Ok(manifest) => manifest,
         Err(e) => return emit(Event::Failure(e)),
     };
-    let project = match resolve_project(client, root, &mut manifest, None) {
-        Ok(project) => project,
-        Err(e) => return emit(Event::Failure(e)),
+    let Some(project) = manifest.project.clone() else {
+        return emit(Event::Failure("This folder isn't linked; /sync links it".to_string()));
     };
-    watch(&Remote { client, project }, root, &mut manifest, interval, true, idle, emit)
-}
-
-/// What `docent sync` was asked to do.
-pub struct Options {
-    pub path: PathBuf,
-    pub project: Option<String>,
-    pub dry_run: bool,
-    pub watch: bool,
-    pub interval: u64,
-}
-
-fn print(event: Event) {
-    match event {
-        Event::Working(_) => {}
-        Event::Change(text) | Event::Summary(text) => println!("{}", text),
-        Event::Failure(text) => eprintln!("! {}", text),
-    }
-    let _ = std::io::stdout().flush();
-}
-
-/// `docent sync`. Returns whether every change went through.
-pub fn run(client: &Client, options: Options) -> Result<bool, String> {
-    let root = fs::canonicalize(&options.path)
-        .map_err(|e| format!("Cannot open {}: {}", options.path.display(), e))?;
-    let mut manifest = Manifest::load(&root)?;
-
-    if options.dry_run {
-        let (plan, _, _) = plan(&root, &manifest);
-        if plan.is_empty() {
-            println!("Up to date with the last sync (Smartloop was not asked)");
+    match try_fetch_projects(client) {
+        Ok(projects) if projects.iter().any(|p| p["id"].as_str() == Some(project.as_str())) => {}
+        Ok(_) => {
+            return emit(Event::Failure(
+                "The project this folder synced to is gone; /sync links it to the current one".to_string(),
+            ));
         }
-        for (key, change) in &plan.skills {
-            println!("{} skill {}", change.symbol(), key);
-        }
-        for (key, change) in &plan.documents {
-            println!("{} {}", change.symbol(), key);
-        }
-        return Ok(true);
+        Err(e) => return emit(Event::Failure(e)),
     }
-
-    let project = resolve_project(client, &root, &mut manifest, options.project.as_deref())?;
-    let remote = Remote { client, project };
-    if options.watch {
-        println!("Watching {} (every {}s, Ctrl-C to stop)", root.display(), options.interval);
-        watch(&remote, &root, &mut manifest, options.interval, false, &|| true, &mut print);
-    }
-    Ok(sync_once(&remote, &root, &mut manifest, false, &|| true, &mut print)?.failed == 0)
+    watch(&Remote { client, project }, root, &mut manifest, interval, idle, stop, emit)
 }
 
 #[cfg(test)]
@@ -715,7 +754,7 @@ mod tests {
     use super::*;
 
     fn entry(hash: &str) -> Entry {
-        Entry { hash: hash.into(), size: 1, mtime: 1, remote: "r".into(), synced_at: 0 }
+        Entry { hash: hash.into(), size: 1, mtime: 1, remote: "r".into(), synced_at: 0, registered: false }
     }
 
     fn file(hash: &str) -> Found {
@@ -743,6 +782,19 @@ mod tests {
     }
 
     #[test]
+    fn documents_not_yet_registered_are_never_pushed_again() {
+        let mut documents = BTreeMap::from([("a.md".to_string(), entry("h"))]);
+        // However long the agent takes to list it, the upload stands.
+        reconcile(&mut documents, &HashSet::new());
+        assert!(documents.get("a.md").is_some_and(|e| !e.registered));
+        reconcile(&mut documents, &HashSet::from(["r".to_string()]));
+        assert!(documents.get("a.md").is_some_and(|e| e.registered));
+        // Listed once and then gone: deleted at Smartloop, so it goes again.
+        reconcile(&mut documents, &HashSet::new());
+        assert!(documents.is_empty());
+    }
+
+    #[test]
     fn reads_skill_frontmatter() {
         let content = "---\nname: \"Summarize\"\ndescription: Short summaries\n---\nBody: text";
         assert_eq!(frontmatter(content, "name").as_deref(), Some("Summarize"));
@@ -759,13 +811,47 @@ mod tests {
     }
 
     #[test]
-    fn home_and_root_are_not_synced_on_their_own() {
+    fn home_and_root_are_never_synced() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(enabled(dir.path()));
-        assert!(!enabled(Path::new("/")));
+        assert!(refusal(dir.path()).is_none());
+        assert!(refusal(Path::new("/")).is_some());
         if let Some(home) = std::env::var_os("HOME") {
-            assert!(!enabled(Path::new(&home)));
+            assert!(refusal(Path::new(&home)).is_some());
         }
+    }
+
+    #[test]
+    fn measures_only_what_would_be_pushed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "12345").unwrap();
+        fs::write(dir.path().join("b.rs"), "skipped").unwrap();
+        assert_eq!(measure(dir.path()), Size { files: 1, bytes: 5 });
+        assert!(!measure(dir.path()).large());
+        assert!(Size { files: LARGE_FILES + 1, bytes: 0 }.large());
+    }
+
+    #[test]
+    fn linking_and_pausing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(linked(root).is_none());
+        // Pausing a folder never linked leaves nothing behind.
+        pause(root).unwrap();
+        assert!(!root.join(DIR).exists());
+
+        link(root, "p1").unwrap();
+        let mut manifest = Manifest::load(root).unwrap();
+        manifest.documents.insert("a.md".into(), entry("h"));
+        manifest.save(root).unwrap();
+        pause(root).unwrap();
+        assert!(linked(root).is_some_and(|l| l.project == "p1" && l.paused));
+        // Linked again to the same project, the map is kept.
+        link(root, "p1").unwrap();
+        assert!(linked(root).is_some_and(|l| !l.paused));
+        assert_eq!(status(root).unwrap().documents, 1);
+        // To another, it starts afresh.
+        link(root, "p2").unwrap();
+        assert_eq!(status(root).unwrap().documents, 0);
     }
 
     #[test]

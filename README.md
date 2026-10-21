@@ -246,18 +246,22 @@ References
 
 ### Keep a project in sync
 
-`docent sync` keeps a Smartloop project in step with a folder. It indexes the
-folder locally into `.docent/manifest.json`, a map of every document and skill
-pushed (hash, and the name or id it has at Smartloop), then pushes only what
-was added, changed or removed since:
+In the chat, `/sync` keeps the project you're in up to date with the folder
+`docent` was opened in. It maps the folder into `.docent/manifest.json` (every
+document and skill pushed: its hash, and the name or id it has at Smartloop),
+then every few seconds pushes only what was added, changed or removed:
 
-```sh
-docent sync              # the current folder, to the Smartloop project named after it
-docent sync --watch      # keep checking (--interval 10 seconds) and push changes as they happen
-docent sync --dry-run    # what would change since the last sync; contacts nothing
-docent sync ~/notes --project <id-or-name>
+```
+/sync            sync this folder to the current project
+/sync status     what's synced, and what the next pass would push
+/sync stop       stop syncing this folder (/sync starts it again)
 ```
 
+- Nothing is synced, and no project created, until you run `/sync`. After
+  that, opening `docent` in the folder opens the chat in its project and keeps
+  syncing it, until `/sync stop`.
+- Your home folder (or one holding it) is never synced. A first sync of more
+  than 200 documents or 500 MB asks first; `/sync --yes` goes ahead.
 - **Documents** are the folder's PDF, Word, PowerPoint, Excel, CSV, Markdown
   and text files. Hidden folders, `.gitignore` and a `.docentignore` (same
   syntax) keep files out. A document in a subfolder is stored flat, as
@@ -266,17 +270,12 @@ docent sync ~/notes --project <id-or-name>
   with optional `name:` and `description:` frontmatter. They are what you
   commit from `.docent/`; the manifest is kept out of git by
   `.docent/.gitignore`, as it names this machine's project.
-- In the chat (`docent`), the folder it is opened in is synced in the
-  background while the app is open, once setup is done: a note appears in the
-  chat when something was pushed, a warning when something failed, and a line
-  above the prompt says "Indexing N documents" while it happens, counting
-  down as the agent gets through them.
-  Anything you add to the folder is picked up within seconds. The first visit
-  creates `.docent/` (as `git init` would) and the project named after the
-  folder, and the chat opens in it unless `--project` says otherwise. Your home folder (or one holding it) is
-  never synced on its own; run `docent sync` there if you mean to.
-- The project is created when none is named after the folder. A document or
-  skill that was deleted at Smartloop is pushed again on the next pass.
+- While it pushes, a note appears in the chat when something was pushed, a
+  warning when something failed, and a line above the prompt says "Indexing N
+  documents", counting down as the agent gets through them.
+- A document or skill deleted at Smartloop is pushed again on the next pass.
+  If the project itself is deleted, syncing stops; `/sync` links the folder to
+  the current project instead.
 
 ## Configuration
 
