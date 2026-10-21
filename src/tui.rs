@@ -28,6 +28,8 @@
 //! plain threads and reports through a channel, so quitting never waits for
 //! a download to finish.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -47,7 +49,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::chat::{self, ChatEvent, TurnStats};
 use crate::progress::{self, Steps, format_duration, format_size};
 use crate::usage::{SearchUsage, TokenStats};
-use crate::{ModelRow, framework, mcp};
+use crate::{ModelRow, docent, framework, mcp};
 
 const LABEL_WIDTH: usize = 28;
 const DETAIL_WIDTH: usize = 12;
@@ -69,6 +71,10 @@ const PAGE_LINES: u16 = 10;
 const DOUBLE_ESC: Duration = Duration::from_secs(2);
 /// Cells in `/usage`'s bar.
 const USAGE_BAR: usize = 30;
+/// Seconds between checks of the working directory's `.docent/` sync.
+const SYNC_INTERVAL: u64 = 5;
+/// How long after a push the status line keeps saying documents are indexing.
+const INDEXING_HINT: Duration = Duration::from_secs(10);
 /// A bar turning in brackets.
 const SPINNER: [&str; 4] = ["[-]", "[\\]", "[|]", "[/]"];
 
@@ -143,6 +149,8 @@ enum AppEvent {
     /// The project's web search switch, read or just toggled; `toggled`
     /// says whether to announce it.
     WebSearch { enabled: bool, toggled: bool },
+    /// A sync started pushing this many changes, or finished at 0.
+    Syncing(usize),
     /// What the agent is doing, for the welcome card; `None` when it
     /// doesn't answer.
     Agent(Option<crate::AgentState>),
@@ -559,6 +567,8 @@ struct App {
     pending_prompt: Option<String>,
     entries: Vec<Entry>,
     turn: Option<Turn>,
+    /// Set while a turn runs, so the background sync waits for it.
+    busy: Arc<AtomicBool>,
     downloads: Vec<Download>,
     overlay: Overlay,
     input: String,
@@ -603,6 +613,11 @@ struct App {
     connections: Option<(usize, usize)>,
     /// When the agent's state was last asked for; `None` while asking.
     agent_asked: Option<Instant>,
+    /// How many changes a sync is pushing to the project, 0 when none.
+    syncing: usize,
+    /// Until when to say "Indexing" after a push, as the agent takes a few
+    /// seconds to notice what it was sent.
+    indexing_until: Option<Instant>,
     /// This month's web search usage, shown in the footer once known.
     search: Option<SearchUsage>,
     /// The project's web search switch (ctrl+s), once read.
@@ -625,6 +640,7 @@ impl App {
             pending_prompt: prompt.filter(|p| !p.trim().is_empty()),
             entries: Vec::new(),
             turn: None,
+            busy: Arc::new(AtomicBool::new(false)),
             downloads: Vec::new(),
             overlay: Overlay::None,
             input: String::new(),
@@ -647,6 +663,8 @@ impl App {
             account: None,
             connections: None,
             agent_asked: Some(Instant::now() - AGENT_EVERY),
+            syncing: 0,
+            indexing_until: None,
             search: None,
             web_search: None,
             quit: false,
@@ -706,6 +724,37 @@ impl App {
             let mut list = Remote::new(tx.clone(), AppEvent::Setup);
             let result = framework::prepare(&mut list, &client, &crate::base_url(), crate::is_local());
             let _ = tx.send(AppEvent::SetupDone(result));
+        });
+    }
+
+    /// The projects to pick the chat's from; then, for a folder that syncs,
+    /// its project is kept at Smartloop up to date for as long as the app is
+    /// open. That project is created first, on the first visit, so the chat
+    /// opens in it.
+    fn load_first_projects(&self) {
+        let root = std::env::current_dir().ok().filter(|root| docent::enabled(root));
+        let link = self.wanted_project.is_none();
+        let busy = self.busy.clone();
+        self.spawn(move |client, tx| {
+            if let Some(root) = root.as_ref().filter(|_| link) {
+                if let Err(e) = docent::link(&client, root) {
+                    let _ = tx.send(AppEvent::Warning(format!("Sync: {}", e)));
+                }
+            }
+            let _ = tx.send(AppEvent::Projects(crate::try_fetch_projects(&client)));
+            let Some(root) = root else { return };
+            let idle = || !busy.load(Ordering::Relaxed);
+            docent::follow(&client, &root, SYNC_INTERVAL, &idle, &mut |event| {
+                let _ = match event {
+                    docent::Event::Change(_) => return,
+                    docent::Event::Working(count) => tx.send(AppEvent::Syncing(count)),
+                    docent::Event::Summary(text) => {
+                        let _ = tx.send(AppEvent::Syncing(0));
+                        tx.send(AppEvent::Notice(format!("Indexed: {}", text)))
+                    }
+                    docent::Event::Failure(text) => tx.send(AppEvent::Warning(format!("Sync: {}", text))),
+                };
+            });
         });
     }
 
@@ -789,10 +838,12 @@ impl App {
             let _ = tx.send(AppEvent::TurnDone(result));
         });
         self.turn = Some(Turn { started: Instant::now(), task, entry, tokens: 0, activity: None });
+        self.busy.store(true, Ordering::Relaxed);
     }
 
     fn stop_turn(&mut self) {
         if let Some(turn) = self.turn.take() {
+            self.busy.store(false, Ordering::Relaxed);
             turn.task.abort();
             if let Some(Entry::Reply(reply)) = self.entries.get_mut(turn.entry) {
                 reply.ended = Some("Interrupted".to_string());
@@ -812,7 +863,7 @@ impl App {
                     self.entries.push(Entry::Notice(format!("Setup complete in {}", format_duration(took))));
                 }
                 self.phase = Phase::Connecting;
-                self.load_projects();
+                self.load_first_projects();
                 self.load_usage();
             }
             AppEvent::SetupDone(Err(e)) => self.setup.failure = Some(e),
@@ -841,6 +892,7 @@ impl App {
             AppEvent::Chat(event) => self.chat_event(event),
             AppEvent::TurnDone(result) => {
                 let Some(turn) = self.turn.take() else { return };
+                self.busy.store(false, Ordering::Relaxed);
                 if let Some(Entry::Reply(reply)) = self.entries.get_mut(turn.entry) {
                     match result {
                         Ok(stats) => reply.stats = Some(stats),
@@ -885,8 +937,16 @@ impl App {
                     self.connections = Some(connection_counts(&servers));
                 }
             }
+            AppEvent::Syncing(count) => {
+                self.syncing = count;
+                if count == 0 {
+                    self.indexing_until = Some(Instant::now() + INDEXING_HINT);
+                    // Ask the agent now, rather than at the next poll.
+                    self.agent_asked = Some(Instant::now() - AGENT_EVERY);
+                }
+            }
             AppEvent::Agent(state) => {
-                let down = || crate::AgentState { state: "not responding".to_string(), memory: None, documents: 0 };
+                let down = || crate::AgentState { state: "not responding".to_string(), memory: None, documents: 0, pending: 0 };
                 self.agent = Some(state.unwrap_or_else(down));
                 self.agent_asked = Some(Instant::now());
             }
@@ -920,7 +980,12 @@ impl App {
             }
         };
         let field = |p: &serde_json::Value, k: &str| p[k].as_str().unwrap_or_default().to_string();
-        let chosen = match &self.wanted_project {
+        // Without one asked for, the project `.docent/` syncs to.
+        let linked = std::env::current_dir()
+            .ok()
+            .and_then(|root| docent::linked_project(&root))
+            .filter(|id| projects.iter().any(|p| field(p, "id") == *id));
+        let chosen = match self.wanted_project.as_ref().or(linked.as_ref()) {
             Some(id) => projects
                 .iter()
                 .find(|p| field(p, "id") == *id)
@@ -1959,6 +2024,18 @@ impl App {
                 lines.push(working(what, detail));
             }
             _ => {}
+        }
+        let indexing = self.agent.as_ref().is_some_and(|a| a.state == "indexing")
+            || self.indexing_until.is_some_and(|until| Instant::now() < until);
+        if matches!(self.phase, Phase::Ready) && (self.syncing > 0 || indexing) {
+            // What's being pushed, then what the agent has left to index.
+            let left = if self.syncing > 0 { self.syncing } else { self.agent.as_ref().map_or(0, |a| a.pending) };
+            let what = match left {
+                0 => "Indexing documents".to_string(),
+                1 => "Indexing 1 document".to_string(),
+                n => format!("Indexing {} documents", n),
+            };
+            lines.push(Line::from(vec![spinner.clone(), Span::styled(format!("{}…", what), dim())]));
         }
         for d in self.downloads.iter().filter(|d| !d.finished) {
             let mut spans = vec![
@@ -3044,6 +3121,28 @@ mod tests {
     }
 
     #[test]
+    fn the_status_line_says_when_documents_are_syncing_or_indexing() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        let said = |app: &App, what: &str| screen(app, 80, 24).contains(what);
+        assert!(!said(&app, "Indexing documents"));
+        app.apply(AppEvent::Syncing(3));
+        assert!(said(&app, "Indexing 3 documents…"));
+        // Pushed; the agent hasn't picked it up yet.
+        app.apply(AppEvent::Syncing(0));
+        assert!(said(&app, "Indexing documents…"));
+        app.indexing_until = None;
+        assert!(!said(&app, "Indexing documents"));
+        let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 1, pending: 0 };
+        app.apply(AppEvent::Agent(Some(agent)));
+        assert!(said(&app, "Indexing documents…"));
+        // The count goes down as the agent gets through them.
+        let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 1, pending: 7 };
+        app.apply(AppEvent::Agent(Some(agent)));
+        assert!(said(&app, "Indexing 7 documents…"));
+    }
+
+    #[test]
     fn login_masks_the_token_and_keeps_it_out_of_history() {
         let mut app = app();
         app.phase = Phase::Ready;
@@ -3080,7 +3179,7 @@ mod tests {
         assert!(rows[banner + 4].contains("by Smartloop") && rows[banner + 4].contains(&versions), "{}", text);
 
         // Filled in as the agent and the platform answer.
-        let state = |state: &str| crate::AgentState { state: state.into(), memory: Some(31), documents: 5 };
+        let state = |state: &str| crate::AgentState { state: state.into(), memory: Some(31), documents: 5, pending: 0 };
         app.apply(AppEvent::Agent(Some(state("healthy"))));
         let server = |state: &str| mcp::Server {
             id: state.into(), name: state.into(), location: String::new(), state: state.into(), tools: 0, error: None,
@@ -3129,7 +3228,7 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         app.project = Some(("p1".into(), "general_chat".into()));
-        app.agent = Some(crate::AgentState { state: "healthy".into(), memory: Some(42), documents: 12 });
+        app.agent = Some(crate::AgentState { state: "healthy".into(), memory: Some(42), documents: 12, pending: 0 });
         app.connections = Some((2, 0));
         app.account = Some(Some("you@example.com".into()));
         app.entries.push(Entry::User(

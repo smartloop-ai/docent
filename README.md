@@ -244,6 +244,40 @@ References
 [1] https://releases.rs/
 ```
 
+### Keep a project in sync
+
+`docent sync` keeps a Smartloop project in step with a folder. It indexes the
+folder locally into `.docent/manifest.json`, a map of every document and skill
+pushed (hash, and the name or id it has at Smartloop), then pushes only what
+was added, changed or removed since:
+
+```sh
+docent sync              # the current folder, to the Smartloop project named after it
+docent sync --watch      # keep checking (--interval 10 seconds) and push changes as they happen
+docent sync --dry-run    # what would change since the last sync; contacts nothing
+docent sync ~/notes --project <id-or-name>
+```
+
+- **Documents** are the folder's PDF, Word, PowerPoint, Excel, CSV, Markdown
+  and text files. Hidden folders, `.gitignore` and a `.docentignore` (same
+  syntax) keep files out. A document in a subfolder is stored flat, as
+  `docs__guide.pdf`.
+- **Skills** are `.docent/skills/<name>.md` or `.docent/skills/<name>/SKILL.md`,
+  with optional `name:` and `description:` frontmatter. They are what you
+  commit from `.docent/`; the manifest is kept out of git by
+  `.docent/.gitignore`, as it names this machine's project.
+- In the chat (`docent`), the folder it is opened in is synced in the
+  background while the app is open, once setup is done: a note appears in the
+  chat when something was pushed, a warning when something failed, and a line
+  above the prompt says "Indexing N documents" while it happens, counting
+  down as the agent gets through them.
+  Anything you add to the folder is picked up within seconds. The first visit
+  creates `.docent/` (as `git init` would) and the project named after the
+  folder, and the chat opens in it unless `--project` says otherwise. Your home folder (or one holding it) is
+  never synced on its own; run `docent sync` there if you mean to.
+- The project is created when none is named after the folder. A document or
+  skill that was deleted at Smartloop is pushed again on the next pass.
+
 ## Configuration
 
 The CLI connects to the local agent on whatever port it picked

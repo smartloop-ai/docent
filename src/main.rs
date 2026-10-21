@@ -9,6 +9,7 @@ use progress::Steps;
 
 mod agent;
 mod chat;
+mod docent;
 mod framework;
 mod mcp;
 mod progress;
@@ -59,6 +60,28 @@ enum Commands {
         /// when stdin or stdout isn't a terminal
         #[arg(long)]
         plain: bool,
+    },
+    /// Keep the project's documents and skills in step with Smartloop
+    ///
+    /// Maps the folder's documents and its `.docent/skills` in
+    /// `.docent/manifest.json` and pushes what was added, changed or removed
+    /// to the Smartloop project of the same name (created when missing).
+    Sync {
+        /// Folder to sync
+        #[arg(value_name = "PATH", default_value = ".")]
+        path: std::path::PathBuf,
+        /// Smartloop project ID or name; the folder's name by default
+        #[arg(long, short)]
+        project: Option<String>,
+        /// Show what would change against the last sync, without contacting Smartloop
+        #[arg(long)]
+        dry_run: bool,
+        /// Keep running and sync whenever the folder changes
+        #[arg(long, short)]
+        watch: bool,
+        /// Seconds between checks with --watch
+        #[arg(long, default_value_t = 10, value_name = "SECONDS")]
+        interval: u64,
     },
 }
 
@@ -509,6 +532,8 @@ pub struct AgentState {
     pub memory: Option<u8>,
     /// The project's documents indexed so far.
     pub documents: usize,
+    /// The project's documents still on their way in.
+    pub pending: usize,
 }
 
 /// What the agent is doing, for the welcome card: `healthy`, or
@@ -525,11 +550,20 @@ pub fn agent_state(client: &Client, project_id: Option<&str>) -> Option<AgentSta
         Some(docs) => docs.iter().filter(|d| matches!(d["status"].as_str(), Some("indexed" | "processed"))).count(),
         None => health["indexing"]["documents"].as_array().map_or(0, Vec::len),
     };
+    let pending = documents.as_deref().unwrap_or_default().iter().filter(|d| on_the_way(d)).count();
+    // Picked up but not yet listed, the queue knows of them first.
+    let pending = pending.max(health["indexing"]["queued"].as_u64().unwrap_or_default() as usize);
     Some(AgentState {
         state: describe_agent(&health, documents.as_deref()),
         memory: health["memory_percent"].as_u64().map(|p| p.min(100) as u8),
         documents: indexed,
+        pending,
     })
+}
+
+/// A document still being converted or indexed.
+fn on_the_way(document: &serde_json::Value) -> bool {
+    matches!(document["status"].as_str().unwrap_or("pending"), "pending" | "converting" | "indexing")
 }
 
 /// Who's signed in: `Name <email>`, or the email alone; `None` when no one
@@ -557,10 +591,7 @@ fn describe_agent(health: &serde_json::Value, documents: Option<&[serde_json::Va
     }
     // `/health` counts only what's still queued; a document being converted
     // or indexed has left the queue.
-    let busy = documents
-        .unwrap_or_default()
-        .iter()
-        .any(|d| matches!(d["status"].as_str().unwrap_or("pending"), "pending" | "converting" | "indexing"));
+    let busy = documents.unwrap_or_default().iter().any(on_the_way);
     let queued = indexing["queued"].as_u64().unwrap_or_default() > 0;
     let scanning = indexing["workspace"]["scanning"].as_bool().unwrap_or_default();
     if busy || queued || scanning { "indexing" } else { "healthy" }.to_string()
@@ -856,6 +887,16 @@ fn main() {
             }
             AgentCommands::Stop => framework::stop(),
         },
+        Commands::Sync { path, project, dry_run, watch, interval } => {
+            // The dry run is local, so it needs no agent.
+            let client = if dry_run { Client::new() } else { agent_client() };
+            let options = docent::Options { path, project, dry_run, watch, interval };
+            match docent::run(&client, options) {
+                Ok(true) => {}
+                Ok(false) => exit(1),
+                Err(e) => fail(e),
+            }
+        }
         Commands::Run { prompt, project, session, plain } => {
             let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
             if terminal && !plain {
