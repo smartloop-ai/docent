@@ -9,6 +9,7 @@ use progress::Steps;
 
 mod agent;
 mod chat;
+mod docent;
 mod framework;
 mod mcp;
 mod progress;
@@ -509,6 +510,8 @@ pub struct AgentState {
     pub memory: Option<u8>,
     /// The project's documents indexed so far.
     pub documents: usize,
+    /// The project's documents still on their way in.
+    pub pending: usize,
 }
 
 /// What the agent is doing, for the welcome card: `healthy`, or
@@ -525,11 +528,20 @@ pub fn agent_state(client: &Client, project_id: Option<&str>) -> Option<AgentSta
         Some(docs) => docs.iter().filter(|d| matches!(d["status"].as_str(), Some("indexed" | "processed"))).count(),
         None => health["indexing"]["documents"].as_array().map_or(0, Vec::len),
     };
+    let pending = documents.as_deref().unwrap_or_default().iter().filter(|d| on_the_way(d)).count();
+    // Picked up but not yet listed, the queue knows of them first.
+    let pending = pending.max(health["indexing"]["queued"].as_u64().unwrap_or_default() as usize);
     Some(AgentState {
         state: describe_agent(&health, documents.as_deref()),
         memory: health["memory_percent"].as_u64().map(|p| p.min(100) as u8),
         documents: indexed,
+        pending,
     })
+}
+
+/// A document still being converted or indexed.
+fn on_the_way(document: &serde_json::Value) -> bool {
+    matches!(document["status"].as_str().unwrap_or("pending"), "pending" | "converting" | "indexing")
 }
 
 /// Who's signed in: `Name <email>`, or the email alone; `None` when no one
@@ -557,10 +569,7 @@ fn describe_agent(health: &serde_json::Value, documents: Option<&[serde_json::Va
     }
     // `/health` counts only what's still queued; a document being converted
     // or indexed has left the queue.
-    let busy = documents
-        .unwrap_or_default()
-        .iter()
-        .any(|d| matches!(d["status"].as_str().unwrap_or("pending"), "pending" | "converting" | "indexing"));
+    let busy = documents.unwrap_or_default().iter().any(on_the_way);
     let queued = indexing["queued"].as_u64().unwrap_or_default() > 0;
     let scanning = indexing["workspace"]["scanning"].as_bool().unwrap_or_default();
     if busy || queued || scanning { "indexing" } else { "healthy" }.to_string()

@@ -244,6 +244,47 @@ References
 [1] https://releases.rs/
 ```
 
+### Keep a project in sync
+
+In the chat, `/sync` keeps the project you're in up to date with the folder
+`docent` was opened in. It maps the folder into `.docent/manifest.json` (every
+document and skill pushed: its hash, and the name or id it has at Smartloop),
+then every few seconds pushes only what was added, changed or removed:
+
+```
+/sync            sync this folder to the current project
+/sync status     what's synced, and what the next pass would push
+/sync stop       stop syncing this folder (/sync starts it again)
+```
+
+- Nothing is synced, and no project created, until you run `/sync`. After
+  that, opening `docent` in the folder opens the chat in its project and keeps
+  syncing it, until `/sync stop`.
+- The folder synced is the nearest one up from where `docent` was opened that
+  holds a `.docent/`, as git finds its repository, so opening it in a
+  subfolder of a synced project syncs the project. With none, it's the folder
+  `docent` was opened in.
+- Syncing runs while the chat is open, checking every 5 seconds and waiting
+  while the chat is answering; changes made while it's closed go on the first
+  check after it opens. `/sync` on a folder already syncing says it's up to
+  date.
+- Your home folder (or one holding it) is never synced. A first sync of more
+  than 200 documents or 500 MB asks first; `/sync --yes` goes ahead.
+- **Documents** are the folder's PDF, Word, PowerPoint, Excel, CSV, Markdown
+  and text files. Hidden folders, `.gitignore` and a `.docentignore` (same
+  syntax) keep files out. A document in a subfolder is stored flat, as
+  `docs__guide.pdf`.
+- **Skills** are `.docent/skills/<name>.md` or `.docent/skills/<name>/SKILL.md`,
+  with optional `name:` and `description:` frontmatter. They are what you
+  commit from `.docent/`; the manifest is kept out of git by
+  `.docent/.gitignore`, as it names this machine's project.
+- While it pushes, a note appears in the chat when something was pushed, a
+  warning when something failed, and a line above the prompt says "Indexing N
+  documents", counting down as the agent gets through them.
+- A document or skill deleted at Smartloop is pushed again on the next pass.
+  If the project itself is deleted, syncing stops; `/sync` links the folder to
+  the current project instead.
+
 ## Configuration
 
 The CLI connects to the local agent on whatever port it picked

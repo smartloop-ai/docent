@@ -28,6 +28,8 @@
 //! plain threads and reports through a channel, so quitting never waits for
 //! a download to finish.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -47,7 +49,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::chat::{self, ChatEvent, TurnStats};
 use crate::progress::{self, Steps, format_duration, format_size};
 use crate::usage::{SearchUsage, TokenStats};
-use crate::{ModelRow, framework, mcp};
+use crate::{ModelRow, docent, framework, mcp};
 
 const LABEL_WIDTH: usize = 28;
 const DETAIL_WIDTH: usize = 12;
@@ -69,6 +71,10 @@ const PAGE_LINES: u16 = 10;
 const DOUBLE_ESC: Duration = Duration::from_secs(2);
 /// Cells in `/usage`'s bar.
 const USAGE_BAR: usize = 30;
+/// Seconds between checks of the working directory's `.docent/` sync.
+const SYNC_INTERVAL: u64 = 5;
+/// How long after a push the status line keeps saying documents are indexing.
+const INDEXING_HINT: Duration = Duration::from_secs(10);
 /// A bar turning in brackets.
 const SPINNER: [&str; 4] = ["[-]", "[\\]", "[|]", "[/]"];
 
@@ -143,6 +149,12 @@ enum AppEvent {
     /// The project's web search switch, read or just toggled; `toggled`
     /// says whether to announce it.
     WebSearch { enabled: bool, toggled: bool },
+    /// A sync started pushing this many changes, or finished at 0.
+    Syncing(usize),
+    /// `/sync` checked the folder: link it to this project and follow it.
+    SyncLink((String, String)),
+    /// The sync that `stop` stops has ended on its own.
+    SyncEnded(Arc<AtomicBool>),
     /// What the agent is doing, for the welcome card; `None` when it
     /// doesn't answer.
     Agent(Option<crate::AgentState>),
@@ -547,6 +559,12 @@ struct Turn {
     activity: Option<String>,
 }
 
+/// The working directory's sync to `project`, running until `stop`.
+struct Sync {
+    project: String,
+    stop: Arc<AtomicBool>,
+}
+
 struct App {
     client: Client,
     tx: UnboundedSender<AppEvent>,
@@ -559,6 +577,8 @@ struct App {
     pending_prompt: Option<String>,
     entries: Vec<Entry>,
     turn: Option<Turn>,
+    /// Set while a turn runs, so the background sync waits for it.
+    busy: Arc<AtomicBool>,
     downloads: Vec<Download>,
     overlay: Overlay,
     input: String,
@@ -603,6 +623,16 @@ struct App {
     connections: Option<(usize, usize)>,
     /// When the agent's state was last asked for; `None` while asking.
     agent_asked: Option<Instant>,
+    /// The working directory's sync, while it runs.
+    sync: Option<Sync>,
+    /// How many changes a sync is pushing to the project, 0 when none.
+    syncing: usize,
+    /// The most documents seen on their way in since indexing started, so
+    /// the status line counts up to it; 0 when nothing's being indexed.
+    indexing_total: usize,
+    /// Until when to say "Indexing" after a push, as the agent takes a few
+    /// seconds to notice what it was sent.
+    indexing_until: Option<Instant>,
     /// This month's web search usage, shown in the footer once known.
     search: Option<SearchUsage>,
     /// The project's web search switch (ctrl+s), once read.
@@ -625,6 +655,7 @@ impl App {
             pending_prompt: prompt.filter(|p| !p.trim().is_empty()),
             entries: Vec::new(),
             turn: None,
+            busy: Arc::new(AtomicBool::new(false)),
             downloads: Vec::new(),
             overlay: Overlay::None,
             input: String::new(),
@@ -647,6 +678,10 @@ impl App {
             account: None,
             connections: None,
             agent_asked: Some(Instant::now() - AGENT_EVERY),
+            sync: None,
+            syncing: 0,
+            indexing_total: 0,
+            indexing_until: None,
             search: None,
             web_search: None,
             quit: false,
@@ -707,6 +742,143 @@ impl App {
             let result = framework::prepare(&mut list, &client, &crate::base_url(), crate::is_local());
             let _ = tx.send(AppEvent::SetupDone(result));
         });
+    }
+
+    /// Keep the working directory in step with the project it's linked to,
+    /// linking it to `project` first when given; a sync already running stops.
+    fn start_sync(&mut self, link: Option<(String, String)>) {
+        let Some(root) = sync_root() else { return };
+        self.stop_sync();
+        let stop = Arc::new(AtomicBool::new(false));
+        let project = match &link {
+            Some((id, _)) => id.clone(),
+            None => docent::linked(&root).map(|l| l.project).unwrap_or_default(),
+        };
+        self.sync = Some(Sync { project, stop: stop.clone() });
+        if let Some((_, name)) = &link {
+            self.entries.push(Entry::Notice(format!("Syncing {} to project {}", root.display(), name)));
+        }
+        if cfg!(test) {
+            return;
+        }
+        let busy = self.busy.clone();
+        self.spawn(move |client, tx| {
+            let linked = match &link {
+                Some((id, _)) => docent::link(&root, id),
+                None => Ok(()),
+            };
+            match linked {
+                Ok(()) => {
+                    let idle = || !busy.load(Ordering::Relaxed);
+                    docent::follow(&client, &root, SYNC_INTERVAL, &idle, &stop, &mut |event| {
+                        let _ = match event {
+                            docent::Event::Working(count) => tx.send(AppEvent::Syncing(count)),
+                            docent::Event::Summary(text) => {
+                                let _ = tx.send(AppEvent::Syncing(0));
+                                tx.send(AppEvent::Notice(format!("Indexed: {}", text)))
+                            }
+                            docent::Event::Failure(text) => tx.send(AppEvent::Warning(format!("Sync: {}", text))),
+                        };
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Warning(format!("Sync: {}", e)));
+                }
+            }
+            let _ = tx.send(AppEvent::Syncing(0));
+            let _ = tx.send(AppEvent::SyncEnded(stop));
+        });
+    }
+
+    fn stop_sync(&mut self) {
+        if let Some(sync) = self.sync.take() {
+            sync.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// `/sync`: link the working directory to the current project and keep
+    /// it in step; `status` and `stop` too. A first sync of a big folder
+    /// asks for `--yes`, and the home folder is never synced.
+    fn sync_command(&mut self, argument: Option<&str>) {
+        let Some(root) = sync_root() else {
+            return self.entries.push(Entry::Error("No working directory to sync".to_string()));
+        };
+        let current = self.project.clone();
+        match argument {
+            None | Some("--yes") => {
+                if let Some(refusal) = docent::refusal(&root) {
+                    return self.entries.push(Entry::Error(format!("Not syncing: {}", refusal)));
+                }
+                let Some(project) = current else {
+                    return self.entries.push(Entry::Error("No project to sync to yet".to_string()));
+                };
+                if self.sync.as_ref().is_some_and(|s| s.project == project.0) {
+                    let text = format!("{} is up to date with project {}", root.display(), project.1);
+                    return self.entries.push(Entry::Notice(text));
+                }
+                let confirmed = argument.is_some();
+                self.spawn(move |_, tx| {
+                    // Pushed before, to this project: only the changes go.
+                    let first = docent::linked(&root).is_none_or(|l| l.project != project.0);
+                    let size = docent::measure(&root);
+                    if first && size.large() && !confirmed {
+                        let _ = tx.send(AppEvent::Warning(format!(
+                            "{} has {} documents ({}); /sync --yes pushes them all to project {}",
+                            root.display(),
+                            size.files,
+                            format_size(size.bytes),
+                            project.1
+                        )));
+                        return;
+                    }
+                    let _ = tx.send(AppEvent::SyncLink(project));
+                });
+            }
+            Some("status") => {
+                let name = |id: &str| match &current {
+                    Some((current, name)) if current == id => name.clone(),
+                    _ => id.to_string(),
+                };
+                let text = match docent::linked(&root) {
+                    None => Ok(format!("{} isn't synced; /sync syncs it to the current project", root.display())),
+                    Some(link) => docent::status(&root).map(|status| {
+                        let state = if link.paused { "Paused syncing" } else { "Syncing" };
+                        let mut text = format!(
+                            "{} {} to project {}: {} documents, {} skills",
+                            state,
+                            root.display(),
+                            name(&link.project),
+                            status.documents,
+                            status.skills
+                        );
+                        match status.changes.len() {
+                            0 => text.push_str("; up to date"),
+                            n => {
+                                let shown = status.changes.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                                let more = if n > 5 { format!(", and {} more", n - 5) } else { String::new() };
+                                text.push_str(&format!("; {} to push: {}{}", n, shown, more));
+                            }
+                        }
+                        text
+                    }),
+                };
+                self.entries.push(match text {
+                    Ok(text) => Entry::Notice(text),
+                    Err(e) => Entry::Error(e),
+                });
+            }
+            Some("stop") => {
+                self.stop_sync();
+                self.syncing = 0;
+                self.spawn(move |_, tx| {
+                    let _ = tx.send(match docent::pause(&root) {
+                        Ok(()) => AppEvent::Notice(format!("Stopped syncing {}; /sync starts again", root.display())),
+                        Err(e) => AppEvent::Error(e),
+                    });
+                });
+            }
+            Some(other) => self.entries.push(Entry::Error(format!("Unknown /sync {}; try /sync status or /sync stop", other))),
+        }
     }
 
     fn load_projects(&self) {
@@ -789,10 +961,12 @@ impl App {
             let _ = tx.send(AppEvent::TurnDone(result));
         });
         self.turn = Some(Turn { started: Instant::now(), task, entry, tokens: 0, activity: None });
+        self.busy.store(true, Ordering::Relaxed);
     }
 
     fn stop_turn(&mut self) {
         if let Some(turn) = self.turn.take() {
+            self.busy.store(false, Ordering::Relaxed);
             turn.task.abort();
             if let Some(Entry::Reply(reply)) = self.entries.get_mut(turn.entry) {
                 reply.ended = Some("Interrupted".to_string());
@@ -841,6 +1015,7 @@ impl App {
             AppEvent::Chat(event) => self.chat_event(event),
             AppEvent::TurnDone(result) => {
                 let Some(turn) = self.turn.take() else { return };
+                self.busy.store(false, Ordering::Relaxed);
                 if let Some(Entry::Reply(reply)) = self.entries.get_mut(turn.entry) {
                     match result {
                         Ok(stats) => reply.stats = Some(stats),
@@ -885,9 +1060,31 @@ impl App {
                     self.connections = Some(connection_counts(&servers));
                 }
             }
+            AppEvent::Syncing(count) => {
+                self.syncing = count;
+                self.indexing_total = self.indexing_total.max(count);
+                if count == 0 {
+                    self.indexing_until = Some(Instant::now() + INDEXING_HINT);
+                    // Ask the agent now, rather than at the next poll.
+                    self.agent_asked = Some(Instant::now() - AGENT_EVERY);
+                }
+            }
+            AppEvent::SyncLink(project) => self.start_sync(Some(project)),
+            AppEvent::SyncEnded(stop) => {
+                if self.sync.as_ref().is_some_and(|s| Arc::ptr_eq(&s.stop, &stop)) {
+                    self.sync = None;
+                }
+            }
             AppEvent::Agent(state) => {
-                let down = || crate::AgentState { state: "not responding".to_string(), memory: None, documents: 0 };
-                self.agent = Some(state.unwrap_or_else(down));
+                let down = || crate::AgentState { state: "not responding".to_string(), memory: None, documents: 0, pending: 0 };
+                let state = state.unwrap_or_else(down);
+                let hinting = self.indexing_until.is_some_and(|until| Instant::now() < until);
+                if state.pending > 0 {
+                    self.indexing_total = self.indexing_total.max(state.pending);
+                } else if state.state != "indexing" && self.syncing == 0 && !hinting {
+                    self.indexing_total = 0;
+                }
+                self.agent = Some(state);
                 self.agent_asked = Some(Instant::now());
             }
             // Only for the project still chatted in.
@@ -920,7 +1117,15 @@ impl App {
             }
         };
         let field = |p: &serde_json::Value, k: &str| p[k].as_str().unwrap_or_default().to_string();
-        let chosen = match &self.wanted_project {
+        // Without one asked for, the project the folder syncs to.
+        let link = sync_root()
+            .filter(|root| docent::refusal(root).is_none())
+            .and_then(|root| docent::linked(&root));
+        let linked = link
+            .as_ref()
+            .map(|l| l.project.clone())
+            .filter(|id| projects.iter().any(|p| field(p, "id") == *id));
+        let chosen = match self.wanted_project.as_ref().or(linked.as_ref()) {
             Some(id) => projects
                 .iter()
                 .find(|p| field(p, "id") == *id)
@@ -933,6 +1138,10 @@ impl App {
                 .map(|p| (field(p, "id"), field(p, "name"))),
         };
         self.phase = Phase::Ready;
+        // A folder `/sync` linked keeps syncing, until `/sync stop`.
+        if link.is_some_and(|l| !l.paused) {
+            self.start_sync(None);
+        }
         match chosen {
             Some(project) => {
                 self.project = Some(project);
@@ -1682,6 +1891,7 @@ impl App {
                     Some(_) => self.find_project(input.split_once(' ').map_or("", |(_, name)| name).trim().to_string()),
                 }
             }
+            "/sync" => self.sync_command(words.next()),
             "/help" | "/?" => self.overlay = Overlay::Help,
             "/status" => self.open_status(),
             "/usage" => self.open_usage(),
@@ -1959,6 +2169,19 @@ impl App {
                 lines.push(working(what, detail));
             }
             _ => {}
+        }
+        let indexing = self.agent.as_ref().is_some_and(|a| a.state == "indexing")
+            || self.indexing_until.is_some_and(|until| Instant::now() < until);
+        if matches!(self.phase, Phase::Ready) && (self.syncing > 0 || indexing) {
+            // Counts up to what was pushed, as the agent gets through it.
+            let left = if self.syncing > 0 { self.syncing } else { self.agent.as_ref().map_or(0, |a| a.pending) };
+            let total = self.indexing_total.max(left);
+            let what = match (left, total) {
+                (0, _) => "Indexing documents".to_string(),
+                (_, 1) => "Indexing 1 document".to_string(),
+                (left, total) => format!("Indexing {} of {} documents", total - left, total),
+            };
+            lines.push(Line::from(vec![spinner.clone(), Span::styled(format!("{}…", what), dim())]));
         }
         for d in self.downloads.iter().filter(|d| !d.finished) {
             let mut spans = vec![
@@ -2626,6 +2849,11 @@ impl App {
     }
 }
 
+/// The folder `/sync` works on: the one the working directory is part of.
+fn sync_root() -> Option<std::path::PathBuf> {
+    std::env::current_dir().ok().map(|dir| docent::root(&dir))
+}
+
 /// A reply as Claude Code lays one out: the answer under a `■` (square, like the setup blocks), its
 /// sources, then `⎿` with the model that answered and how it went.
 fn reply_lines(reply: &Reply, lines: &mut Vec<Line<'static>>) {
@@ -2819,7 +3047,7 @@ fn is_document(path: &std::path::Path) -> bool {
 
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
-const COMMANDS: [(&str, &str); 11] = [
+const COMMANDS: [(&str, &str); 12] = [
     ("/help", "shortcuts and commands"),
     ("/login", "sign in in the browser (--token to paste one)"),
     ("/logout", "log out"),
@@ -2827,6 +3055,7 @@ const COMMANDS: [(&str, &str); 11] = [
     ("/mcp", "MCP servers; /mcp add <url> to connect one"),
     ("/project", "switch, create, import and delete projects"),
     ("/status", "account, model, agent and versions"),
+    ("/sync", "sync this folder's documents to the project"),
     ("/usage", "web searches left, tokens and cost saved"),
     ("/upgrade", "Pro plan: 1,000 web searches a month"),
     ("/clear", "clear the chat and start a new session"),
@@ -2903,6 +3132,9 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/project <name>", "switch to a project by its name or ID"),
         ("/project new <name>", "create a project and switch to it"),
         ("/project import <zip>", "import an exported project"),
+        ("/sync", "keep this folder's documents in the project"),
+        ("/sync status", "what's synced, and what's waiting"),
+        ("/sync stop", "stop syncing this folder"),
         ("/status", "account, model, agent and versions"),
         ("/login", "sign in in the browser (--token to paste one)"),
         ("/logout", "log out"),
@@ -3044,6 +3276,63 @@ mod tests {
     }
 
     #[test]
+    fn the_status_line_says_when_documents_are_syncing_or_indexing() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        let said = |app: &App, what: &str| screen(app, 80, 24).contains(what);
+        assert!(!said(&app, "Indexing documents"));
+        app.apply(AppEvent::Syncing(3));
+        assert!(said(&app, "Indexing 0 of 3 documents…"));
+        // Pushed; the agent hasn't picked it up yet.
+        app.apply(AppEvent::Syncing(0));
+        assert!(said(&app, "Indexing documents…"));
+        app.indexing_until = None;
+        assert!(!said(&app, "Indexing documents"));
+        let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 1, pending: 0 };
+        app.apply(AppEvent::Agent(Some(agent)));
+        assert!(said(&app, "Indexing documents…"));
+        // The count goes up as the agent gets through them.
+        let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 1, pending: 7 };
+        app.apply(AppEvent::Agent(Some(agent)));
+        assert!(said(&app, "Indexing 0 of 7 documents…"));
+        let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 5, pending: 3 };
+        app.apply(AppEvent::Agent(Some(agent)));
+        assert!(said(&app, "Indexing 4 of 7 documents…"));
+        let agent = crate::AgentState { state: "healthy".into(), memory: None, documents: 8, pending: 0 };
+        app.apply(AppEvent::Agent(Some(agent)));
+        assert!(!said(&app, "Indexing"));
+        assert_eq!(app.indexing_total, 0);
+    }
+
+    #[test]
+    fn sync_links_the_folder_to_the_current_project_only() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        let last = |app: &App| match app.entries.last() {
+            Some(Entry::Error(e) | Entry::Notice(e)) => e.clone(),
+            _ => String::new(),
+        };
+        // Nothing to sync to, so nothing is made.
+        app.input = "/sync".into();
+        app.submit();
+        assert!(last(&app).contains("No project to sync to"), "{}", last(&app));
+        app.input = "/sync now".into();
+        app.submit();
+        assert!(last(&app).contains("Unknown /sync now"));
+
+        app.project = Some(("p1".into(), "notes".into()));
+        app.apply(AppEvent::SyncLink(("p1".into(), "notes".into())));
+        assert!(last(&app).contains("to project notes"));
+        app.input = "/sync".into();
+        app.submit();
+        assert!(last(&app).contains("up to date with project notes"));
+        // Its thread ending lets `/sync` start it again.
+        let stop = app.sync.as_ref().unwrap().stop.clone();
+        app.apply(AppEvent::SyncEnded(stop));
+        assert!(app.sync.is_none());
+    }
+
+    #[test]
     fn login_masks_the_token_and_keeps_it_out_of_history() {
         let mut app = app();
         app.phase = Phase::Ready;
@@ -3080,7 +3369,7 @@ mod tests {
         assert!(rows[banner + 4].contains("by Smartloop") && rows[banner + 4].contains(&versions), "{}", text);
 
         // Filled in as the agent and the platform answer.
-        let state = |state: &str| crate::AgentState { state: state.into(), memory: Some(31), documents: 5 };
+        let state = |state: &str| crate::AgentState { state: state.into(), memory: Some(31), documents: 5, pending: 0 };
         app.apply(AppEvent::Agent(Some(state("healthy"))));
         let server = |state: &str| mcp::Server {
             id: state.into(), name: state.into(), location: String::new(), state: state.into(), tools: 0, error: None,
@@ -3129,7 +3418,7 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         app.project = Some(("p1".into(), "general_chat".into()));
-        app.agent = Some(crate::AgentState { state: "healthy".into(), memory: Some(42), documents: 12 });
+        app.agent = Some(crate::AgentState { state: "healthy".into(), memory: Some(42), documents: 12, pending: 0 });
         app.connections = Some((2, 0));
         app.account = Some(Some("you@example.com".into()));
         app.entries.push(Entry::User(
