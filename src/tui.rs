@@ -4241,6 +4241,13 @@ mod tests {
     }
 
     #[test]
+    fn br_breaks_a_reply_line() {
+        let reply = Reply { text: "one<br>two<br>\nthree<br>\n- four".into(), ..Default::default() };
+        let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string()).collect();
+        assert_eq!(rows, ["one", "two", "three", "", "- four"]);
+    }
+
+    #[test]
     fn links_in_tables_keep_the_borders_straight() {
         let reply = Reply {
             text: "| Name | Link |\n|---|---|\n\

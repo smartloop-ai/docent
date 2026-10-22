@@ -113,8 +113,8 @@ const END: char = '\u{2060}';
 /// `markdown` with its links marked for `resolve`, which gets back the URLs
 /// they're numbered in. A link reads `label (address)`, or just the address
 /// where the label only repeats it; a bare web address becomes one, except
-/// in code, HTML and math. A `<br>` in a table cell, which can't break a
-/// line, becomes a space.
+/// in code, HTML and math. A `<br>` breaks the line, or in a table cell or
+/// heading, which can't, becomes a space.
 pub fn mark_links(markdown: &str) -> (String, Vec<String>) {
     // The options tui-markdown parses with, so the two agree on what's code.
     let options = Options::ENABLE_STRIKETHROUGH
@@ -134,8 +134,14 @@ pub fn mark_links(markdown: &str) -> (String, Vec<String>) {
     // Where a bare address is left alone.
     let mut skip: Vec<Range<usize>> = Vec::new();
     let mut link: Option<OpenLink> = None;
-    let mut in_cell = false;
+    // In a table cell or heading, which can't break a line.
+    let mut one_line = false;
+    // A `<br>` that breaks a line by what follows it.
+    let mut br: Option<Range<usize>> = None;
     for (event, range) in Parser::new_ext(markdown, options).into_offset_iter() {
+        if let Some(at) = br.take() {
+            edits.push(line_break(markdown, at, &event));
+        }
         if let Some(OpenLink { label, text, .. }) = &mut link
             && !matches!(event, Event::End(TagEnd::Link))
         {
@@ -163,11 +169,19 @@ pub fn mark_links(markdown: &str) -> (String, Vec<String>) {
                 };
                 edits.push((range, edit));
             }
-            Event::Start(Tag::TableCell) => in_cell = true,
-            Event::End(TagEnd::TableCell) => in_cell = false,
-            Event::InlineHtml(html) if in_cell && matches!(html.to_lowercase().replace(' ', "").as_str(), "<br>" | "<br/>") => {
-                edits.push((range, " ".into()));
+            Event::Start(Tag::TableCell | Tag::Heading { .. }) => one_line = true,
+            Event::End(TagEnd::TableCell | TagEnd::Heading(_)) => one_line = false,
+            Event::InlineHtml(html) if is_br(&html) => {
+                if one_line {
+                    edits.push((range, " ".into()));
+                } else {
+                    br = Some(range);
+                }
             }
+            // A `<br>` on a line of its own is dropped, to preserve vertical
+            // space in the terminal: the blank lines around it already part
+            // the blocks.
+            Event::Html(html) if is_br(&html) => edits.push((range, String::new())),
             Event::Start(Tag::CodeBlock(_) | Tag::Image { .. } | Tag::HtmlBlock | Tag::MetadataBlock(_))
             | Event::Code(_)
             | Event::Html(_)
@@ -176,6 +190,9 @@ pub fn mark_links(markdown: &str) -> (String, Vec<String>) {
             | Event::DisplayMath(_) => skip.push(range),
             _ => {}
         }
+    }
+    if let Some(at) = br {
+        edits.push((at, String::new()));
     }
     for at in addresses(markdown) {
         if !skip.iter().any(|r| r.contains(&at.start)) {
@@ -197,6 +214,34 @@ pub fn mark_links(markdown: &str) -> (String, Vec<String>) {
     }
     out.push_str(&markdown[from..]);
     (out, urls)
+}
+
+/// Whether `html` is a `<br>` tag.
+fn is_br(html: &str) -> bool {
+    matches!(html.trim().to_ascii_lowercase().replace(' ', "").as_str(), "<br>" | "<br/>")
+}
+
+/// The edit making the `<br>` at `at` in `markdown` a hard line break, by
+/// what comes `next`: before a line break it ends the line with a `\`,
+/// before more text it breaks there, and at the end of a paragraph, where a
+/// `\` would show as itself, it goes.
+fn line_break(markdown: &str, at: Range<usize>, next: &Event) -> (Range<usize>, String) {
+    match next {
+        Event::SoftBreak => {
+            let after = &markdown[at.end..];
+            let spaces = after.len() - after.trim_start_matches([' ', '\t']).len();
+            (at.start..at.end + spaces, "\\".into())
+        }
+        Event::Text(_)
+        | Event::Code(_)
+        | Event::InlineHtml(_)
+        | Event::InlineMath(_)
+        | Event::FootnoteReference(_)
+        | Event::Start(
+            Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Superscript | Tag::Subscript | Tag::Link { .. } | Tag::Image { .. },
+        ) => (at, "\\\n".into()),
+        _ => (at, String::new()),
+    }
 }
 
 /// A link `mark_links` is reading.
@@ -392,6 +437,19 @@ mod tests {
         assert_eq!(linkify("", Style::new()).len(), 1);
         let wiki = linkify("(https://en.wikipedia.org/wiki/Rust_(language))", Style::new());
         assert_eq!(wiki[1].content, "https://en.wikipedia.org/wiki/Rust_(language)");
+    }
+
+    #[test]
+    fn br_breaks_the_line_where_it_can() {
+        let br = |markdown: &str| mark_links(markdown).0;
+        assert_eq!(br("one<br>two<BR />three"), "one\\\ntwo\\\nthree");
+        assert_eq!(br("one<br> \ntwo"), "one\\\ntwo");
+        assert_eq!(br("end<br>\n\nnext<br>"), "end\n\nnext");
+        assert_eq!(br("# Title<br>more"), "# Title more");
+        assert_eq!(br("| a |\n|---|\n| one<br/>two |"), "| a |\n|---|\n| one two |");
+        assert_eq!(br("before\n\n<br>\n\nafter"), "before\n\n\nafter");
+        assert_eq!(br("`a<br>b` <span>"), "`a<br>b` <span>");
+        assert_eq!(br("ends<br>\n- item<br>*more*<br>"), "ends\n- item\\\n*more*");
     }
 
     #[test]
