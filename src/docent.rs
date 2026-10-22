@@ -8,6 +8,9 @@
 //! changed or removed, so the Smartloop project follows the folder. Nothing
 //! is linked, and no project created, on its own.
 //!
+//! The project root is the nearest folder up from the working directory that
+//! holds a `.docent/`, or the working directory when none does.
+//!
 //! Documents are the files under the project root with a supported extension
 //! (hidden folders, `.gitignore` and `.docentignore` are honoured). Skills are
 //! `.docent/skills/<name>.md` or `.docent/skills/<name>/SKILL.md`; they are
@@ -634,6 +637,17 @@ pub fn refusal(root: &Path) -> Option<String> {
     holds_home.then(|| format!("{} holds your whole home folder; open docent in a project folder to sync it", root.display()))
 }
 
+/// The folder `start` is part of: the nearest one holding a `.docent/`, as
+/// git finds its repository, else `start` itself. The home folder and those
+/// above it are never taken, since they're never synced.
+pub fn root(start: &Path) -> PathBuf {
+    start
+        .ancestors()
+        .take_while(|dir| refusal(dir).is_none())
+        .find(|dir| dir.join(DIR).is_dir())
+        .map_or_else(|| start.to_path_buf(), Path::to_path_buf)
+}
+
 /// The documents a first sync of `root` would push, without reading them.
 #[derive(Debug, Default, PartialEq)]
 pub struct Size {
@@ -818,6 +832,21 @@ mod tests {
         if let Some(home) = std::env::var_os("HOME") {
             assert!(refusal(Path::new(&home)).is_some());
         }
+    }
+
+    #[test]
+    fn finds_the_root_above() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b");
+        fs::create_dir_all(&nested).unwrap();
+        // Nothing linked yet: the folder itself.
+        assert_eq!(root(&nested), nested);
+        fs::create_dir(dir.path().join(DIR)).unwrap();
+        assert_eq!(root(&nested), dir.path());
+        assert_eq!(root(dir.path()), dir.path());
+        // The nearest one wins.
+        fs::create_dir(nested.join(DIR)).unwrap();
+        assert_eq!(root(&nested), nested);
     }
 
     #[test]

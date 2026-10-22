@@ -747,7 +747,7 @@ impl App {
     /// Keep the working directory in step with the project it's linked to,
     /// linking it to `project` first when given; a sync already running stops.
     fn start_sync(&mut self, link: Option<(String, String)>) {
-        let Ok(root) = std::env::current_dir() else { return };
+        let Some(root) = sync_root() else { return };
         self.stop_sync();
         let stop = Arc::new(AtomicBool::new(false));
         let project = match &link {
@@ -800,7 +800,7 @@ impl App {
     /// it in step; `status` and `stop` too. A first sync of a big folder
     /// asks for `--yes`, and the home folder is never synced.
     fn sync_command(&mut self, argument: Option<&str>) {
-        let Ok(root) = std::env::current_dir() else {
+        let Some(root) = sync_root() else {
             return self.entries.push(Entry::Error("No working directory to sync".to_string()));
         };
         let current = self.project.clone();
@@ -1118,8 +1118,7 @@ impl App {
         };
         let field = |p: &serde_json::Value, k: &str| p[k].as_str().unwrap_or_default().to_string();
         // Without one asked for, the project the folder syncs to.
-        let link = std::env::current_dir()
-            .ok()
+        let link = sync_root()
             .filter(|root| docent::refusal(root).is_none())
             .and_then(|root| docent::linked(&root));
         let linked = link
@@ -2848,6 +2847,11 @@ impl App {
     fn spinner(&self) -> &'static str {
         SPINNER[self.ticks % SPINNER.len()]
     }
+}
+
+/// The folder `/sync` works on: the one the working directory is part of.
+fn sync_root() -> Option<std::path::PathBuf> {
+    std::env::current_dir().ok().map(|dir| docent::root(&dir))
 }
 
 /// A reply as Claude Code lays one out: the answer under a `■` (square, like the setup blocks), its
