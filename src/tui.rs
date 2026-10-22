@@ -520,6 +520,62 @@ struct Reply {
     stats: Option<TurnStats>,
     /// Why it ended early: stopped by the user, or an error.
     ended: Option<String>,
+    /// `text` as last drawn, with its length and width: the conversation
+    /// redraws every tick, and only a reply still streaming changes.
+    rendered: std::cell::RefCell<Option<(usize, u16, Vec<Line<'static>>)>>,
+}
+
+impl Reply {
+    /// `text` rendered as markdown at `width`, its links and bare web
+    /// addresses clickable.
+    fn body(&self, width: u16) -> Vec<Line<'static>> {
+        let text = self.text.trim_end();
+        let mut rendered = self.rendered.borrow_mut();
+        match &*rendered {
+            Some((len, at, lines)) if *len == text.len() && *at == width => lines.clone(),
+            _ => {
+                let options = tui_markdown::Options::new(Markdown).table_width(width).table_row_dividers(true);
+                let (markdown, urls) = crate::links::mark_links(text);
+                let mut lines: Vec<Line<'static>> = tui_markdown::from_str_with_options(&markdown, &options)
+                    .lines
+                    .into_iter()
+                    .map(|line| {
+                        let spans = line.spans.into_iter().map(|s| Span::styled(s.content.into_owned(), s.style));
+                        Line::from(spans.collect::<Vec<_>>()).style(line.style)
+                    })
+                    .collect();
+                crate::links::resolve(&mut lines, &urls);
+                *rendered = Some((text.len(), width, lines.clone()));
+                lines
+            }
+        }
+    }
+}
+
+/// tui-markdown's styles, but with table borders dim like ours (its dark
+/// gray is the background color in some themes), headings and code without
+/// their `#` and ``` markers. Links don't reach it: `links::mark_links`
+/// draws them.
+#[derive(Clone)]
+struct Markdown;
+
+impl tui_markdown::StyleSheet for Markdown {
+    /// Dim, like our other borders, in place of the default dark gray,
+    /// which is the background color in some themes and hides the table.
+    fn table_border(&self) -> Style {
+        dim()
+    }
+
+    /// The ``` drawn above and below a code block by default; none drops
+    /// both lines.
+    fn code_block_fence(&self) -> &str {
+        ""
+    }
+
+    /// The `#`s drawn before a heading by default; none drops them.
+    fn heading_marker(&self, _level: u8) -> &str {
+        ""
+    }
 }
 
 enum Overlay {
@@ -593,12 +649,14 @@ struct App {
     /// How far up the conversation goes, as of the last draw.
     scroll_limit: std::cell::Cell<u16>,
     /// The conversation pane as last drawn, row by row, for copying a
-    /// selection out of it.
-    shown: std::cell::RefCell<(Rect, Vec<Vec<String>>)>,
+    /// selection out of it, and the link under each cell, for clicking.
+    shown: std::cell::RefCell<Shown>,
     /// Text being selected with the mouse, in screen cells.
     selection: Option<Selection>,
     /// What the last selection copied, flashed in the footer for a moment.
     copied: Option<(usize, Instant)>,
+    /// The link last clicked, flashed in the footer as it opens.
+    opened: Option<(String, Instant)>,
     /// Kept for the app's life: on X11 the clipboard empties when its owner
     /// goes away.
     clipboard: Option<arboard::Clipboard>,
@@ -665,9 +723,10 @@ impl App {
             last_esc: None,
             scroll_back: 0,
             scroll_limit: std::cell::Cell::new(0),
-            shown: std::cell::RefCell::new((Rect::default(), Vec::new())),
+            shown: std::cell::RefCell::new(Shown::default()),
             selection: None,
             copied: None,
+            opened: None,
             clipboard: None,
             ticks: 0,
             token_entry: false,
@@ -1234,23 +1293,28 @@ impl App {
     // ----- keys ------------------------------------------------------------
 
     /// The wheel scrolls; a left-button drag over the conversation selects,
-    /// and letting go copies the selection.
+    /// and letting go copies the selection; a click on a link opens it.
     fn mouse(&mut self, mouse: MouseEvent) {
         let at = (mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll(WHEEL_LINES as i32),
             MouseEventKind::ScrollDown => self.scroll(-(WHEEL_LINES as i32)),
             MouseEventKind::Down(MouseButton::Left) => {
-                let area = self.shown.borrow().0;
+                let area = self.shown.borrow().area;
                 self.selection = area.contains(at.into()).then_some(Selection { anchor: at, head: at });
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(selection) = &mut self.selection {
-                    let area = self.shown.borrow().0;
+                    let area = self.shown.borrow().area;
                     selection.head = clamp_to(area, at);
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                let clicked = self.selection.as_ref().filter(|s| s.anchor == s.head).map(|s| s.anchor);
+                if let Some(url) = clicked.and_then(|at| self.shown.borrow().link_at(at)) {
+                    self.selection = None;
+                    return self.open(url);
+                }
                 let text = self.selection.as_ref().filter(|s| s.anchor != s.head).map(|s| self.selected_text(s));
                 match text.filter(|t| !t.trim().is_empty()) {
                     Some(text) => self.copy(text),
@@ -1264,7 +1328,7 @@ impl App {
     /// The selected cells' text, a line per screen row, trailing blanks off.
     fn selected_text(&self, selection: &Selection) -> String {
         let shown = self.shown.borrow();
-        let (area, rows) = (&shown.0, &shown.1);
+        let (area, rows) = (&shown.area, &shown.rows);
         selection
             .rows(*area)
             .map(|(y, from, to)| {
@@ -1274,6 +1338,14 @@ impl App {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Open a clicked link in the browser.
+    fn open(&mut self, url: String) {
+        if !cfg!(test) {
+            crate::open_browser(&url);
+        }
+        self.opened = Some((url, Instant::now()));
     }
 
     /// Put `text` on the system clipboard, or where there's none (over SSH),
@@ -2343,14 +2415,16 @@ impl App {
         lines
     }
 
-    /// Remember the conversation as drawn, for copying, and highlight the
-    /// selection over it.
+    /// Remember the conversation as drawn, for copying and for clicking its
+    /// links, make the links hyperlinks, and highlight the selection over it.
     fn keep_shown(&self, frame: &mut Frame, area: Rect) {
         let buffer = frame.buffer_mut();
         let rows = (area.top()..area.bottom())
             .map(|y| (area.left()..area.right()).map(|x| buffer[(x, y)].symbol().to_string()).collect())
             .collect();
-        *self.shown.borrow_mut() = (area, rows);
+        // Tests read the screen back as text, so they go without the escapes.
+        let links = crate::links::apply(buffer, area, !cfg!(test));
+        *self.shown.borrow_mut() = Shown { area, rows, links };
         if let Some(selection) = &self.selection {
             for (y, from, to) in selection.rows(area) {
                 for x in from..=to {
@@ -2384,7 +2458,7 @@ impl App {
                         ]));
                     }
                 }
-                Entry::Reply(reply) => reply_lines(reply, &mut lines),
+                Entry::Reply(reply) => reply_lines(reply, area.width, &mut lines),
                 Entry::Notice(text) => lines.push(Line::from(vec![
                     Span::styled("■ ", Style::new().fg(Color::Green)),
                     Span::raw(text.clone()),
@@ -2515,9 +2589,14 @@ impl App {
     /// Key hints under the prompt.
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let mut hints = vec![Span::raw("  ")];
-        if let Some((chars, _)) = self.copied.filter(|(_, at)| at.elapsed() < Duration::from_secs(2)) {
+        let recent = |at: &Instant| at.elapsed() < Duration::from_secs(2);
+        let opened = self.opened.as_ref().filter(|(_, at)| recent(at));
+        if let Some((chars, _)) = self.copied.filter(|(_, at)| recent(at)) {
             hints.push(Span::styled("✓ ", Style::new().fg(Color::Green)));
             hints.push(Span::styled(format!("Copied {} characters", chars), dim()));
+        } else if let Some((url, _)) = opened {
+            hints.push(Span::styled("↗ ", Style::new().fg(Color::Green)));
+            hints.push(Span::styled(format!("Opening {}", url), dim()));
         } else if self.scroll_back > 0 {
             hints.push(Span::styled(format!("↓ {} lines below  ", self.scroll_back), dim()));
             hints.extend(key_hints(&[("pgdn", "scroll down"), ("end", "latest")]));
@@ -2856,22 +2935,24 @@ fn sync_root() -> Option<std::path::PathBuf> {
 
 /// A reply as Claude Code lays one out: the answer under a `■` (square, like the setup blocks), its
 /// sources, then `⎿` with the model that answered and how it went.
-fn reply_lines(reply: &Reply, lines: &mut Vec<Line<'static>>) {
+fn reply_lines(reply: &Reply, width: u16, lines: &mut Vec<Line<'static>>) {
     for warning in &reply.warnings {
         lines.push(Line::from(vec![
             Span::styled("■ ", Style::new().fg(Color::Yellow)),
             Span::styled(warning.clone(), dim()),
         ]));
     }
-    for (i, line) in reply.text.trim_end().lines().enumerate() {
+    for (i, line) in reply.body(width.saturating_sub(2)).into_iter().enumerate() {
         let mark = if i == 0 { Span::raw("■ ") } else { Span::raw("  ") };
-        lines.push(Line::from(vec![mark, Span::raw(line.to_string())]));
+        lines.push(Line::from(std::iter::once(mark).chain(line.spans).collect::<Vec<_>>()));
     }
     if !reply.citations.is_empty() {
         lines.push(Line::default());
         lines.push(Line::styled("  References", dim()));
         for (i, label) in reply.citations.iter().enumerate() {
-            lines.push(Line::from(vec![Span::styled(format!("  [{}] ", i + 1), dim()), Span::raw(label.clone())]));
+            let mut spans = vec![Span::styled(format!("  [{}] ", i + 1), dim())];
+            spans.extend(crate::links::linkify(label, Style::new()));
+            lines.push(Line::from(spans));
         }
     }
     match (&reply.ended, &reply.stats) {
@@ -2909,6 +2990,25 @@ fn error_line(text: &str) -> Line<'static> {
 fn refresh_models(client: &Client, tx: &UnboundedSender<AppEvent>, project: Option<(String, String)>) {
     if let Some((id, _)) = project {
         let _ = tx.send(AppEvent::Models(crate::model_rows(client, &id)));
+    }
+}
+
+/// The conversation pane as last drawn.
+#[derive(Default)]
+struct Shown {
+    area: Rect,
+    /// Each cell's text, row by row.
+    rows: Vec<Vec<String>>,
+    /// Each cell's link, if it's in one.
+    links: Vec<Vec<Option<u32>>>,
+}
+
+impl Shown {
+    /// The URL of the link at screen position `at`, if one's there.
+    fn link_at(&self, (x, y): (u16, u16)) -> Option<String> {
+        let (x, y) = (x.checked_sub(self.area.x)?, y.checked_sub(self.area.y)?);
+        let id = (*self.links.get(y as usize)?.get(x as usize)?)?;
+        crate::links::url(id)
     }
 }
 
@@ -3427,15 +3527,16 @@ mod tests {
         app.entries.push(Entry::Reply(Reply {
             warnings: Vec::new(),
             model: Some("sl-mini".into()),
-            text: "Drafted nda-northwind-labs.docx from your template:\n\
-                   1. Mutual NDA between Smartloop Inc. and Northwind Labs, Inc.\n\
-                   2. 2-year term from signing; confidentiality survives 3 years (section 5)\n\
-                   3. Governed by California law, venue in San Francisco (section 9)\n\
+            text: "Drafted `nda-northwind-labs.docx` from your template:\n\n\
+                   1. **Mutual NDA** between Smartloop Inc. and Northwind Labs, Inc.\n\
+                   2. **2-year term** from signing; confidentiality survives 3 years (section 5)\n\
+                   3. Governed by **California law**, venue in San Francisco (section 9)\n\n\
                    Signature blocks are left blank for both parties."
                 .into(),
             citations: vec!["mutual-nda-template.docx".into()],
             stats: Some(TurnStats { tokens: 96, elapsed: Duration::from_secs(14) }),
             ended: None,
+            ..Default::default()
         }));
         app.entries.push(Entry::User("[Doc 2] Compare it with their redlines and flag anything risky".into()));
         app.entries.push(Entry::Reply(Reply::default()));
@@ -3456,6 +3557,7 @@ mod tests {
         let color = |c: Color| match c {
             Color::Rgb(r, g, b) => format!("#{:02x}{:02x}{:02x}", r, g, b),
             Color::Indexed(169) => "#e55d9c".to_string(),
+            Color::Indexed(147) => "#b1b9f9".to_string(),
             Color::Reset => String::new(),
             other => format!("{:?}", other),
         };
@@ -3508,6 +3610,48 @@ mod tests {
         app.scroll(-1000);
         assert_eq!(app.scroll_back, 0);
         assert!(screen(&app, 80, 24).contains("line 59"));
+    }
+
+    #[test]
+    fn clicking_a_link_opens_it_and_dragging_over_one_copies() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.entries.push(Entry::Reply(Reply {
+            text: "Read [the docs](https://smartloop.ai/docs) first.".into(),
+            citations: vec!["Guide (https://smartloop.ai/guide)".into()],
+            ..Default::default()
+        }));
+        let text = screen(&app, 80, 24);
+        let rows: Vec<&str> = text.lines().collect();
+        let find = |wanted: &str| {
+            let y = rows.iter().position(|r| r.contains(wanted)).expect(&text);
+            let x = rows[y][..rows[y].find(wanted).unwrap()].chars().count();
+            (x as u16, y as u16)
+        };
+        let mouse = |kind, (column, row): (u16, u16)| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+        let click = |app: &mut App, at| {
+            app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), at));
+            app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), at));
+            app.opened.take().map(|(url, _)| url)
+        };
+
+        let (x, y) = find("the docs");
+        assert_eq!(click(&mut app, (x + 4, y)).as_deref(), Some("https://smartloop.ai/docs"));
+        assert_eq!(click(&mut app, find("https://smartloop.ai/docs")).as_deref(), Some("https://smartloop.ai/docs"));
+        assert_eq!(click(&mut app, find("https://smartloop.ai/guide")).as_deref(), Some("https://smartloop.ai/guide"));
+        assert_eq!(click(&mut app, find("Read")), None, "plain text opens nothing");
+        assert_eq!(app.copied, None);
+
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), (x, y)));
+        app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), (x + 7, y)));
+        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), (x + 7, y)));
+        assert_eq!(app.opened, None);
+        assert_eq!(app.copied.map(|(n, _)| n), Some(8));
+
+        app.copied = None;
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), (x, y)));
+        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), (x, y)));
+        assert!(screen(&app, 80, 24).contains("Opening https://smartloop.ai/docs"));
     }
 
     #[test]
@@ -4097,6 +4241,111 @@ mod tests {
     }
 
     #[test]
+    fn br_breaks_a_reply_line() {
+        let reply = Reply { text: "one<br>two<br>\nthree<br>\n- four".into(), ..Default::default() };
+        let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string()).collect();
+        assert_eq!(rows, ["one", "two", "three", "", "- four"]);
+    }
+
+    #[test]
+    fn links_in_tables_keep_the_borders_straight() {
+        let reply = Reply {
+            text: "| Name | Link |\n|---|---|\n\
+                   | Crates | https://crates.io/ |\n\
+                   | Docs | [https://doc.rust-lang.org/](https://doc.rust-lang.org/)<br>Language docs |\n\
+                   | Guide | see [the guide](https://example.com/a/long/guide/path) here |"
+                .into(),
+            ..Default::default()
+        };
+        let lines = reply.body(40);
+        let rows: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let text = rows.join("\n");
+        let width = |row: &String| unicode_width::UnicodeWidthStr::width(row.as_str());
+        assert!(rows.iter().all(|row| width(row) == width(&rows[0])), "{}", text);
+        assert!(!text.contains("<br>") && !text.contains("(https://crates.io") && !text.contains("(https://doc."), "{}", text);
+        assert!(text.contains("│ Language docs"), "{}", text);
+        let links = |wanted: &str| -> Vec<Option<String>> {
+            let spans = lines.iter().flat_map(|l| &l.spans).filter(|s| s.content.contains(wanted));
+            spans.map(|s| crate::links::id(s.style).and_then(crate::links::url)).collect()
+        };
+        assert_eq!(links("crates.io"), [Some("https://crates.io/".to_string())]);
+        assert_eq!(links("doc.rust-lang"), [Some("https://doc.rust-lang.org/".to_string())]);
+        // The guide's address wraps over two rows, and opens from both.
+        let guide = Some("https://example.com/a/long/guide/path".to_string());
+        assert_eq!(links("the guide"), vec![guide.clone()]);
+        assert_eq!(links("(https://example.com"), vec![guide.clone()]);
+        assert_eq!(links("/guide/path)"), [guide]);
+        assert_eq!(links(" here"), [None]);
+        let padding = lines.iter().flat_map(|l| &l.spans).filter(|s| s.content.trim().is_empty());
+        assert!(padding.into_iter().all(|s| crate::links::id(s.style).is_none()), "padding is no link");
+    }
+
+    #[test]
+    fn reply_links_and_bare_addresses_open_but_code_does_not() {
+        let reply = Reply {
+            text: "Read [the docs](https://smartloop.ai/docs), https://a.io/x_y_z*1 and `https://not.a/link`.\n\n\
+                   ```\nhttps://nor.this\n```\n\n[notes](notes.md) and [top](#top), <https://auto.link>."
+                .into(),
+            ..Default::default()
+        };
+        let lines = reply.body(200);
+        let spans: Vec<&Span> = lines.iter().flat_map(|l| &l.spans).collect();
+        let span = |wanted: &str| *spans.iter().find(|s| s.content.contains(wanted)).unwrap_or_else(|| panic!("{wanted}: {lines:?}"));
+        let link = |wanted: &str| crate::links::id(span(wanted).style).and_then(crate::links::url);
+        let text: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+
+        assert_eq!(link("the docs").as_deref(), Some("https://smartloop.ai/docs"));
+        assert_eq!(link("https://smartloop.ai/docs").as_deref(), Some("https://smartloop.ai/docs"));
+        assert_eq!(span("https://a.io").content, "https://a.io/x_y_z*1");
+        assert_eq!(link("https://a.io").as_deref(), Some("https://a.io/x_y_z*1"));
+        assert_eq!(link("https://auto.link").as_deref(), Some("https://auto.link"));
+        assert_eq!(link("not.a"), None);
+        assert_eq!(link("nor.this"), None);
+        assert_eq!(link("notes"), None);
+        assert_eq!(link("top"), None);
+        assert!(text.contains("https://a.io/x_y_z*1 and") && !text.contains("<https://auto.link>"), "{}", text);
+        assert!(text.contains("notes (notes.md)") && text.contains("top,"), "{}", text);
+        assert!(!text.contains("(https://a.io") && !text.contains("(https://auto.link"), "{}", text);
+        assert!(spans.iter().all(|s| s.style.underline_color != Some(Color::Indexed(0))), "{:?}", lines);
+    }
+
+    #[test]
+    fn replies_render_as_markdown() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.entries.push(Entry::Reply(Reply {
+            text: "## Plan\n\n- **one** step\n- `two`\n\n```rust\nfn main() {}\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |".into(),
+            ..Default::default()
+        }));
+        let text = screen(&app, 40, 30);
+        let rows: Vec<&str> = text.lines().collect();
+        let top = rows.iter().position(|r| r.starts_with("■ Plan")).expect(&text);
+        assert_eq!(
+            &rows[top..top + 14],
+            [
+                "■ Plan",
+                "",
+                "  - one step",
+                "  - two",
+                "",
+                "  fn main() {}",
+                "",
+                "  ┌───┬───┐",
+                "  │ a │ b │",
+                "  ├───┼───┤",
+                "  │ 1 │ 2 │",
+                "  ├───┼───┤",
+                "  │ 3 │ 4 │",
+                "  └───┴───┘",
+            ],
+            "{}",
+            text
+        );
+        assert!(!text.contains("**") && !text.contains("```") && !text.contains('#'), "{}", text);
+    }
+
+    #[test]
     fn conversation_logs_steps_and_status_sits_above_the_prompt() {
         let mut app = app();
         app.phase = Phase::Ready;
@@ -4109,6 +4358,7 @@ mod tests {
             citations: vec!["roadmap.pdf".into()],
             stats: Some(TurnStats { tokens: 12, elapsed: Duration::from_secs(2) }),
             ended: None,
+            ..Default::default()
         }));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         app.turn = Some(Turn {

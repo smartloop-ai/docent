@@ -11,6 +11,7 @@ mod agent;
 mod chat;
 mod docent;
 mod framework;
+mod links;
 mod mcp;
 mod progress;
 mod tui;
