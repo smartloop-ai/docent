@@ -813,7 +813,7 @@ impl App {
                     return self.entries.push(Entry::Error("No project to sync to yet".to_string()));
                 };
                 if self.sync.as_ref().is_some_and(|s| s.project == project.0) {
-                    let text = format!("Already syncing {} to project {}", root.display(), project.1);
+                    let text = format!("{} is up to date with project {}", root.display(), project.1);
                     return self.entries.push(Entry::Notice(text));
                 }
                 let confirmed = argument.is_some();
@@ -3325,7 +3325,7 @@ mod tests {
         assert!(last(&app).contains("to project notes"));
         app.input = "/sync".into();
         app.submit();
-        assert!(last(&app).contains("Already syncing"));
+        assert!(last(&app).contains("up to date with project notes"));
         // Its thread ending lets `/sync` start it again.
         let stop = app.sync.as_ref().unwrap().stop.clone();
         app.apply(AppEvent::SyncEnded(stop));

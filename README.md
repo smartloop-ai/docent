@@ -260,6 +260,14 @@ then every few seconds pushes only what was added, changed or removed:
 - Nothing is synced, and no project created, until you run `/sync`. After
   that, opening `docent` in the folder opens the chat in its project and keeps
   syncing it, until `/sync stop`.
+- The folder synced is the nearest one up from where `docent` was opened that
+  holds a `.docent/`, as git finds its repository, so opening it in a
+  subfolder of a synced project syncs the project. With none, it's the folder
+  `docent` was opened in.
+- Syncing runs while the chat is open, checking every 5 seconds and waiting
+  while the chat is answering; changes made while it's closed go on the first
+  check after it opens. `/sync` on a folder already syncing says it's up to
+  date.
 - Your home folder (or one holding it) is never synced. A first sync of more
   than 200 documents or 500 MB asks first; `/sync --yes` goes ahead.
 - **Documents** are the folder's PDF, Word, PowerPoint, Excel, CSV, Markdown
