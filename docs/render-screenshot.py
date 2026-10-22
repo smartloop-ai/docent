@@ -34,6 +34,15 @@ NAMED = {
     "DarkGray": (82, 82, 91),
 }
 
+# Which way each box character's lines run from the cell's center: up, down,
+# left, right. Tables use the square corners and joints, the welcome card the
+# round ones.
+ARMS = {
+    "│": "ud", "╭": "dr", "╮": "dl", "╰": "ur", "╯": "ul",
+    "┌": "dr", "┐": "dl", "└": "ur", "┘": "ul",
+    "├": "udr", "┤": "udl", "┬": "dlr", "┴": "ulr", "┼": "udlr",
+}
+
 
 def color(cell):
     fg = cell["fg"]
@@ -83,18 +92,20 @@ def main(source, target):
                 w = max(1, SCALE)
                 draw.line((cx, upper, cx, cy), fill=rgb, width=w)
                 draw.line((cx, cy, left + cell_w, cy), fill=rgb, width=w)
-            elif symbol in "│╭╮╰╯":
-                # Box edges meet their neighbors at the cell's center lines.
+            elif symbol in ARMS:
+                # Box edges and joints meet their neighbors at the cell's center lines.
                 w = max(1, SCALE)
                 cx, cy = left + cell_w / 2, upper + cell_h / 2
                 right, bottom = left + cell_w + 1, upper + cell_h + 1
-                if symbol == "│":
-                    draw.line((cx, upper, cx, bottom), fill=rgb, width=w)
-                else:
-                    horizontal = (cx, right) if symbol in "╭╰" else (left, cx)
-                    vertical = (cy, bottom) if symbol in "╭╮" else (upper, cy)
-                    draw.line((horizontal[0], cy, horizontal[1], cy), fill=rgb, width=w)
-                    draw.line((cx, vertical[0], cx, vertical[1]), fill=rgb, width=w)
+                arms = ARMS[symbol]
+                if "l" in arms or "r" in arms:
+                    x0 = left if "l" in arms else cx
+                    x1 = right if "r" in arms else cx
+                    draw.line((x0, cy, x1, cy), fill=rgb, width=w)
+                if "u" in arms or "d" in arms:
+                    y0 = upper if "u" in arms else cy
+                    y1 = bottom if "d" in arms else cy
+                    draw.line((cx, y0, cx, y1), fill=rgb, width=w)
             elif symbol in "─▀▄█":
                 # Block and rule characters fill their cell edge to edge.
                 if symbol == "─":

@@ -3528,9 +3528,11 @@ mod tests {
             warnings: Vec::new(),
             model: Some("sl-mini".into()),
             text: "Drafted `nda-northwind-labs.docx` from your template:\n\n\
-                   1. **Mutual NDA** between Smartloop Inc. and Northwind Labs, Inc.\n\
-                   2. **2-year term** from signing; confidentiality survives 3 years (section 5)\n\
-                   3. Governed by **California law**, venue in San Francisco (section 9)\n\n\
+                   | Clause | Terms | Section |\n\
+                   |---|---|---|\n\
+                   | **Parties** | Smartloop Inc. and Northwind Labs, Inc. | 1 |\n\
+                   | **Term** | 2 years from signing; confidentiality survives 3 | 5 |\n\
+                   | **Governing law** | California, venue in San Francisco | 9 |\n\n\
                    Signature blocks are left blank for both parties."
                 .into(),
             citations: vec!["mutual-nda-template.docx".into()],
@@ -3550,7 +3552,7 @@ mod tests {
         });
         app.input = "".into();
 
-        let (width, height) = (100, 38);
+        let (width, height) = (100, 46);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
