@@ -9,7 +9,11 @@
 //! is linked, and no project created, on its own.
 //!
 //! The project root is the nearest folder up from the working directory that
-//! holds a `.docent/`, or the working directory when none does.
+//! holds a `.docent/`, or the working directory when none does. Each machine
+//! also records the folder every project is linked to, in
+//! `~/.smartloop/docent-folders.json`, so a project keeps syncing from its
+//! own folder whichever one the chat was opened in. A project has one folder:
+//! linking it to another pauses the old one.
 //!
 //! Documents are the files under the project root with a supported extension
 //! (hidden folders, `.gitignore` and `.docentignore` are honoured). Skills are
@@ -34,6 +38,8 @@ pub const DIR: &str = ".docent";
 const MANIFEST: &str = "manifest.json";
 const SKILLS: &str = "skills";
 const IGNORE_FILE: &str = ".docentignore";
+/// The folder each project is linked to on this machine, in the install dir.
+const FOLDERS: &str = "docent-folders.json";
 /// What the agent can turn into searchable documents.
 const EXTENSIONS: [&str; 7] = ["pdf", "docx", "pptx", "xlsx", "csv", "md", "txt"];
 /// Those the agent can't read in place: they need indexing to be searched.
@@ -485,16 +491,14 @@ struct Summary {
 }
 
 impl Summary {
+    /// What changed, leaving out what didn't: `2 added, 1 removed`.
     fn line(&self) -> String {
-        let mut parts = vec![
-            format!("{} added", self.added),
-            format!("{} updated", self.updated),
-            format!("{} removed", self.removed),
-        ];
-        if self.failed > 0 {
-            parts.push(format!("{} failed", self.failed));
-        }
-        parts.join(", ")
+        [(self.added, "added"), (self.updated, "updated"), (self.removed, "removed"), (self.failed, "failed")]
+            .iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, what)| format!("{} {}", n, what))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -502,7 +506,7 @@ impl Summary {
 pub enum Event {
     /// A pass starts pushing this many changes.
     Working(usize),
-    /// How a pass ended: `2 added, 0 updated, 0 removed`.
+    /// How a pass ended: `2 added, 1 removed`.
     Summary(String),
     /// A change that didn't go through, or a pass that couldn't run.
     Failure(String),
@@ -578,7 +582,11 @@ fn sync_once(
             }
         }
     }
-    emit(Event::Summary(summary.line()));
+    // One stopped before doing anything has nothing to say.
+    let line = summary.line();
+    if !line.is_empty() {
+        emit(Event::Summary(line));
+    }
     Ok(summary)
 }
 
@@ -696,8 +704,69 @@ pub fn linked(root: &Path) -> Option<Link> {
     Some(Link { project: manifest.project?, paused: manifest.paused })
 }
 
+/// The folder `project` is linked to on this machine, paused or not; none
+/// when it was never linked, or its folder has since been linked elsewhere,
+/// unlinked or removed.
+pub fn folder(project: &str) -> Option<PathBuf> {
+    let root = Folders::load().0.remove(project)?;
+    linked(&root).is_some_and(|l| l.project == project).then_some(root)
+}
+
+/// Each project's folder, by project id.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Folders(BTreeMap<String, PathBuf>);
+
+impl Folders {
+    fn path() -> PathBuf {
+        // Each test runs on a thread of its own: keep theirs apart, and out
+        // of the real install dir.
+        if cfg!(test) {
+            let name = format!("docent-folders-{}-{:?}.json", std::process::id(), std::thread::current().id());
+            return std::env::temp_dir().join(name.replace(['(', ')'], ""));
+        }
+        crate::framework::install_dir().join(FOLDERS)
+    }
+
+    /// One unreadable starts afresh: the manifests still say what's linked.
+    fn load() -> Self {
+        fs::read_to_string(Self::path()).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+    }
+
+    fn save(&self) -> Result<(), String> {
+        let path = Self::path();
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
+        }
+        let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, text + "\n").map_err(|e| format!("Failed to write {}: {}", tmp.display(), e))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("Failed to save {}: {}", path.display(), e))
+    }
+}
+
+/// Record `root` as the folder `project` syncs from, pausing the one it
+/// synced from before; held under the sync lock.
+fn bind(root: &Path, project: &str) -> Result<(), String> {
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut folders = Folders::load();
+    if folders.0.get(project) == Some(&root) {
+        return Ok(());
+    }
+    // A folder syncs to one project: one linked to another before leaves it.
+    folders.0.retain(|_, folder| *folder != root);
+    if let Some(old) = folders.0.insert(project.to_string(), root)
+        && let Ok(mut manifest) = Manifest::load(&old)
+        && manifest.project.as_deref() == Some(project)
+        && !manifest.paused
+    {
+        manifest.paused = true;
+        manifest.save(&old)?;
+    }
+    folders.save()
+}
+
 /// Sync `root` to `project` from now on; one it synced elsewhere before
-/// starts its map afresh.
+/// starts its map afresh, and the folder `project` synced from before stops.
 pub fn link(root: &Path, project: &str) -> Result<(), String> {
     let _held = lock();
     let mut manifest = Manifest::load(root)?;
@@ -707,7 +776,8 @@ pub fn link(root: &Path, project: &str) -> Result<(), String> {
         manifest.project = Some(project.to_string());
     }
     manifest.paused = false;
-    manifest.save(root)
+    manifest.save(root)?;
+    bind(root, project)
 }
 
 /// Stop syncing `root` until it's linked again, waiting for a sync still
@@ -773,6 +843,12 @@ pub fn follow(
             ));
         }
         Err(e) => return emit(Event::Failure(e)),
+    }
+    // Linked before folders were recorded: record it now.
+    if folder(&project).is_none()
+        && let Err(e) = bind(root, &project)
+    {
+        emit(Event::Failure(e));
     }
     watch(&Remote { client, project }, root, &mut manifest, interval, idle, stop, emit)
 }
@@ -907,6 +983,39 @@ mod tests {
         // To another, it starts afresh.
         link(root, "p2").unwrap();
         assert_eq!(status(root).unwrap().documents, 0);
+    }
+
+    #[test]
+    fn a_project_syncs_from_the_one_folder_last_linked() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (fs::canonicalize(a.path()).unwrap(), fs::canonicalize(b.path()).unwrap());
+        assert!(folder("p1").is_none());
+        link(&a, "p1").unwrap();
+        assert_eq!(folder("p1"), Some(a.clone()));
+        // Paused, it's still the project's folder.
+        pause(&a).unwrap();
+        assert_eq!(folder("p1"), Some(a.clone()));
+
+        // Linked to another folder, the first one stops.
+        link(&a, "p1").unwrap();
+        link(&b, "p1").unwrap();
+        assert_eq!(folder("p1"), Some(b.clone()));
+        assert!(linked(&a).is_some_and(|l| l.project == "p1" && l.paused));
+
+        // A folder linked to another project leaves this one without.
+        link(&b, "p2").unwrap();
+        assert!(folder("p1").is_none());
+        assert_eq!(folder("p2"), Some(b.clone()));
+        // As does one removed.
+        drop(fs::remove_dir_all(&b));
+        assert!(folder("p2").is_none());
+        let _ = fs::remove_file(Folders::path());
+    }
+
+    #[test]
+    fn summary_names_only_what_changed() {
+        assert_eq!(Summary { removed: 1, ..Summary::default() }.line(), "1 removed");
+        assert_eq!(Summary { added: 2, updated: 1, failed: 1, ..Summary::default() }.line(), "2 added, 1 updated, 1 failed");
     }
 
     #[test]
