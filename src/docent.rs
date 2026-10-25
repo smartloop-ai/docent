@@ -36,6 +36,8 @@ const SKILLS: &str = "skills";
 const IGNORE_FILE: &str = ".docentignore";
 /// What the agent can turn into searchable documents.
 const EXTENSIONS: [&str; 7] = ["pdf", "docx", "pptx", "xlsx", "csv", "md", "txt"];
+/// Those the agent can't read in place: they need indexing to be searched.
+const DOCUMENTS: [&str; 4] = ["pdf", "docx", "pptx", "xlsx"];
 /// How many changes a pass pushes at once.
 const PARALLEL: usize = 4;
 /// A first sync pushing more documents than this, or more bytes, asks first.
@@ -671,6 +673,18 @@ pub fn measure(root: &Path) -> Size {
     size
 }
 
+/// The documents under `root` only a sync makes searchable, by relative
+/// path: the text ones the agent reads in place are left out.
+pub fn unsynced(root: &Path) -> Vec<String> {
+    walk(root)
+        .filter(|entry| {
+            let ext = entry.path().extension().and_then(|e| e.to_str()).unwrap_or_default();
+            DOCUMENTS.contains(&ext.to_ascii_lowercase().as_str())
+        })
+        .map(|entry| relative_key(root, entry.path()))
+        .collect()
+}
+
 /// The Smartloop project `root` syncs to, and whether its sync is paused.
 pub struct Link {
     pub project: String,
@@ -857,6 +871,18 @@ mod tests {
         assert_eq!(measure(dir.path()), Size { files: 1, bytes: 5 });
         assert!(!measure(dir.path()).large());
         assert!(Size { files: LARGE_FILES + 1, bytes: 0 }.large());
+    }
+
+    #[test]
+    fn unsynced_lists_only_documents_that_need_indexing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("docs")).unwrap();
+        fs::write(dir.path().join("README.md"), "read in place").unwrap();
+        fs::write(dir.path().join("docs/Report.PDF"), "pdf").unwrap();
+        fs::write(dir.path().join("plan.docx"), "docx").unwrap();
+        let mut found = unsynced(dir.path());
+        found.sort();
+        assert_eq!(found, ["docs/Report.PDF", "plan.docx"]);
     }
 
     #[test]
