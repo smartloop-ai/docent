@@ -27,7 +27,7 @@ pub const BANNER: [&str; 3] = [
 
 #[derive(Parser)]
 #[command(
-    name = "smartloop", 
+    name = "docent", 
     version, 
     author,
     about=format!("\n{}\n\nDocent by Smartloop: frontier quality, local first", BANNER.join("\n")),
@@ -845,16 +845,17 @@ fn main() {
         exit(code);
     }
 
-    // Installed as both `smartloop` and `docent`: name it as it was run.
-    let docent = std::env::args_os()
+    // Installed as `docent`, and as `smartloop` for those who had it under
+    // its old name: name it as it was run.
+    let smartloop = std::env::args_os()
         .next()
-        .and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s == "docent"))
+        .and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s == "smartloop"))
         .unwrap_or_default();
-    let name = if docent { "docent" } else { "smartloop" };
+    let name = if smartloop { "smartloop" } else { "docent" };
     let args = Args::from_arg_matches(&Args::command().name(name).bin_name(name).get_matches())
         .unwrap_or_else(|e| e.exit());
 
-    // Bare `smartloop` is `smartloop run`.
+    // Bare `docent` is `docent run`.
     let command = args.command.unwrap_or(Commands::Run { prompt: None, project: None, session: None, plain: false });
     match command {
         Commands::Agent { command } => match command {

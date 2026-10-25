@@ -1455,6 +1455,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "docent"
+version = "1.0.46"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "async-openai",
+ "clap",
+ "crossterm",
+ "fernet",
+ "futures-util",
+ "ignore",
+ "indicatif",
+ "prettytable-rs",
+ "pulldown-cmark",
+ "ratatui",
+ "reqwest 0.12.28",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "smartloop",
+ "sysinfo 0.39.6",
+ "tempfile",
+ "tokio",
+ "tui-markdown",
+ "unicode-width 0.2.2",
+]
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5247,9 +5276,9 @@ checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
 
 [[package]]
 name = "smartloop"
-version = "1.2.14"
+version = "1.2.15"
 source = "sparse+https://dl.smartloop.ai/crates/"
-checksum = "f27cd20cc42be912bf81d568ccf428fac6ef1ab6ad2e492ff5cb04989d71d96f"
+checksum = "0ec282ace7fec2a0eec4279d5e4d4981b6d68d5465d12d28057d2b851377cda6"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -5323,35 +5352,6 @@ dependencies = [
  "uuid",
  "walkdir",
  "zip",
-]
-
-[[package]]
-name = "smartloop-cli"
-version = "1.0.46"
-dependencies = [
- "anyhow",
- "arboard",
- "async-openai",
- "clap",
- "crossterm",
- "fernet",
- "futures-util",
- "ignore",
- "indicatif",
- "prettytable-rs",
- "pulldown-cmark",
- "ratatui",
- "reqwest 0.12.28",
- "rpassword",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "smartloop",
- "sysinfo 0.39.6",
- "tempfile",
- "tokio",
- "tui-markdown",
- "unicode-width 0.2.2",
 ]
 
 [[package]]

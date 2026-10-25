@@ -81,13 +81,17 @@ detect_target() {
 
     OS="$os_part"
     TARGET="${arch_part}-${os_part}"
+    # `smartloop` is the old name, kept as a second one so existing
+    # commands and scripts still run.
     if [ "$os_part" = "pc-windows-msvc" ]; then
         ARCHIVE_EXT="zip"
-        BIN_NAME="smartloop.exe"
+        EXE=".exe"
     else
         ARCHIVE_EXT="tar.gz"
-        BIN_NAME="smartloop"
+        EXE=""
     fi
+    BIN_NAME="docent${EXE}"
+    ALIAS_NAME="smartloop${EXE}"
 }
 
 # Latest release tag, read straight off the redirect so no JSON parser and no
@@ -223,8 +227,8 @@ add_to_path() {
     fi
 
     if [ -w "$config_file" ]; then
-        printf '\n# smartloop\n%s\n' "$command" >> "$config_file"
-        say "${MUTED}Added ${NC}smartloop${MUTED} to \$PATH in ${NC}${config_file}"
+        printf '\n# docent\n%s\n' "$command" >> "$config_file"
+        say "${MUTED}Added ${NC}docent${MUTED} to \$PATH in ${NC}${config_file}"
     else
         say "${MUTED}Manually add to ${NC}${config_file}${MUTED}:${NC}"
         say "  $command"
@@ -309,7 +313,7 @@ print_banner() {
     say ""
 }
 
-install_smartloop() {
+install_docent() {
     need curl
     need tar
 
@@ -323,20 +327,27 @@ install_smartloop() {
 
     INSTALL_DIR="${SMARTLOOP_CLI_INSTALL_DIR:-$(default_install_dir)}"
 
-    local name="smartloop-${VERSION}-${TARGET}"
-    local archive="${name}.${ARCHIVE_EXT}"
     local base_url="https://github.com/${REPO}/releases/download/v${VERSION}"
 
     say "${MUTED}The following NEW packages will be installed:${NC}"
-    say "  ${BOLD}smartloop${NC} ${MUTED}(${VERSION}, ${TARGET})${NC}"
+    say "  ${BOLD}docent${NC} ${MUTED}(${VERSION}, ${TARGET})${NC}"
 
     TMP_DIR="$(mktemp -d)"
+
+    curl -fsSL "${base_url}/SHA256SUMS" -o "${TMP_DIR}/SHA256SUMS" \
+        || error "Could not download SHA256SUMS"
+    # Releases before the rename ship `smartloop-*` archives holding a
+    # `smartloop` binary.
+    local name="docent-${VERSION}-${TARGET}" packed="$BIN_NAME"
+    if ! grep -q " ${name}.${ARCHIVE_EXT}\$" "${TMP_DIR}/SHA256SUMS"; then
+        name="smartloop-${VERSION}-${TARGET}"
+        packed="$ALIAS_NAME"
+    fi
+    local archive="${name}.${ARCHIVE_EXT}"
 
     say "${MUTED}[1/3] Downloading docent (${VERSION})${NC}"
     download_with_progress "${base_url}/${archive}" "${TMP_DIR}/${archive}" \
         "Get:1 docent ${VERSION}"
-    curl -fsSL "${base_url}/SHA256SUMS" -o "${TMP_DIR}/SHA256SUMS" \
-        || error "Could not download SHA256SUMS"
     verify_checksum "${TMP_DIR}/${archive}" "${TMP_DIR}/SHA256SUMS"
 
     say "${MUTED}[2/3] Unpacking docent (${VERSION})${NC}"
@@ -349,11 +360,17 @@ install_smartloop() {
 
     say "${MUTED}[3/3] Setting up docent (${VERSION})${NC}"
     mkdir -p "$INSTALL_DIR"
+    # Installs before the rename have `docent` as a link to `smartloop`:
+    # remove it rather than write through it.
+    rm -f "${INSTALL_DIR}/${BIN_NAME}"
+    if [ "$packed" != "$BIN_NAME" ]; then
+        mv "${TMP_DIR}/${name}/${packed}" "${TMP_DIR}/${name}/${BIN_NAME}"
+    fi
     if [ -d "${TMP_DIR}/${name}/lib" ]; then
         # Linux builds carry the Vulkan loader in lib/, found next to the real
         # binary, so the folder lives in its own place and the bin directory
         # gets symlinks.
-        local data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/smartloop"
+        local data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/docent"
         local payload="${data_dir}/${VERSION}"
         mkdir -p "$data_dir"
         rm -rf "$payload"
@@ -364,6 +381,8 @@ install_smartloop() {
         for old in "$data_dir"/*; do
             [ "$old" = "$payload" ] || rm -rf "$old"
         done
+        # As is the folder from before the rename.
+        rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/smartloop"
     else
         install -m 755 "${TMP_DIR}/${name}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null \
             || { cp "${TMP_DIR}/${name}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}" \
@@ -373,16 +392,17 @@ install_smartloop() {
     "${INSTALL_DIR}/${BIN_NAME}" --version >/dev/null 2>&1 \
         || error "Installation verification failed: 'docent --version' did not succeed"
 
-    # `docent` is the same binary under its other name: a symlink, or on
+    # `smartloop` is the same binary under its old name: a symlink, or on
     # Windows (no symlinks without admin) a copy.
+    rm -f "${INSTALL_DIR}/${ALIAS_NAME}"
     if [ "$OS" = "pc-windows-msvc" ]; then
         cp "${TMP_DIR}/${name}"/*.dll "$INSTALL_DIR"/ 2>/dev/null || true
-        cp "${INSTALL_DIR}/${BIN_NAME}" "${INSTALL_DIR}/docent.exe"
+        cp "${INSTALL_DIR}/${BIN_NAME}" "${INSTALL_DIR}/${ALIAS_NAME}"
     else
-        ln -sf "$BIN_NAME" "${INSTALL_DIR}/docent"
+        ln -sf "$BIN_NAME" "${INSTALL_DIR}/${ALIAS_NAME}"
     fi
 
-    say "${GREEN}Installed${NC} ${INSTALL_DIR}/${BIN_NAME} ${MUTED}(also as${NC} docent${MUTED})${NC}"
+    say "${GREEN}Installed${NC} ${INSTALL_DIR}/${BIN_NAME} ${MUTED}(also as${NC} smartloop${MUTED})${NC}"
 
     say "${MUTED}Processing triggers for docent (${VERSION}) ...${NC}"
     if [ "$OS" = "pc-windows-msvc" ]; then
@@ -399,4 +419,4 @@ install_smartloop() {
     print_banner
 }
 
-install_smartloop
+install_docent

@@ -1,4 +1,4 @@
-//! `smartloop run` as a full-screen app, laid out like Claude Code:
+//! `docent run` as a full-screen app, laid out like Claude Code:
 //!
 //! ```text
 //! > what is the capital of France?
@@ -152,7 +152,7 @@ enum AppEvent {
     /// A sync started pushing this many changes, or finished at 0.
     Syncing(usize),
     /// `/sync` checked the folder: link it to this project and follow it.
-    SyncLink((String, String)),
+    SyncLink(std::path::PathBuf, (String, String)),
     /// The sync that `stop` stops has ended on its own.
     SyncEnded(Arc<AtomicBool>),
     /// What the agent is doing, for the welcome card; `None` when it
@@ -621,6 +621,7 @@ struct Turn {
 /// The working directory's sync to `project`, running until `stop`.
 struct Sync {
     project: String,
+    root: std::path::PathBuf,
     stop: Arc<AtomicBool>,
 }
 
@@ -806,29 +807,33 @@ impl App {
         });
     }
 
-    /// Keep the working directory in step with the project it's linked to,
-    /// linking it to `project` first when given; a sync already running stops.
-    fn start_sync(&mut self, link: Option<(String, String)>) {
-        let Some(root) = sync_root() else { return };
+    /// Keep the current project's folder in step with it, when it has one
+    /// not paused; a sync already running stops.
+    fn follow_project(&mut self) {
+        self.stop_sync();
+        let Some(project) = self.project.clone() else { return };
+        let Some(root) = project_root(&project.0) else { return };
+        if docent::linked(&root).is_some_and(|l| !l.paused) {
+            self.start_sync(root, project, false);
+        }
+    }
+
+    /// Keep `root` in step with `project`, linking it first when `link`
+    /// says to; a sync already running stops. One away from the working
+    /// directory says where it is.
+    fn start_sync(&mut self, root: std::path::PathBuf, project: (String, String), link: bool) {
         self.stop_sync();
         let stop = Arc::new(AtomicBool::new(false));
-        let project = match &link {
-            Some((id, _)) => id.clone(),
-            None => docent::linked(&root).map(|l| l.project).unwrap_or_default(),
-        };
-        self.sync = Some(Sync { project, stop: stop.clone() });
-        if let Some((_, name)) = &link {
-            self.entries.push(Entry::Notice(format!("Syncing {} to project {}", root.display(), name)));
+        self.sync = Some(Sync { project: project.0.clone(), root: root.clone(), stop: stop.clone() });
+        if link || sync_root().is_none_or(|here| here != root) {
+            self.entries.push(Entry::Notice(format!("Syncing {} to project {}", root.display(), project.1)));
         }
         if cfg!(test) {
             return;
         }
         let busy = self.busy.clone();
         self.spawn(move |client, tx| {
-            let linked = match &link {
-                Some((id, _)) => docent::link(&root, id),
-                None => Ok(()),
-            };
+            let linked = if link { docent::link(&root, &project.0) } else { Ok(()) };
             match linked {
                 Ok(()) => {
                     let idle = || !busy.load(Ordering::Relaxed);
@@ -837,7 +842,8 @@ impl App {
                             docent::Event::Working(count) => tx.send(AppEvent::Syncing(count)),
                             docent::Event::Summary(text) => {
                                 let _ = tx.send(AppEvent::Syncing(0));
-                                tx.send(AppEvent::Notice(format!("Indexed: {}", text)))
+                                // Sent, not yet indexed: the status line shows that next.
+                                tx.send(AppEvent::Notice(format!("Synced: {}", text)))
                             }
                             docent::Event::Failure(text) => tx.send(AppEvent::Warning(format!("Sync: {}", text))),
                         };
@@ -859,26 +865,41 @@ impl App {
     }
 
     /// `/sync`: link the working directory to the current project and keep
-    /// it in step; `status` and `stop` too. A first sync of a big folder
-    /// asks for `--yes`, and the home folder is never synced.
-    fn sync_command(&mut self, argument: Option<&str>) {
-        let Some(root) = sync_root() else {
+    /// it in step; `status` and `stop` too, of the folder the project syncs
+    /// from. A first sync of a big folder asks for `--yes`, one of a project
+    /// linked to another folder for `--move`, and the home folder is never
+    /// synced.
+    fn sync_command(&mut self, arguments: &[&str]) {
+        let Some(here) = sync_root() else {
             return self.entries.push(Entry::Error("No working directory to sync".to_string()));
         };
         let current = self.project.clone();
-        match argument {
-            None | Some("--yes") => {
+        // The folder the current project syncs from, wherever it is.
+        let root = current.as_ref().and_then(|(id, _)| project_root(id)).unwrap_or_else(|| here.clone());
+        match arguments {
+            flags if flags.iter().all(|f| matches!(*f, "--yes" | "--move")) => {
+                let root = here;
                 if let Some(refusal) = docent::refusal(&root) {
                     return self.entries.push(Entry::Error(format!("Not syncing: {}", refusal)));
                 }
                 let Some(project) = current else {
                     return self.entries.push(Entry::Error("No project to sync to yet".to_string()));
                 };
-                if self.sync.as_ref().is_some_and(|s| s.project == project.0) {
+                if self.sync.as_ref().is_some_and(|s| s.project == project.0 && s.root == root) {
                     let text = format!("{} is up to date with project {}", root.display(), project.1);
                     return self.entries.push(Entry::Notice(text));
                 }
-                let confirmed = argument.is_some();
+                if let Some(other) = project_root(&project.0).filter(|other| *other != root)
+                    && !flags.contains(&"--move")
+                {
+                    return self.entries.push(Entry::Error(format!(
+                        "Project {} syncs {}; /sync --move syncs {} instead",
+                        project.1,
+                        other.display(),
+                        root.display()
+                    )));
+                }
+                let confirmed = flags.contains(&"--yes");
                 self.spawn(move |_, tx| {
                     // Pushed before, to this project: only the changes go.
                     let first = docent::linked(&root).is_none_or(|l| l.project != project.0);
@@ -893,10 +914,10 @@ impl App {
                         )));
                         return;
                     }
-                    let _ = tx.send(AppEvent::SyncLink(project));
+                    let _ = tx.send(AppEvent::SyncLink(root, project));
                 });
             }
-            Some("status") => {
+            ["status"] => {
                 let name = |id: &str| match &current {
                     Some((current, name)) if current == id => name.clone(),
                     _ => id.to_string(),
@@ -929,7 +950,8 @@ impl App {
                     Err(e) => Entry::Error(e),
                 });
             }
-            Some("stop") => {
+            ["stop"] => {
+                let root = self.sync.as_ref().map_or(root, |s| s.root.clone());
                 self.stop_sync();
                 self.syncing = 0;
                 self.spawn(move |_, tx| {
@@ -939,7 +961,10 @@ impl App {
                     });
                 });
             }
-            Some(other) => self.entries.push(Entry::Error(format!("Unknown /sync {}; try /sync status or /sync stop", other))),
+            other => self.entries.push(Entry::Error(format!(
+                "Unknown /sync {}; try /sync status or /sync stop",
+                other.join(" ")
+            ))),
         }
     }
 
@@ -1131,7 +1156,7 @@ impl App {
                     self.agent_asked = Some(Instant::now() - AGENT_EVERY);
                 }
             }
-            AppEvent::SyncLink(project) => self.start_sync(Some(project)),
+            AppEvent::SyncLink(root, project) => self.start_sync(root, project, true),
             AppEvent::SyncEnded(stop) => {
                 if self.sync.as_ref().is_some_and(|s| Arc::ptr_eq(&s.stop, &stop)) {
                     self.sync = None;
@@ -1200,17 +1225,15 @@ impl App {
                 .map(|p| (field(p, "id"), field(p, "name"))),
         };
         self.phase = Phase::Ready;
-        let unlinked = link.is_none();
-        // A folder `/sync` linked keeps syncing, until `/sync stop`.
-        if link.is_some_and(|l| !l.paused) {
-            self.start_sync(None);
-        }
         match chosen {
             Some(project) => {
-                if unlinked {
+                // Nothing here or for the project synced yet: say what /sync would add.
+                if link.is_none() && project_root(&project.0).is_none() {
                     self.hint_unsynced(project.1.clone());
                 }
                 self.project = Some(project);
+                // Its folder keeps syncing, wherever it is, until `/sync stop`.
+                self.follow_project();
                 self.load_web_search();
                 self.load_skills();
                 self.load_connections();
@@ -1273,6 +1296,7 @@ impl App {
         self.entries.push(Entry::Notice(format!("Switched to project {}", project.1)));
         let id = project.0.clone();
         self.project = Some(project);
+        self.follow_project();
         self.load_web_search();
         self.load_skills();
         self.load_connections();
@@ -1983,7 +2007,7 @@ impl App {
                     Some(_) => self.find_project(input.split_once(' ').map_or("", |(_, name)| name).trim().to_string()),
                 }
             }
-            "/sync" => self.sync_command(words.next()),
+            "/sync" => self.sync_command(&words.collect::<Vec<_>>()),
             "/help" | "/?" => self.overlay = Overlay::Help,
             "/status" => self.open_status(),
             "/usage" => self.open_usage(),
@@ -2952,7 +2976,14 @@ impl App {
 
 /// The folder `/sync` works on: the one the working directory is part of.
 fn sync_root() -> Option<std::path::PathBuf> {
-    std::env::current_dir().ok().map(|dir| docent::root(&dir))
+    let root = docent::root(&std::env::current_dir().ok()?);
+    Some(std::fs::canonicalize(&root).unwrap_or(root))
+}
+
+/// The folder `project` syncs from: the one it was last linked to, else the
+/// working directory's when that's linked to it.
+fn project_root(project: &str) -> Option<std::path::PathBuf> {
+    docent::folder(project).or_else(|| sync_root().filter(|root| docent::linked(root).is_some_and(|l| l.project == project)))
 }
 
 /// `3 documents here aren't searchable yet (a.pdf, b.docx, and 1 more)…`,
@@ -3269,7 +3300,8 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/project import <zip>", "import an exported project"),
         ("/sync", "keep this folder's documents in the project"),
         ("/sync status", "what's synced, and what's waiting"),
-        ("/sync stop", "stop syncing this folder"),
+        ("/sync --move", "sync this folder instead of the project's other one"),
+        ("/sync stop", "stop syncing the project's folder"),
         ("/status", "account, model, agent and versions"),
         ("/login", "sign in in the browser (--token to paste one)"),
         ("/logout", "log out"),
@@ -3497,7 +3529,7 @@ mod tests {
         assert!(last(&app).contains("Unknown /sync now"));
 
         app.project = Some(("p1".into(), "notes".into()));
-        app.apply(AppEvent::SyncLink(("p1".into(), "notes".into())));
+        app.apply(AppEvent::SyncLink(sync_root().unwrap(), ("p1".into(), "notes".into())));
         assert!(last(&app).contains("to project notes"));
         app.input = "/sync".into();
         app.submit();
@@ -3506,6 +3538,35 @@ mod tests {
         let stop = app.sync.as_ref().unwrap().stop.clone();
         app.apply(AppEvent::SyncEnded(stop));
         assert!(app.sync.is_none());
+    }
+
+    #[test]
+    fn a_project_syncs_from_its_own_folder_wherever_the_chat_is() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere = std::fs::canonicalize(elsewhere.path()).unwrap();
+        docent::link(&elsewhere, "p9").unwrap();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+
+        // Switched to, the project's folder syncs, and says where it is.
+        app.switch_project(("p9".into(), "Contracts".into()));
+        assert_eq!(app.sync.as_ref().map(|s| s.root.clone()), Some(elsewhere.clone()));
+        let text = format!("Syncing {} to project Contracts", elsewhere.display());
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if *n == text)));
+
+        // Here isn't linked to it without --move.
+        app.input = "/sync".into();
+        app.submit();
+        let Some(Entry::Error(e)) = app.entries.last() else { panic!("no error") };
+        assert!(e.starts_with(&format!("Project Contracts syncs {}; /sync --move syncs", elsewhere.display())), "{}", e);
+
+        // Paused, switching back to it leaves it alone.
+        docent::pause(&elsewhere).unwrap();
+        app.switch_project(("p1".into(), "Default".into()));
+        app.switch_project(("p9".into(), "Contracts".into()));
+        assert!(app.sync.is_none());
+        let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
     #[test]
