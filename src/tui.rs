@@ -155,9 +155,9 @@ enum AppEvent {
     SyncLink(std::path::PathBuf, (String, String)),
     /// The sync that `stop` stops has ended on its own.
     SyncEnded(Arc<AtomicBool>),
-    /// What the agent is doing, for the welcome card; `None` when it
-    /// doesn't answer.
-    Agent(Option<crate::AgentState>),
+    /// What the agent is doing for this project, for the welcome card;
+    /// `None` when it doesn't answer.
+    Agent(Option<String>, Option<crate::AgentState>),
     /// Who's signed in, for the welcome card; `None` when no one is.
     Account(Option<String>),
     /// The MCP servers of this project, by id, for the welcome card.
@@ -838,6 +838,10 @@ impl App {
                 Ok(()) => {
                     let idle = || !busy.load(Ordering::Relaxed);
                     docent::follow(&client, &root, SYNC_INTERVAL, &idle, &stop, &mut |event| {
+                        // Stopped, say nothing more: the project may have switched.
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
                         let _ = match event {
                             docent::Event::Working(count) => tx.send(AppEvent::Syncing(count)),
                             docent::Event::Summary(text) => {
@@ -853,7 +857,6 @@ impl App {
                     let _ = tx.send(AppEvent::Warning(format!("Sync: {}", e)));
                 }
             }
-            let _ = tx.send(AppEvent::Syncing(0));
             let _ = tx.send(AppEvent::SyncEnded(stop));
         });
     }
@@ -861,6 +864,7 @@ impl App {
     fn stop_sync(&mut self) {
         if let Some(sync) = self.sync.take() {
             sync.stop.store(true, Ordering::Relaxed);
+            self.syncing = 0;
         }
     }
 
@@ -953,7 +957,6 @@ impl App {
             ["stop"] => {
                 let root = self.sync.as_ref().map_or(root, |s| s.root.clone());
                 self.stop_sync();
-                self.syncing = 0;
                 self.spawn(move |_, tx| {
                     let _ = tx.send(match docent::pause(&root) {
                         Ok(()) => AppEvent::Notice(format!("Stopped syncing {}; /sync starts again", root.display())),
@@ -1160,9 +1163,16 @@ impl App {
             AppEvent::SyncEnded(stop) => {
                 if self.sync.as_ref().is_some_and(|s| Arc::ptr_eq(&s.stop, &stop)) {
                     self.sync = None;
+                    self.syncing = 0;
                 }
             }
-            AppEvent::Agent(state) => {
+            AppEvent::Agent(project, state) => {
+                self.agent_asked = Some(Instant::now());
+                // Asked before a switch: ask again, for this one.
+                if project.as_deref() != self.project.as_ref().map(|(id, _)| id.as_str()) {
+                    self.agent_asked = Some(Instant::now() - AGENT_EVERY);
+                    return;
+                }
                 let down = || crate::AgentState { state: "not responding".to_string(), memory: None, documents: 0, pending: 0 };
                 let state = state.unwrap_or_else(down);
                 let hinting = self.indexing_until.is_some_and(|until| Instant::now() < until);
@@ -1172,7 +1182,6 @@ impl App {
                     self.indexing_total = 0;
                 }
                 self.agent = Some(state);
-                self.agent_asked = Some(Instant::now());
             }
             // Only for the project still chatted in.
             AppEvent::Skills(project, skills) => {
@@ -1293,6 +1302,13 @@ impl App {
         self.web_search = None;
         self.skills.clear();
         self.connections = None;
+        // What the last project's documents were doing isn't this one's.
+        self.agent = None;
+        self.indexing_total = 0;
+        self.indexing_until = None;
+        if self.agent_asked.is_some() {
+            self.agent_asked = Some(Instant::now() - AGENT_EVERY);
+        }
         self.entries.push(Entry::Notice(format!("Switched to project {}", project.1)));
         let id = project.0.clone();
         self.project = Some(project);
@@ -1654,7 +1670,8 @@ impl App {
         self.agent_asked = None;
         let project = self.project.as_ref().map(|(id, _)| id.clone());
         self.spawn(move |client, tx| {
-            let _ = tx.send(AppEvent::Agent(crate::agent_state(&client, project.as_deref())));
+            let state = crate::agent_state(&client, project.as_deref());
+            let _ = tx.send(AppEvent::Agent(project, state));
         });
     }
 
@@ -3447,7 +3464,7 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 1, pending: 0 };
-        app.apply(AppEvent::Agent(Some(agent)));
+        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(agent)));
         app.entries.push(Entry::Reply(Reply::default()));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         app.turn = Some(Turn {
@@ -3497,17 +3514,17 @@ mod tests {
         app.indexing_until = None;
         assert!(!said(&app, "Indexing documents"));
         let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 1, pending: 0 };
-        app.apply(AppEvent::Agent(Some(agent)));
+        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(agent)));
         assert!(said(&app, "Indexing documents…"));
         // The count goes up as the agent gets through them.
         let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 1, pending: 7 };
-        app.apply(AppEvent::Agent(Some(agent)));
+        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(agent)));
         assert!(said(&app, "Indexing 0 of 7 documents…"));
         let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 5, pending: 3 };
-        app.apply(AppEvent::Agent(Some(agent)));
+        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(agent)));
         assert!(said(&app, "Indexing 4 of 7 documents…"));
         let agent = crate::AgentState { state: "healthy".into(), memory: None, documents: 8, pending: 0 };
-        app.apply(AppEvent::Agent(Some(agent)));
+        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(agent)));
         assert!(!said(&app, "Indexing"));
         assert_eq!(app.indexing_total, 0);
     }
@@ -3561,6 +3578,16 @@ mod tests {
         let Some(Entry::Error(e)) = app.entries.last() else { panic!("no error") };
         assert!(e.starts_with(&format!("Project Contracts syncs {}; /sync --move syncs", elsewhere.display())), "{}", e);
 
+        // Switched away, the stopped sync and what the agent said of the
+        // last project's documents don't read as this one indexing.
+        let stop = app.sync.as_ref().unwrap().stop.clone();
+        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(crate::AgentState { state: "indexing".into(), memory: None, documents: 0, pending: 2 })));
+        app.switch_project(("p1".into(), "Default".into()));
+        app.apply(AppEvent::SyncEnded(stop));
+        app.apply(AppEvent::Agent(Some("p9".into()), Some(crate::AgentState { state: "indexing".into(), memory: None, documents: 0, pending: 2 })));
+        assert!(!screen(&app, 80, 24).contains("Indexing"));
+        app.switch_project(("p9".into(), "Contracts".into()));
+
         // Paused, switching back to it leaves it alone.
         docent::pause(&elsewhere).unwrap();
         app.switch_project(("p1".into(), "Default".into()));
@@ -3607,7 +3634,7 @@ mod tests {
 
         // Filled in as the agent and the platform answer.
         let state = |state: &str| crate::AgentState { state: state.into(), memory: Some(31), documents: 5, pending: 0 };
-        app.apply(AppEvent::Agent(Some(state("healthy"))));
+        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(state("healthy"))));
         let server = |state: &str| mcp::Server {
             id: state.into(), name: state.into(), location: String::new(), state: state.into(), tools: 0, error: None,
         };
@@ -3618,16 +3645,16 @@ mod tests {
         assert!(filled.contains("project  Default"), "{}", filled);
         assert!(filled.contains(&format!("         5 docs · 2 connections {}", app.spinner())), "{}", filled);
         assert!(filled.contains("agent    ▰▰▰▱▱▱▱▱▱▱ 31% memory"), "{}", filled);
-        app.apply(AppEvent::Agent(Some(state("indexing"))));
+        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(state("indexing"))));
         assert!(screen(&app, 80, 30).contains(&format!("agent    {} ▰▰▰▱▱▱▱▱▱▱ 31% memory", app.spinner())));
-        app.apply(AppEvent::Agent(Some(crate::AgentState { memory: None, ..state("healthy") })));
+        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(crate::AgentState { memory: None, ..state("healthy") })));
         // No figure to draw: the square says it's up.
         assert!(screen(&app, 80, 30).contains("agent    ■ "));
         assert!(filled.contains("account  mehfuz@smartloop.ai"), "{}", filled);
         assert!(!filled.contains("healthy"), "{}", filled);
         app.apply(AppEvent::Account(None));
         assert!(screen(&app, 80, 30).contains("account  not signed in · /login"));
-        app.apply(AppEvent::Agent(None));
+        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), None));
         assert!(screen(&app, 80, 30).contains("agent    ■ not responding"));
         // Only as wide as what it holds, not the screen.
         let wide = screen(&app, 120, 24);

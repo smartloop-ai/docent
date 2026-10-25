@@ -712,6 +712,16 @@ pub fn folder(project: &str) -> Option<PathBuf> {
     linked(&root).is_some_and(|l| l.project == project).then_some(root)
 }
 
+/// The folder a turn of `project` works in, from `here`: the project's own,
+/// else the one `here` is part of unless that's linked to another project,
+/// whose documents aren't this one's to index.
+pub fn workspace(project: &str, here: &Path) -> Option<PathBuf> {
+    folder(project).or_else(|| {
+        let root = root(here);
+        linked(&root).is_none_or(|l| l.project == project).then(|| here.to_path_buf())
+    })
+}
+
 /// Each project's folder, by project id.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Folders(BTreeMap<String, PathBuf>);
@@ -1009,6 +1019,24 @@ mod tests {
         // As does one removed.
         drop(fs::remove_dir_all(&b));
         assert!(folder("p2").is_none());
+        let _ = fs::remove_file(Folders::path());
+    }
+
+    #[test]
+    fn a_turn_never_works_in_a_folder_linked_to_another_project() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (fs::canonicalize(a.path()).unwrap(), fs::canonicalize(b.path()).unwrap());
+        let inside = a.join("docs");
+        fs::create_dir_all(&inside).unwrap();
+        // Unlinked, the working directory is the turn's.
+        assert_eq!(workspace("p1", &inside), Some(inside.clone()));
+        link(&a, "p1").unwrap();
+        assert_eq!(workspace("p1", &inside), Some(a.clone()));
+        // Another project, without a folder of its own, gets none here.
+        assert!(workspace("p2", &inside).is_none());
+        // With one, it works there.
+        link(&b, "p2").unwrap();
+        assert_eq!(workspace("p2", &inside), Some(b.clone()));
         let _ = fs::remove_file(Folders::path());
     }
 
