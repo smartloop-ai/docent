@@ -12,7 +12,7 @@ $ErrorActionPreference = 'Stop'
 $Repo = 'smartloop-ai/docent'
 
 # Where the binary lands.  A Rust toolchain already has CARGO_HOME\bin on PATH,
-# so installing there means `smartloop` works straight away with no PATH edit.
+# so installing there means `docent` works straight away with no PATH edit.
 # Without one, fall back to our own directory -- $HOME\.smartloop is the
 # studio's data directory, so the binary sits beside it, not inside the data.
 $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
@@ -70,7 +70,7 @@ function Write-Banner {
 
 function Get-LatestVersion {
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" `
-        -Headers @{ 'User-Agent' = 'smartloop-cli-installer' }
+        -Headers @{ 'User-Agent' = 'docent-installer' }
     return $release.tag_name -replace '^v', ''
 }
 
@@ -89,26 +89,34 @@ $version = if ($env:SMARTLOOP_CLI_VERSION) {
 }
 if (-not $version) { throw 'Could not determine the latest release; set SMARTLOOP_CLI_VERSION' }
 
-$name = "smartloop-$version-$target"
-$archive = "$name.zip"
 $baseUrl = "https://github.com/$Repo/releases/download/v$version"
 
 Write-Host "${MUTED}Reading package lists... Done$NC"
 Write-Host "${MUTED}The following NEW packages will be installed:$NC"
-Write-Host "  ${BOLD}smartloop${NC} ${MUTED}($version, $target)${NC}"
+Write-Host "  ${BOLD}docent${NC} ${MUTED}($version, $target)${NC}"
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString())
 New-Item -ItemType Directory -Path $tmp | Out-Null
 
 try {
+    $sumsPath = Join-Path $tmp 'SHA256SUMS'
+    Invoke-WebRequest -Uri "$baseUrl/SHA256SUMS" -OutFile $sumsPath
+
+    # Releases before the rename ship `smartloop-*` archives holding a
+    # `smartloop.exe`.
+    $name = "docent-$version-$target"
+    $packed = 'docent.exe'
+    if (-not (Select-String -Path $sumsPath -Pattern "\s$([regex]::Escape("$name.zip"))$" -Quiet)) {
+        $name = "smartloop-$version-$target"
+        $packed = 'smartloop.exe'
+    }
+    $archive = "$name.zip"
+
     Write-Host "${MUTED}[1/3] Downloading docent ($version)${NC}"
     $archivePath = Join-Path $tmp $archive
     # Invoke-WebRequest draws its own progress bar; leave $ProgressPreference
     # at its default so the user sees it.
     Invoke-WebRequest -Uri "$baseUrl/$archive" -OutFile $archivePath
-
-    $sumsPath = Join-Path $tmp 'SHA256SUMS'
-    Invoke-WebRequest -Uri "$baseUrl/SHA256SUMS" -OutFile $sumsPath
 
     $expected = (Get-Content $sumsPath |
         Where-Object { $_ -match "\s$([regex]::Escape($archive))$" } |
@@ -123,22 +131,23 @@ try {
 
     Write-Host "${MUTED}[3/3] Setting up docent ($version)${NC}"
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Copy-Item -Path (Join-Path $tmp "$name\smartloop.exe") -Destination $InstallDir -Force
+    Copy-Item -Path (Join-Path $tmp "$name\$packed") -Destination (Join-Path $InstallDir 'docent.exe') -Force
     # The Vulkan loader and MSVC runtime the embedded agent loads, found in
     # the application directory.
     Copy-Item -Path (Join-Path $tmp "$name\*.dll") -Destination $InstallDir -Force
 
-    # `docent` is the same binary under its other name; symlinks need admin.
-    Copy-Item -Path (Join-Path $InstallDir 'smartloop.exe') -Destination (Join-Path $InstallDir 'docent.exe') -Force
+    # `smartloop` is the same binary under its old name, so existing commands
+    # and scripts still run; symlinks need admin.
+    Copy-Item -Path (Join-Path $InstallDir 'docent.exe') -Destination (Join-Path $InstallDir 'smartloop.exe') -Force
 
-    Write-Host "${GREEN}Installed${NC} $(Join-Path $InstallDir 'smartloop.exe') ${MUTED}(also as${NC} docent${MUTED})${NC}"
+    Write-Host "${GREEN}Installed${NC} $(Join-Path $InstallDir 'docent.exe') ${MUTED}(also as${NC} smartloop${MUTED})${NC}"
 
     Write-Host "${MUTED}Processing triggers for docent ($version) ...$NC"
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if ($userPath -notlike "*$InstallDir*") {
         [Environment]::SetEnvironmentVariable('Path', "$InstallDir;$userPath", 'User')
-        Write-Host "${MUTED}Added ${NC}smartloop${MUTED} to your PATH (${InstallDir})${NC}"
+        Write-Host "${MUTED}Added ${NC}docent${MUTED} to your PATH (${InstallDir})${NC}"
     }
 
     Write-Banner -Version $version -Dir $InstallDir

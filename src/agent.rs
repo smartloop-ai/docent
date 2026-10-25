@@ -123,7 +123,7 @@ mod tests {
     use super::*;
 
     fn argv(args: &[&str]) -> Vec<String> {
-        std::iter::once("smartloop").chain(args.iter().copied()).map(str::to_string).collect()
+        std::iter::once("docent").chain(args.iter().copied()).map(str::to_string).collect()
     }
 
     #[test]

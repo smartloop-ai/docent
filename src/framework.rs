@@ -28,7 +28,7 @@ const DEFAULT_DOWNLOAD_URL: &str = "https://dl.smartloop.ai";
 /// Embedding GGUF SLP loads for document search (AppSettings.embedding_gguf_file).
 const EMBEDDING_FILE: &str = "bge-m3-Q4_K_M.gguf";
 const START_TIMEOUT: Duration = Duration::from_secs(120);
-/// How long `smartloop agent stop` waits for a graceful exit before killing.
+/// How long `docent agent stop` waits for a graceful exit before killing.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `~/.smartloop`, or `SLP_HOME` when set — the same home SLP itself resolves.
@@ -383,7 +383,7 @@ fn queue_setup(list: &mut dyn Steps) -> SetupSteps {
     }
 }
 
-/// `smartloop agent start`: bring the local agent up and ready, or say it
+/// `docent agent start`: bring the local agent up and ready, or say it
 /// already is.
 pub fn start(client: &Client, base_url: &str) {
     if !ensure_running(client, base_url, true)
@@ -648,7 +648,7 @@ pub fn stop_launched() -> bool {
     true
 }
 
-/// Whether another `smartloop` is running besides this one and `agent`,
+/// Whether another `docent` is running besides this one and `agent`,
 /// whose workers (`<exe> -m <module>`) run the same binary.
 fn other_sessions(system: &System, agent: Pid) -> bool {
     let (Ok(exe), me) = (std::env::current_exe(), Pid::from_u32(std::process::id())) else { return false };
@@ -682,7 +682,7 @@ fn launch(list: &mut dyn Steps, step: usize, client: &Client) {
         .append(true)
         .open(&log_path)
         .unwrap_or_else(|e| list.fail(step, format!("Failed to open {}: {}", log_path.display(), e)));
-    let _ = writeln!(log, "\n--- Service starting from smartloop CLI (pid {}) ---", std::process::id());
+    let _ = writeln!(log, "\n--- Service starting from docent CLI (pid {}) ---", std::process::id());
     let log_err = log
         .try_clone()
         .unwrap_or_else(|e| list.fail(step, format!("Failed to open {}: {}", log_path.display(), e)));
@@ -864,7 +864,7 @@ fn process_tree(system: &System, root: Pid) -> Vec<Pid> {
     tree
 }
 
-/// `smartloop agent stop`: stop the agent by its pid.
+/// `docent agent stop`: stop the agent by its pid.
 pub fn stop() {
     let Some(pid) = find_agent(&processes()) else {
         eprintln!("Agent is not running");
@@ -969,7 +969,7 @@ mod tests {
         let served = args(&["/usr/local/bin/docent", SERVE_SUBCOMMAND, CLI_VERSION_FLAG, "1.0.34"]);
         assert_eq!(served_cli_version(&served), Some("1.0.34"));
         // Served without a version: never this build's.
-        assert_eq!(served_cli_version(&args(&["smartloop", SERVE_SUBCOMMAND])), Some(""));
+        assert_eq!(served_cli_version(&args(&["docent", SERVE_SUBCOMMAND])), Some(""));
         assert_eq!(served_cli_version(&args(&["slp", "agent", "start"])), None);
     }
 

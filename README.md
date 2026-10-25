@@ -2,7 +2,7 @@
 
 Frontier quality. Local first. Chat with your PDFs and Office files, search the web, and connect MCP servers, all from the terminal. If no local agent is running, the CLI downloads the framework and models it needs and starts one itself.
 
-It installs as both `docent` and `smartloop`; the two are the same command.
+It installs as `docent`, and as `smartloop` (its old name) so existing commands keep working; the two are the same binary.
 
 <img width="822" alt="docent run: a reply with its sources, the status line and the prompt" src="docs/tui.png" />
 
@@ -41,7 +41,7 @@ Vulkan loader bundled), macOS (Apple Silicon, signed and notarized) and
 Windows (x86_64, signed). The agent is built in, with GPU inference through
 Metal on macOS and Vulkan on Linux and Windows.
 
-On Linux the release folder goes to `~/.local/share/smartloop/<version>/`, and
+On Linux the release folder goes to `~/.local/share/docent/<version>/`, and
 the bin directory gets symlinks to it.
 
 ### From source
