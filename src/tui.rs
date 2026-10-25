@@ -613,6 +613,9 @@ struct Turn {
     tokens: u64,
     /// The latest `chat.status` message, for the status line.
     activity: Option<String>,
+    /// That message is the agent indexing the folder for this turn, which
+    /// the turn's own line already shows.
+    indexing: bool,
 }
 
 /// The working directory's sync to `project`, running until `stop`.
@@ -1019,7 +1022,7 @@ impl App {
             let result = chat::stream_turn(&chat, &message, &ids, &project, &session, &mut on).await;
             let _ = tx.send(AppEvent::TurnDone(result));
         });
-        self.turn = Some(Turn { started: Instant::now(), task, entry, tokens: 0, activity: None });
+        self.turn = Some(Turn { started: Instant::now(), task, entry, tokens: 0, activity: None, indexing: false });
         self.busy.store(true, Ordering::Relaxed);
     }
 
@@ -1301,6 +1304,7 @@ impl App {
                     reply.model = Some(name);
                 }
                 turn.activity = Some(message.trim_end_matches(['.', '…']).to_string());
+                turn.indexing = step == "index";
             }
             ChatEvent::Retrying(e) => reply.warnings.push(format!("Connection dropped, retrying: {}", e)),
         }
@@ -2258,8 +2262,10 @@ impl App {
             }
             _ => {}
         }
-        let indexing = self.agent.as_ref().is_some_and(|a| a.state == "indexing")
-            || self.indexing_until.is_some_and(|until| Instant::now() < until);
+        // Not while the turn's own line is reporting the same indexing.
+        let indexing = (self.agent.as_ref().is_some_and(|a| a.state == "indexing")
+            || self.indexing_until.is_some_and(|until| Instant::now() < until))
+            && !self.turn.as_ref().is_some_and(|turn| turn.indexing);
         if matches!(self.phase, Phase::Ready) && (self.syncing > 0 || indexing) {
             // Counts up to what was pushed, as the agent gets through it.
             let left = if self.syncing > 0 { self.syncing } else { self.agent.as_ref().map_or(0, |a| a.pending) };
@@ -3405,6 +3411,33 @@ mod tests {
     }
 
     #[test]
+    fn indexing_for_the_turn_shows_on_the_turns_line_only() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 1, pending: 0 };
+        app.apply(AppEvent::Agent(Some(agent)));
+        app.entries.push(Entry::Reply(Reply::default()));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        app.turn = Some(Turn {
+            started: Instant::now(),
+            task: runtime.spawn(async {}),
+            entry: app.entries.len() - 1,
+            tokens: 0,
+            activity: None,
+            indexing: false,
+        });
+        app.chat_event(ChatEvent::Status { step: "index".into(), message: "Reading Testamento ejemplo.pdf".into() });
+
+        let shown = screen(&app, 80, 24);
+        assert!(shown.contains("Reading Testamento ejemplo.pdf…"));
+        assert!(!shown.contains("Indexing documents"));
+
+        // Past indexing, a background pass shows again.
+        app.chat_event(ChatEvent::Status { step: "explore".into(), message: "Searching documents".into() });
+        assert!(screen(&app, 80, 24).contains("Indexing documents…"));
+    }
+
+    #[test]
     fn hints_at_documents_only_a_sync_makes_searchable() {
         assert_eq!(unsynced_hint(&[], "Docs"), None);
         assert_eq!(
@@ -3592,6 +3625,7 @@ mod tests {
             entry: 3,
             tokens: 0,
             activity: Some("Reading northwind-redlines.pdf".into()),
+            indexing: false,
         });
         app.input = "".into();
 
@@ -3910,7 +3944,7 @@ mod tests {
         // still running stops: its session is gone.
         let runtime = tokio::runtime::Runtime::new().unwrap();
         app.entries.push(Entry::Reply(Reply::default()));
-        app.turn = Some(Turn { started: Instant::now(), task: runtime.spawn(async {}), entry: app.entries.len() - 1, tokens: 0, activity: None });
+        app.turn = Some(Turn { started: Instant::now(), task: runtime.spawn(async {}), entry: app.entries.len() - 1, tokens: 0, activity: None, indexing: false });
         app.apply(AppEvent::SwitchProject(Project::from_json(&project("p4", "Contracts", false))));
         assert!(app.turn.is_none());
         assert_eq!(app.project, Some(("p4".into(), "Contracts".into())));
@@ -4412,6 +4446,7 @@ mod tests {
             entry: 1,
             tokens: 40,
             activity: Some("Reading roadmap.pdf".into()),
+            indexing: false,
         });
         let text = screen(&app, 80, 24);
         let rows: Vec<&str> = text.lines().collect();

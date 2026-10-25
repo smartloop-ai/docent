@@ -101,11 +101,15 @@ async fn stream_turn_once(
     if !attachments.is_empty() {
         user["attachments"] = serde_json::json!(attachments);
     }
+    // The folder the turn works in: the agent binds the project to it on
+    // first use, then indexes and explores it.
+    let cwd = std::env::current_dir().ok().map(|dir| dir.to_string_lossy().into_owned());
     let body = serde_json::json!({
         "model": "sl-mini",
         "messages": [user],
         "session_id": session_id,
         "project_id": project_id,
+        "cwd": cwd,
         "stream": true,
     });
 
