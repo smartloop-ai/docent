@@ -571,9 +571,10 @@ fn describe_agent(health: &serde_json::Value, documents: Option<&[serde_json::Va
     // `/health` counts only what's still queued; a document being converted
     // or indexed has left the queue.
     let busy = documents.unwrap_or_default().iter().any(on_the_way);
+    // The agent's workspace scan runs from startup, whether or not a folder
+    // is synced, so on its own it isn't documents going in.
     let queued = indexing["queued"].as_u64().unwrap_or_default() > 0;
-    let scanning = indexing["workspace"]["scanning"].as_bool().unwrap_or_default();
-    if busy || queued || scanning { "indexing" } else { "healthy" }.to_string()
+    if busy || queued { "indexing" } else { "healthy" }.to_string()
 }
 
 /// The project's own skills, as `(name, description)`: the agent runs one
@@ -904,7 +905,7 @@ mod tests {
         assert_eq!(describe_agent(&idle, Some(&docs(&["pending"]))), "indexing");
         assert_eq!(describe_agent(&health(json!({ "status": "running", "queued": 3 })), None), "indexing");
         let scanning = health(json!({ "status": "running", "queued": 0, "workspace": { "scanning": true } }));
-        assert_eq!(describe_agent(&scanning, Some(&[])), "indexing");
+        assert_eq!(describe_agent(&scanning, Some(&[])), "healthy");
         assert_eq!(describe_agent(&health(json!({ "status": "failed" })), None), "indexing failed");
     }
 
