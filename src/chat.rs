@@ -103,9 +103,11 @@ async fn stream_turn_once(
     }
     // The folder the turn works in: the agent binds the project to it on
     // first use, then indexes and explores it. That's the folder the project
-    // syncs from, when it has one, wherever the chat was opened.
-    let cwd = crate::docent::folder(project_id)
-        .or_else(|| std::env::current_dir().ok())
+    // syncs from, when it has one, wherever the chat was opened; never one
+    // linked to another project.
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|here| crate::docent::workspace(project_id, &here))
         .map(|dir| dir.to_string_lossy().into_owned());
     let body = serde_json::json!({
         "model": "sl-mini",
