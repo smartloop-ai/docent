@@ -1197,12 +1197,16 @@ impl App {
                 .map(|p| (field(p, "id"), field(p, "name"))),
         };
         self.phase = Phase::Ready;
+        let unlinked = link.is_none();
         // A folder `/sync` linked keeps syncing, until `/sync stop`.
         if link.is_some_and(|l| !l.paused) {
             self.start_sync(None);
         }
         match chosen {
             Some(project) => {
+                if unlinked {
+                    self.hint_unsynced(project.1.clone());
+                }
                 self.project = Some(project);
                 self.load_web_search();
                 self.load_skills();
@@ -1214,6 +1218,18 @@ impl App {
             }
             None => self.entries.push(Entry::Error("No projects found; create one with /project new <name>".to_string())),
         }
+    }
+
+    /// Point out the documents in a folder never synced, which the agent
+    /// can't search until `/sync` indexes them.
+    fn hint_unsynced(&self, project: String) {
+        let Some(root) = sync_root().filter(|root| docent::refusal(root).is_none()) else { return };
+        self.spawn(move |_, tx| {
+            let found = docent::unsynced(&root);
+            if let Some(text) = unsynced_hint(&found, &project) {
+                let _ = tx.send(AppEvent::Notice(text));
+            }
+        });
     }
 
     /// Fill the `/project` panel: on opening, the current project selected;
@@ -2933,6 +2949,19 @@ fn sync_root() -> Option<std::path::PathBuf> {
     std::env::current_dir().ok().map(|dir| docent::root(&dir))
 }
 
+/// `3 documents here aren't searchable yet (a.pdf, b.docx, and 1 more)…`,
+/// or nothing when there are none.
+fn unsynced_hint(found: &[String], project: &str) -> Option<String> {
+    let n = found.len();
+    if n == 0 {
+        return None;
+    }
+    let shown = found.iter().take(2).cloned().collect::<Vec<_>>().join(", ");
+    let more = if n > 2 { format!(", and {} more", n - 2) } else { String::new() };
+    let (noun, verb) = if n == 1 { ("document", "isn't") } else { ("documents", "aren't") };
+    Some(format!("{n} {noun} here {verb} searchable yet ({shown}{more}); /sync adds them to project {project}"))
+}
+
 /// A reply as Claude Code lays one out: the answer under a `■` (square, like the setup blocks), its
 /// sources, then `⎿` with the model that answered and how it went.
 fn reply_lines(reply: &Reply, width: u16, lines: &mut Vec<Line<'static>>) {
@@ -3373,6 +3402,20 @@ mod tests {
 
     fn app() -> App {
         App::new(Client::new(), None, None, Some("cli-test".to_string()))
+    }
+
+    #[test]
+    fn hints_at_documents_only_a_sync_makes_searchable() {
+        assert_eq!(unsynced_hint(&[], "Docs"), None);
+        assert_eq!(
+            unsynced_hint(&["a.pdf".into()], "Docs").unwrap(),
+            "1 document here isn't searchable yet (a.pdf); /sync adds them to project Docs"
+        );
+        let found: Vec<String> = ["a.pdf", "b.docx", "c.pptx", "d.xlsx"].map(String::from).into();
+        assert_eq!(
+            unsynced_hint(&found, "Docs").unwrap(),
+            "4 documents here aren't searchable yet (a.pdf, b.docx, and 2 more); /sync adds them to project Docs"
+        );
     }
 
     #[test]
