@@ -216,6 +216,7 @@ On exit it prints the session id, to resume with `--session`.
 | `/upgrade` | Pro plan: 1,000 web searches a month |
 | `/clear` | clear the chat and start a new session |
 | `/<skill> [prompt]` | run one of the project's skills; `/` lists them with the commands |
+| `!<command>` | run a shell command in the working directory; its output goes to the agent with your next prompt, so it stays in the session |
 | `/help`, `/quit` | |
 
 Pass an initial prompt to send immediately:
@@ -276,6 +277,20 @@ then every few seconds pushes only what was added, changed or removed:
   and text files. Hidden folders, `.gitignore` and a `.docentignore` (same
   syntax) keep files out. A document in a subfolder is stored flat, as
   `docs__guide.pdf`.
+- **`.docentignore`** keeps files out of the project without keeping them out
+  of git. Put it in the synced folder (or any folder under it, for that
+  folder's files) and list paths or patterns, one per line, as in
+  `.gitignore`:
+
+  ```
+  README.md
+  drafts/
+  *.csv
+  ```
+
+  A file ignored after it was synced is deleted from the project on the next
+  pass, as if it had been removed; take it out of `.docentignore` to push it
+  again.
 - **Skills** are `.docent/skills/<name>.md` or `.docent/skills/<name>/SKILL.md`,
   with optional `name:` and `description:` frontmatter. They are what you
   commit from `.docent/`; the manifest is kept out of git by
@@ -283,6 +298,14 @@ then every few seconds pushes only what was added, changed or removed:
 - While it pushes, a note appears in the chat when something was pushed, a
   warning when something failed, and a line above the prompt says "Indexing N
   documents", counting down as the agent gets through them.
+- A document the project already has, by content, is taken up rather than
+  pushed again, so a fresh `.docent/` (or a lost manifest) doesn't upload the
+  folder twice. A first sync also says which documents the project has that
+  aren't in the folder; it leaves those alone, as they may have come from
+  elsewhere.
+- A document removed or changed before the project has registered its
+  upload waits until the project lists it, then is deleted or replaced, so no
+  copy is left behind.
 - A document or skill deleted at Smartloop is pushed again on the next pass.
   If the project itself is deleted, syncing stops; `/sync` links the folder to
   the current project instead.

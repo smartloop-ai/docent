@@ -164,6 +164,8 @@ enum AppEvent {
     Connections(String, Vec<mcp::Server>),
     /// The skills of this project, by id, for the slash-command hints.
     Skills(String, Vec<(String, String)>),
+    /// A `!command` finished: its run's id, its output and exit code.
+    Shell(usize, String, Option<i32>),
 }
 
 /// One `Steps` call, carried from a worker thread to the app.
@@ -503,9 +505,17 @@ struct Download {
 enum Entry {
     User(String),
     Reply(Reply),
+    Shell(Shell),
     Notice(String),
     Warning(String),
     Error(String),
+}
+
+/// A `!command` run in the working directory, with its output once done.
+struct Shell {
+    id: usize,
+    command: String,
+    output: Option<(String, Option<i32>)>,
 }
 
 /// One answer as it streams in. The agent's steps show on the status line
@@ -670,6 +680,11 @@ struct App {
     /// Files dropped on the prompt, each shown there as a chip such as
     /// `[Image 1]` until the message is sent.
     attachments: Vec<Attachment>,
+    /// `!command` runs not yet sent: the next prompt carries them to the
+    /// agent, so they stay in the session's history.
+    shell_context: Vec<String>,
+    /// Ids for `!command` runs, so each result finds its entry.
+    shell_runs: usize,
     /// The highlighted slash-command hint while typing a command.
     hint_at: usize,
     /// The project's skills as `(name, description)`, hinted and run as
@@ -735,6 +750,8 @@ impl App {
             ticks: 0,
             token_entry: false,
             attachments: Vec::new(),
+            shell_context: Vec::new(),
+            shell_runs: 0,
             hint_at: 0,
             skills: Vec::new(),
             agent: None,
@@ -850,6 +867,7 @@ impl App {
                                 tx.send(AppEvent::Notice(format!("Synced: {}", text)))
                             }
                             docent::Event::Failure(text) => tx.send(AppEvent::Warning(format!("Sync: {}", text))),
+                            docent::Event::Note(text) => tx.send(AppEvent::Notice(format!("Sync: {}", text))),
                         };
                     });
                 }
@@ -1054,6 +1072,22 @@ impl App {
         self.busy.store(true, Ordering::Relaxed);
     }
 
+    /// Run `command` with the shell in the working directory, showing its
+    /// output as it ends.
+    fn run_shell(&mut self, command: String) {
+        if command.is_empty() {
+            return self.entries.push(Entry::Error("Give a command to run: !<command>".to_string()));
+        }
+        self.shell_runs += 1;
+        let id = self.shell_runs;
+        self.entries.push(Entry::Shell(Shell { id, command: command.clone(), output: None }));
+        self.scroll_back = 0;
+        self.spawn(move |_, tx| {
+            let (output, code) = run_command(&command);
+            let _ = tx.send(AppEvent::Shell(id, output, code));
+        });
+    }
+
     fn stop_turn(&mut self) {
         if let Some(turn) = self.turn.take() {
             self.busy.store(false, Ordering::Relaxed);
@@ -1138,6 +1172,16 @@ impl App {
                 }
             }
             AppEvent::Error(text) => self.entries.push(Entry::Error(text)),
+            AppEvent::Shell(id, output, code) => {
+                // Gone with a /clear: nothing to show or keep.
+                let Some(Entry::Shell(shell)) =
+                    self.entries.iter_mut().find(|e| matches!(e, Entry::Shell(s) if s.id == id))
+                else {
+                    return;
+                };
+                self.shell_context.push(shell_context(&shell.command, &output, code));
+                shell.output = Some((output, code));
+            }
             AppEvent::Usage(usage) => {
                 self.search = usage;
                 if let Overlay::Usage { loading, .. } = &mut self.overlay {
@@ -2038,9 +2082,13 @@ impl App {
                 self.stop_turn();
                 self.entries.clear();
                 self.attachments.clear();
+                self.shell_context.clear();
                 self.session = chat::new_session_id();
                 self.scroll_back = 0;
             }
+            // `!command` runs in the working directory, its output kept for
+            // the agent with the next prompt.
+            _ if input.starts_with('!') => self.run_shell(input[1..].trim().to_string()),
             // `/<skill>` goes to the agent, which runs that skill.
             _ if command.starts_with('/') && !self.is_skill(command) => {
                 self.entries.push(Entry::Error(format!("Unknown command {}; try /help", command)));
@@ -2057,6 +2105,9 @@ impl App {
                 let mut message = input.clone();
                 for file in &files {
                     message = message.replace(&file.label, &file.name());
+                }
+                if !self.shell_context.is_empty() {
+                    message = format!("{}\n\n{}", std::mem::take(&mut self.shell_context).join("\n\n"), message);
                 }
                 self.send_turn(input.clone(), message, files);
             }
@@ -2522,6 +2573,7 @@ impl App {
                     }
                 }
                 Entry::Reply(reply) => reply_lines(reply, area.width, &mut lines),
+                Entry::Shell(shell) => shell_lines(shell, self.spinner(), &mut lines),
                 Entry::Notice(text) => lines.push(Line::from(vec![
                     Span::styled("■ ", Style::new().fg(Color::Green)),
                     Span::raw(text.clone()),
@@ -2551,8 +2603,11 @@ impl App {
     }
 
     fn draw_input(&self, frame: &mut Frame, area: Rect) {
-        // Between two rules across the screen, as in Claude Code.
-        let block = Block::new().borders(Borders::TOP | Borders::BOTTOM).border_style(dim());
+        // Between two rules across the screen, as in Claude Code; in the
+        // brand color while a `!command` is typed, as it runs in the shell.
+        let shell = !self.token_entry && self.input.starts_with('!');
+        let rules = if shell { Style::new().fg(pink()) } else { dim() };
+        let block = Block::new().borders(Borders::TOP | Borders::BOTTOM).border_style(rules);
         let inner = block.inner(area);
         let ready = matches!(self.phase, Phase::Ready) && self.project.is_some();
         let label = if self.token_entry { "token: " } else { "> " };
@@ -3060,6 +3115,64 @@ fn selected_model(message: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Lines of output a `!command` shows, from its end; the agent gets more.
+const SHELL_SHOWN: usize = 20;
+/// Characters of output the agent gets, from its end.
+const SHELL_KEPT: usize = 8000;
+
+/// Run `command` with the platform's shell, its stdin closed: stdout then
+/// stderr, and the exit code (none when killed by a signal).
+fn run_command(command: &str) -> (String, Option<i32>) {
+    let mut shell = if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C");
+        c
+    } else {
+        let mut c = std::process::Command::new(std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()));
+        c.arg("-c");
+        c
+    };
+    match shell.arg(command).stdin(std::process::Stdio::null()).output() {
+        Ok(out) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            (text.trim_end().to_string(), out.status.code())
+        }
+        Err(e) => (format!("Failed to run: {}", e), None),
+    }
+}
+
+/// What the agent is told of a `!command` run, ahead of the next prompt.
+fn shell_context(command: &str, output: &str, code: Option<i32>) -> String {
+    let start = output.char_indices().rev().nth(SHELL_KEPT - 1).map_or(0, |(i, _)| i);
+    let cut = if start > 0 { "(earlier output cut)\n" } else { "" };
+    let ended = code.map_or_else(|| "was stopped".to_string(), |c| format!("exited with {}", c));
+    format!("I ran `{}` in the shell; it {}:\n```\n{}{}\n```", command, ended, cut, &output[start..])
+}
+
+fn shell_lines(shell: &Shell, spinner: &str, lines: &mut Vec<Line<'static>>) {
+    let mark = match &shell.output {
+        None => Span::styled(format!("{} ", spinner), Style::new().fg(Color::Cyan)),
+        Some((_, Some(0))) => Span::styled("! ", Style::new().fg(Color::Cyan).bold()),
+        Some(_) => Span::styled("! ", Style::new().fg(Color::Red).bold()),
+    };
+    lines.push(Line::from(vec![mark, Span::styled(shell.command.clone(), key_style())]));
+    let Some((output, code)) = &shell.output else { return };
+    let all: Vec<&str> = output.lines().collect();
+    let skipped = all.len().saturating_sub(SHELL_SHOWN);
+    if skipped > 0 {
+        lines.push(Line::from(Span::styled(format!("  … {} earlier lines", skipped), dim())));
+    }
+    for line in &all[skipped..] {
+        lines.push(Line::from(Span::styled(format!("  {}", line), dim())));
+    }
+    match code {
+        Some(0) => {}
+        Some(c) => lines.push(Line::from(Span::styled(format!("  exited with {}", c), Style::new().fg(Color::Red)))),
+        None => lines.push(Line::from(Span::styled("  stopped", Style::new().fg(Color::Red)))),
+    }
+}
+
 fn error_line(text: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled("■ ", Style::new().fg(Color::Red)),
@@ -3326,6 +3439,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/upgrade", "Pro plan: 1,000 web searches a month"),
         ("/clear", "clear the chat and start a new session"),
         ("/<skill> [prompt]", "run one of the project's skills"),
+        ("!<command>", "run a shell command; the next prompt shares its output"),
         ("[ctrl+c] /quit", "quit"),
     ];
     rows.iter()
@@ -3594,6 +3708,57 @@ mod tests {
         app.switch_project(("p9".into(), "Contracts".into()));
         assert!(app.sync.is_none());
         let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn a_bang_command_runs_and_its_output_rides_with_the_next_prompt() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.input = "!echo hello".into();
+        app.submit();
+        assert_eq!(app.history, vec!["!echo hello".to_string()]);
+        let Some(Entry::Shell(shell)) = app.entries.last() else { panic!("no shell entry") };
+        assert_eq!(shell.command, "echo hello");
+        let (output, code) = run_command("echo hello");
+        assert_eq!((output.as_str(), code), ("hello", Some(0)));
+        app.apply(AppEvent::Shell(shell.id, output, code));
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("! echo hello") && text.contains("  hello"), "{}", text);
+        assert_eq!(app.shell_context, vec!["I ran `echo hello` in the shell; it exited with 0:\n```\nhello\n```"]);
+        // A /clear drops what wasn't sent, and a result arriving after it.
+        app.input = "/clear".into();
+        app.submit();
+        app.apply(AppEvent::Shell(1, "late".into(), Some(0)));
+        assert!(app.shell_context.is_empty() && app.entries.is_empty());
+    }
+
+    #[test]
+    fn the_prompt_rules_turn_pink_while_a_bang_command_is_typed() {
+        let rule_colors = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..12).filter(|&y| buffer[(0, y)].symbol() == "─").map(|y| buffer[(0, y)].fg).collect::<Vec<_>>()
+        };
+        let mut app = app();
+        app.phase = Phase::Ready;
+        assert!(rule_colors(&app).iter().all(|&c| c != pink()));
+        app.input = "!ls".into();
+        let colors = rule_colors(&app);
+        assert!(colors.len() >= 2 && colors.iter().rev().take(2).all(|&c| c == pink()), "{:?}", colors);
+    }
+
+    #[test]
+    fn a_failed_bang_command_shows_its_exit_code_and_keeps_the_tail() {
+        let (output, code) = run_command("echo oops >&2; exit 3");
+        assert_eq!((output.as_str(), code), ("oops", Some(3)));
+        let long = "z".repeat(SHELL_KEPT + 10);
+        let kept = shell_context("cat big", &long, Some(0));
+        assert!(kept.contains("(earlier output cut)\n") && kept.matches('z').count() == SHELL_KEPT, "{}", kept.len());
+        let mut lines = Vec::new();
+        let shell = Shell { id: 1, command: "false".into(), output: Some(("".into(), Some(1))) };
+        shell_lines(&shell, "", &mut lines);
+        assert!(lines.iter().any(|l| l.to_string() == "  exited with 1"));
     }
 
     #[test]

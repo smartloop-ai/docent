@@ -30,6 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use reqwest::blocking::{Client, multipart};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use md5::Md5;
 use sha2::{Digest, Sha256};
 
 use crate::{error_message, projects_url, request_json, try_fetch_projects};
@@ -158,9 +159,18 @@ fn relative_key(base: &Path, path: &Path) -> String {
 }
 
 fn hash_file(path: &Path) -> std::io::Result<String> {
-    let mut hasher = Sha256::new();
+    hex_digest::<Sha256>(path)
+}
+
+fn hex_digest<D: Digest + std::io::Write>(path: &Path) -> std::io::Result<String> {
+    let mut hasher = D::new();
     std::io::copy(&mut fs::File::open(path)?, &mut hasher)?;
     Ok(hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+/// The id the project gives a document: the MD5 of its content.
+fn document_id(path: &Path) -> std::io::Result<String> {
+    hex_digest::<Md5>(path)
 }
 
 fn found(path: &Path, known: Option<&Entry>) -> std::io::Result<Found> {
@@ -315,16 +325,15 @@ impl Remote<'_> {
     }
 
     /// Delete the document stored under `name`; one the project no longer
-    /// has counts as deleted.
-    fn delete_document(&self, name: &str) -> Result<(), String> {
-        let stored = |doc: &Value| {
-            let file = doc["path"].as_str().and_then(|p| Path::new(p).file_name()?.to_str().map(str::to_string));
-            file.or_else(|| doc["filename"].as_str().map(str::to_string))
-        };
+    /// has counts as deleted. False when it's there but not yet registered,
+    /// so it has no id to delete it by.
+    fn delete_document(&self, name: &str) -> Result<bool, String> {
         let documents = self.documents()?;
-        let Some(id) = documents.iter().find(|d| stored(d).as_deref() == Some(name)).and_then(|d| d["id"].as_str())
-        else {
-            return Ok(());
+        let Some(document) = documents.iter().find(|d| stored_name(d).as_deref() == Some(name)) else {
+            return Ok(true);
+        };
+        let Some(id) = document["id"].as_str() else {
+            return Ok(false);
         };
         let action = format!("delete {}", name);
         let response = self
@@ -333,7 +342,7 @@ impl Remote<'_> {
             .send()
             .map_err(|e| format!("Failed to {}: {}", action, e))?;
         if response.status().is_success() || response.status() == 404 {
-            Ok(())
+            Ok(true)
         } else {
             Err(error_message(&action, response))
         }
@@ -378,23 +387,91 @@ impl Remote<'_> {
     }
 }
 
+/// The name a listed document is stored under in the project's inbox.
+fn stored_name(document: &Value) -> Option<String> {
+    let file = document["path"].as_str().and_then(|p| Path::new(p).file_name()?.to_str().map(str::to_string));
+    file.or_else(|| document["filename"].as_str().map(str::to_string))
+}
+
 /// Entries the project no longer has are dropped from the manifest, so the
 /// next diff adds them again. A document counts as gone only once the project
 /// has listed it: the agent registers an upload when it next scans its inbox,
 /// which takes as long as the indexing ahead of it, and pushing one again
 /// before then would only index it twice.
-fn forget_missing(manifest: &mut Manifest, remote: &Remote) -> Result<(), String> {
-    let stored: HashSet<String> = remote
-        .documents()?
-        .iter()
-        .filter_map(|d| d["path"].as_str().and_then(|p| Path::new(p).file_name()?.to_str().map(str::to_string)))
-        .collect();
+fn forget_missing(manifest: &mut Manifest, listed: &[Value], remote: &Remote) -> Result<(), String> {
+    // Registered is listed with an id: an upload still waiting in the inbox
+    // is listed without one, and can't be deleted yet.
+    let stored: HashSet<String> = listed.iter().filter(|d| d["id"].is_string()).filter_map(stored_name).collect();
     reconcile(&mut manifest.documents, &stored);
 
     let ids: HashSet<String> =
         remote.skills()?.iter().filter_map(|s| s["id"].as_str().map(str::to_string)).collect();
     manifest.skills.retain(|_, e| ids.contains(&e.remote));
     Ok(())
+}
+
+/// Take up the documents to add that the project has already, by content,
+/// as a map lost or made afresh leaves them: recorded, not pushed again,
+/// where an upload would only sit beside them never registered. Returns how
+/// many it took up.
+fn adopt(
+    manifest: &mut Manifest,
+    listed: &[Value],
+    changes: &mut Vec<(String, Change)>,
+    found: &BTreeMap<String, Found>,
+) -> usize {
+    let ids: BTreeMap<&str, String> =
+        listed.iter().filter_map(|d| Some((d["id"].as_str()?, stored_name(d)?))).collect();
+    if ids.is_empty() {
+        return 0;
+    }
+    // One document is tracked once: a second copy here is pushed as usual.
+    let mut taken: HashSet<String> = manifest.documents.values().map(|e| e.remote.clone()).collect();
+    let before = changes.len();
+    changes.retain(|(key, change)| {
+        let Some(file) = found.get(key).filter(|_| *change == Change::Add) else { return true };
+        let Some(name) = document_id(&file.path).ok().and_then(|id| ids.get(id.as_str())) else { return true };
+        if !taken.insert(name.clone()) {
+            return true;
+        }
+        let entry = Entry {
+            hash: file.hash.clone(),
+            size: file.size,
+            mtime: file.mtime,
+            remote: name.clone(),
+            synced_at: now(),
+            registered: true,
+        };
+        manifest.documents.insert(key.clone(), entry);
+        false
+    });
+    before - changes.len()
+}
+
+/// `2 documents in the project aren't in this folder (a.pdf, b.md)`: those
+/// it has that nothing here tracks or is about to replace, said on a first
+/// sync and left alone, as they may have come from elsewhere.
+fn strays(manifest: &Manifest, listed: &[Value], changes: &[(String, Change)]) -> Option<String> {
+    let tracked: HashSet<String> = manifest
+        .documents
+        .values()
+        .map(|e| e.remote.clone())
+        .chain(changes.iter().map(|(key, _)| remote_name(key)))
+        .collect();
+    let names: Vec<String> = listed
+        .iter()
+        .filter(|d| d["id"].is_string())
+        .filter_map(stored_name)
+        .filter(|name| !tracked.contains(name))
+        .collect();
+    let n = names.len();
+    if n == 0 {
+        return None;
+    }
+    let shown = names.iter().take(2).cloned().collect::<Vec<_>>().join(", ");
+    let more = if n > 2 { format!(", and {} more", n - 2) } else { String::new() };
+    let (noun, verb, them) = if n == 1 { ("document", "isn't", "it") } else { ("documents", "aren't", "them") };
+    Some(format!("{n} {noun} in the project {verb} in this folder ({shown}{more}); sync leaves {them} be"))
 }
 
 /// Mark the documents the project lists as registered, and drop those it
@@ -425,7 +502,10 @@ fn push(
 
     Ok(match (skill, change) {
         (false, Change::Remove) => {
-            remote.delete_document(old.unwrap_or_default())?;
+            let name = old.unwrap_or_default();
+            if !remote.delete_document(name)? {
+                return Err(format!("{} isn't registered yet; it's deleted once it is", name));
+            }
             None
         }
         (true, Change::Remove) => {
@@ -433,8 +513,10 @@ fn push(
             None
         }
         (false, _) => {
+            // A changed document goes in again under the same name. One the
+            // project has by name only isn't this folder's to replace: it
+            // may have come from elsewhere, and the upload goes in beside it.
             if let Some(name) = old {
-                // A changed document goes in again under the same name.
                 remote.delete_document(name)?;
             }
             Some(remote.upload(root, &file.ok_or("File vanished")?.path, &remote_name(key))?)
@@ -472,11 +554,21 @@ fn record(
     manifest.save(root)
 }
 
+/// A document's upload not yet registered can't be found to delete: one
+/// changed or removed meanwhile waits until the project lists it, or the old
+/// upload would stay in the project with nothing tracking it.
+fn settled(documents: Vec<(String, Change)>, known: &BTreeMap<String, Entry>) -> Vec<(String, Change)> {
+    documents
+        .into_iter()
+        .filter(|(key, change)| *change == Change::Add || known.get(key).is_none_or(|e| e.registered))
+        .collect()
+}
+
 fn plan(root: &Path, manifest: &Manifest) -> (Plan, BTreeMap<String, Found>, BTreeMap<String, Found>) {
     let documents = scan_documents(root, &manifest.documents);
     let skills = scan_skills(root);
     let plan = Plan {
-        documents: diff(&documents, &manifest.documents),
+        documents: settled(diff(&documents, &manifest.documents), &manifest.documents),
         skills: diff(&skills, &manifest.skills),
     };
     (plan, documents, skills)
@@ -484,6 +576,8 @@ fn plan(root: &Path, manifest: &Manifest) -> (Plan, BTreeMap<String, Found>, BTr
 
 #[derive(Default)]
 struct Summary {
+    /// Documents the project had already, now tracked without a push.
+    adopted: usize,
     added: usize,
     updated: usize,
     removed: usize,
@@ -493,7 +587,13 @@ struct Summary {
 impl Summary {
     /// What changed, leaving out what didn't: `2 added, 1 removed`.
     fn line(&self) -> String {
-        [(self.added, "added"), (self.updated, "updated"), (self.removed, "removed"), (self.failed, "failed")]
+        [
+            (self.adopted, "already in the project"),
+            (self.added, "added"),
+            (self.updated, "updated"),
+            (self.removed, "removed"),
+            (self.failed, "failed"),
+        ]
             .iter()
             .filter(|(n, _)| *n > 0)
             .map(|(n, what)| format!("{} {}", n, what))
@@ -510,6 +610,8 @@ pub enum Event {
     Summary(String),
     /// A change that didn't go through, or a pass that couldn't run.
     Failure(String),
+    /// Worth knowing, not a change: what a first sync left alone.
+    Note(String),
 }
 
 /// Hold the sync back until `idle` says so, checking once a second; false
@@ -530,13 +632,21 @@ fn sync_once(
     manifest: &mut Manifest,
     idle: &dyn Fn() -> bool,
     stop: &AtomicBool,
+    first: bool,
     emit: &mut dyn FnMut(Event),
 ) -> Result<Summary, String> {
-    forget_missing(manifest, remote)?;
-    let (plan, documents, skills) = plan(root, manifest);
-    let mut summary = Summary::default();
+    let listed = remote.documents()?;
+    forget_missing(manifest, &listed, remote)?;
+    let (mut plan, documents, skills) = plan(root, manifest);
+    let mut summary = Summary { adopted: adopt(manifest, &listed, &mut plan.documents, &documents), ..Summary::default() };
+    if first && let Some(note) = strays(manifest, &listed, &plan.documents) {
+        emit(Event::Note(note));
+    }
     if plan.is_empty() {
         manifest.save(root)?;
+        if summary.adopted > 0 {
+            emit(Event::Summary(summary.line()));
+        }
         return Ok(summary);
     }
 
@@ -603,6 +713,8 @@ fn watch(
     emit: &mut dyn FnMut(Event),
 ) {
     let mut reported: HashSet<String> = HashSet::new();
+    // A map made afresh says what the project has beyond the folder, once.
+    let mut first = manifest.documents.is_empty() && manifest.skills.is_empty();
     while wait_for(idle, stop) {
         let mut failures = HashSet::new();
         let mut relay = |event: Event| match event {
@@ -614,8 +726,9 @@ fn watch(
             }
             other => emit(other),
         };
-        if let Err(e) = sync_once(remote, root, manifest, idle, stop, &mut relay) {
-            relay(Event::Failure(e));
+        match sync_once(remote, root, manifest, idle, stop, first, &mut relay) {
+            Ok(_) => first = false,
+            Err(e) => relay(Event::Failure(e)),
         }
         reported = failures;
         for _ in 0..interval.max(1) {
@@ -906,6 +1019,61 @@ mod tests {
         // Listed once and then gone: deleted at Smartloop, so it goes again.
         reconcile(&mut documents, &HashSet::new());
         assert!(documents.is_empty());
+    }
+
+    #[test]
+    fn documents_not_yet_registered_wait_to_be_removed_or_replaced() {
+        let registered = Entry { registered: true, ..entry("a") };
+        let known = BTreeMap::from([
+            ("gone".to_string(), entry("a")),
+            ("edit".to_string(), entry("a")),
+            ("listed".to_string(), registered.clone()),
+            ("relisted".to_string(), registered),
+        ]);
+        let found = BTreeMap::from([("edit".to_string(), file("b")), ("relisted".to_string(), file("b")), ("new".to_string(), file("a"))]);
+        let mut changes = settled(diff(&found, &known), &known);
+        changes.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            changes,
+            vec![
+                ("listed".to_string(), Change::Remove),
+                ("new".to_string(), Change::Add),
+                ("relisted".to_string(), Change::Update),
+            ]
+        );
+    }
+
+    #[test]
+    fn documents_the_project_has_by_content_are_taken_up_not_pushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| {
+            let path = dir.path().join(name);
+            fs::write(&path, format!("content of {}", if name.starts_with("copy") { "same" } else { name })).unwrap();
+            path
+        };
+        let found = BTreeMap::from([
+            ("same.md".to_string(), Found { path: path("copy-a.md"), ..file("a") }),
+            ("again.md".to_string(), Found { path: path("copy-b.md"), ..file("a") }),
+            ("new.md".to_string(), Found { path: path("new.md"), ..file("b") }),
+        ]);
+        let id = document_id(&found["same.md"].path).unwrap();
+        assert_eq!(id, format!("{:x}", Md5::digest(b"content of same")));
+        let listed = vec![
+            json!({"id": id, "path": "documents/README.md"}),
+            json!({"id": "other", "path": "documents/elsewhere.pdf"}),
+            json!({"id": null, "path": "/inbox/documents/README_1.md"}),
+        ];
+        let mut manifest = Manifest::default();
+        let mut changes: Vec<(String, Change)> = found.keys().map(|k| (k.clone(), Change::Add)).collect();
+        assert_eq!(adopt(&mut manifest, &listed, &mut changes, &found), 1);
+        // Two copies here, one there: the second goes in as usual.
+        let taken = manifest.documents.values().next().unwrap();
+        assert!(taken.registered && taken.remote == "README.md" && manifest.documents.len() == 1);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(
+            strays(&manifest, &listed, &changes).as_deref(),
+            Some("1 document in the project isn't in this folder (elsewhere.pdf); sync leaves it be")
+        );
     }
 
     #[test]

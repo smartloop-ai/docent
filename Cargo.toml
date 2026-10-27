@@ -37,6 +37,7 @@ fernet = { version = "0.2.2", default-features = false, features = ["rustcrypto"
 anyhow = "1"
 ignore = "0.4.33"
 sha2 = "0.10"
+md5 = { package = "md-5", version = "0.10" }
 serde = { version = "1", features = ["derive"] }
 tui-markdown = "0.3.12"
 pulldown-cmark = { version = "0.13", default-features = false }
