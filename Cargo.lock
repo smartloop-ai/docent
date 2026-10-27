@@ -1456,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "docent"
-version = "1.0.50"
+version = "1.0.49"
 dependencies = [
  "anyhow",
  "arboard",

@@ -1,6 +1,6 @@
 [package]
 name = "docent"
-version = "1.0.50"
+version = "1.0.49"
 edition = "2024"
 build = "build.rs"
 
