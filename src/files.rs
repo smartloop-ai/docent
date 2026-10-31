@@ -45,9 +45,22 @@ const LOCKS: [&str; 7] =
 
 /// Most of the project's files listed for the agent.
 const LISTED: usize = 200;
-/// Most characters of file contents sent with a prompt, and of one file.
-const SHOWN: usize = 60_000;
-const SHOWN_EACH: usize = 30_000;
+/// Characters of file contents sent with a prompt when nothing better is
+/// known of the model's window: what a 32k-token local model takes.
+pub const DEFAULT_BUDGET: usize = 60_000;
+/// Most characters of file contents sent with one prompt, however wide the
+/// model's window: a turn's worth of reading, not the whole disk.
+pub const MOST_BUDGET: usize = 400_000;
+
+/// Characters of file contents a prompt may carry for a model with a
+/// `window` of tokens: two characters a token, so that the files take
+/// about half of it, between `DEFAULT_BUDGET` and `MOST_BUDGET`.
+pub fn budget_for(window: Option<u64>) -> usize {
+    match window {
+        Some(tokens) => (usize::try_from(tokens).unwrap_or(usize::MAX).saturating_mul(2)).clamp(DEFAULT_BUDGET, MOST_BUDGET),
+        None => DEFAULT_BUDGET,
+    }
+}
 
 /// The kind of code project `root` is, from the files at its top.
 pub fn project_kind(root: &Path) -> Option<&'static str> {
@@ -86,8 +99,10 @@ pub struct Context {
 /// rather than in general. Files the prompt names come first, then the
 /// source, then the rest; one too big to show whole shows the parts the
 /// prompt's words are in, and says so. `kind` is what the project is,
-/// as in "Rust".
-pub fn project_context(root: &Path, kind: &str, prompt: &str) -> Context {
+/// as in "Rust"; `budget` the characters of contents to send, for the
+/// model's window (`budget_for`), half of it at most for one file.
+pub fn project_context(root: &Path, kind: &str, prompt: &str, budget: usize) -> Context {
+    let shown_each = budget / 2;
     let mut paths: Vec<String> = ignore::WalkBuilder::new(root)
         .require_git(false)
         .filter_entry(|e| e.depth() == 0 || !SKIPPED.contains(&e.file_name().to_string_lossy().as_ref()))
@@ -130,7 +145,7 @@ pub fn project_context(root: &Path, kind: &str, prompt: &str) -> Context {
     let mut order: Vec<&String> =
         paths.iter().filter(|p| !LOCKS.contains(&p.rsplit('/').next().unwrap_or(p))).collect();
     order.sort_by_key(|p| (!is_manifest(p), !mentioned(p), !is_source(p), (*p).clone()));
-    let mut room = SHOWN;
+    let mut room = budget;
     let mut shown = String::new();
     let mut whole = Vec::new();
     for path in order {
@@ -141,7 +156,7 @@ pub fn project_context(root: &Path, kind: &str, prompt: &str) -> Context {
         if content.contains('\0') {
             continue;
         }
-        let limit = SHOWN_EACH.min(room);
+        let limit = shown_each.min(room);
         let (body, note) = if content.len() <= limit {
             whole.push(path.clone());
             (content.trim_end().to_string(), String::new())
@@ -892,7 +907,7 @@ mod tests {
         fs::write(dir.path().join("target/debug/x.rs"), "built").unwrap();
         fs::create_dir_all(dir.path().join(".hidden")).unwrap();
         fs::write(dir.path().join(".hidden/x.rs"), "hidden").unwrap();
-        let context = project_context(dir.path(), "Rust", "");
+        let context = project_context(dir.path(), "Rust", "", DEFAULT_BUDGET);
         let text = context.text;
         assert_eq!(context.whole, ["Cargo.toml", "src/main.rs"]);
         assert!(text.starts_with("I'm working in the Rust project at"), "{}", text);
@@ -914,7 +929,14 @@ mod tests {
         let big: String = (1..=1400).map(|i| format!("    let value_{} = {};\n", i, i)).collect();
         let big = format!("{}fn status_line() {{}}\n{}", big, big);
         fs::write(dir.path().join("src/ui.rs"), &big).unwrap();
-        let text = project_context(dir.path(), "Rust", "Fix the status line in the news feed");
+        let text = project_context(dir.path(), "Rust", "Fix the status line in the news feed", DEFAULT_BUDGET);
+        // A wider window takes the big file whole.
+        let wide = project_context(dir.path(), "Rust", "Fix the status line in the news feed", MOST_BUDGET);
+        assert!(wide.whole.contains(&"src/ui.rs".to_string()), "{:?}", wide.whole);
+        assert_eq!(budget_for(None), DEFAULT_BUDGET);
+        assert_eq!(budget_for(Some(32_768)), 65_536);
+        assert_eq!(budget_for(Some(4_096)), DEFAULT_BUDGET);
+        assert_eq!(budget_for(Some(1_048_576)), MOST_BUDGET);
         let at = |needle: &str| text.text.find(needle).unwrap_or(usize::MAX);
         // The manifest, the file the prompt names, the source, then the docs.
         assert!(at("`Cargo.toml`") < at("`src/news.rs`"), "{}", text.text);

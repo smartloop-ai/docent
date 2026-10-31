@@ -428,6 +428,8 @@ pub struct ModelRow {
     pub capabilities: String,
     /// Whether the capabilities were set here, over the catalog's.
     pub overridden: bool,
+    /// The model's context window in tokens, when the catalog says.
+    pub context: Option<u64>,
     pub access: String,
     /// False when the model needs a sign-in first.
     pub accessible: bool,
@@ -455,6 +457,7 @@ pub fn model_rows(client: &Client, project_id: &str) -> Result<Vec<ModelRow>, St
                     .map(|c| c.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
                     .unwrap_or_default(),
                 overridden: model["capabilities_overridden"].as_bool().unwrap_or_default(),
+                context: model["context_length"].as_u64().filter(|n| *n > 0),
                 access: model["access_level"].as_str().unwrap_or_default().to_string(),
                 accessible: model["is_accessible"].as_bool() != Some(false),
                 downloaded: flag("downloaded"),

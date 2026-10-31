@@ -906,6 +906,10 @@ struct App {
     check: Option<Check>,
     /// Rounds of fixing a failed check since the user's last prompt.
     fix_round: u32,
+    /// The widest context window among the project's enabled models, in
+    /// tokens, once the models are known: how much of the project a prompt
+    /// may carry.
+    window: Option<u64>,
     /// The last reply's files left unwritten, as the agent wasn't shown
     /// them whole, with their folder: `/write` writes them after all.
     kept: Option<(std::path::PathBuf, Vec<files::File>)>,
@@ -982,6 +986,7 @@ impl App {
             shell_runs: 0,
             check: None,
             fix_round: 0,
+            window: None,
             kept: None,
             last_failure: None,
             hint_at: 0,
@@ -1283,7 +1288,7 @@ impl App {
         let mut code = false;
         if let Some(root) = &files_dir {
             let context = code_kind(root).map_or_else(String::new, |kind| {
-                let c = files::project_context(root, kind, &message);
+                let c = files::project_context(root, kind, &message, files::budget_for(self.window));
                 code = true;
                 whole = c.whole;
                 format!("{}\n\n", c.text)
@@ -1648,6 +1653,9 @@ impl App {
             AppEvent::Projects(result) => self.projects_loaded(result),
             AppEvent::SwitchProject(project) => self.switch_project((project.id, project.name)),
             AppEvent::Models(result) => {
+                if let Ok(list) = &result {
+                    self.window = list.iter().filter(|m| m.enabled).filter_map(|m| m.context).max();
+                }
                 if let Overlay::Models { rows, selected } = &mut self.overlay {
                     if let Ok(list) = &result {
                         *selected = (*selected).min(list.len().saturating_sub(1));
@@ -1957,6 +1965,7 @@ impl App {
         self.session = chat::new_session_id();
         self.scroll_back = 0;
         self.web_search = None;
+        self.window = None;
         self.skills.clear();
         self.connections = None;
         // What the last project's documents were doing isn't this one's.
@@ -1971,6 +1980,7 @@ impl App {
         self.project = Some(project);
         self.follow_project();
         self.load_web_search();
+        self.load_models();
         self.load_skills();
         self.load_connections();
         // A prompt given on the command line waits for the project opened
@@ -4700,6 +4710,7 @@ mod tests {
             name: "qwen3.5-2b".into(),
             capabilities: "general, coding".into(),
             overridden: true,
+            context: Some(32_768),
             access: "free".into(),
             accessible: true,
             downloaded: true,
@@ -5253,6 +5264,7 @@ mod tests {
             name: name.into(),
             capabilities: "general, vision".into(),
             overridden: false,
+            context: None,
             access: "free".into(),
             accessible: true,
             downloaded,

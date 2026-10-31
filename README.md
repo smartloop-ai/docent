@@ -324,7 +324,9 @@ then every few seconds pushes only what was added, changed or removed:
 In a code project, a prompt is answered with code that fits what's there:
 the agent is sent the project's files, with the contents of those the prompt
 concerns, and told to answer from them rather than the web (the project's
-web search is off for that turn). The files its reply gives, each whole in a
+web search is off for that turn). How much is sent follows the widest
+context window among the project's enabled models: 60,000 characters for a
+32k-token local model, up to 400,000 for a cloud model with a million. The files its reply gives, each whole in a
 fenced block with its path above, are written into the folder, and the chat
 lists what each gained and lost by lines. In the reply, a file shows as its
 change against the file in the folder, lines added and removed with a little
