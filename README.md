@@ -214,6 +214,7 @@ On exit it prints the session id, to resume with `--session`.
 | `/status` | account, model, agent and versions |
 | `/usage` | web searches left, tokens and cost saved |
 | `/upgrade` | Pro plan: 1,000 web searches a month |
+| `/code [on\|off\|auto]` | whether prompts in this folder are answered with code (see [Coding](#coding)); `on` and `off` mark the folder over what its files say, `auto` unmarks it |
 | `/clear` | clear the chat and start a new session |
 | `/<skill> [prompt]` | run one of the project's skills; `/` lists them with the commands |
 | `!<command>` | run a shell command in the working directory; its output goes to the agent with your next prompt, so it stays in the session |
@@ -260,9 +261,14 @@ then every few seconds pushes only what was added, changed or removed:
 /sync stop       stop syncing this folder (/sync starts it again)
 ```
 
-- Nothing is synced, and no project created, until you run `/sync`. After
-  that, opening `docent` in the folder opens the chat in its project and keeps
-  syncing it, until `/sync stop`.
+- Opening `docent` in a folder that isn't linked to a project yet gives it
+  one of its own, named after the folder (a project by that name with no
+  folder of its own is reused), writes the link to `.docent/manifest.json`,
+  and syncs the folder to it from then on. A folder of more than 200
+  documents or 500 MB is linked but not synced until `/sync --yes`. Opening
+  `docent` in a linked folder, or one under it, opens the chat in its project
+  and keeps syncing it, until `/sync stop`. `--project` opens another project
+  instead, and links nothing.
 - The folder synced is the nearest one up from where `docent` was opened that
   holds a `.docent/`, as git finds its repository, so opening it in a
   subfolder of a synced project syncs the project. With none, it's the folder
@@ -275,8 +281,9 @@ then every few seconds pushes only what was added, changed or removed:
   than 200 documents or 500 MB asks first; `/sync --yes` goes ahead.
 - **Documents** are the folder's PDF, Word, PowerPoint, Excel, CSV, Markdown
   and text files. Hidden folders, `.gitignore` and a `.docentignore` (same
-  syntax) keep files out. A document in a subfolder is stored flat, as
-  `docs__guide.pdf`.
+  syntax) keep files out, and so are build output and dependencies always:
+  `node_modules`, `target`, `dist`, `build`, `vendor`, `venv` and the like.
+  A document in a subfolder is stored flat, as `docs__guide.pdf`.
 - **`.docentignore`** keeps files out of the project without keeping them out
   of git. Put it in the synced folder (or any folder under it, for that
   folder's files) and list paths or patterns, one per line, as in
@@ -309,6 +316,39 @@ then every few seconds pushes only what was added, changed or removed:
 - A document or skill deleted at Smartloop is pushed again on the next pass.
   If the project itself is deleted, syncing stops; `/sync` links the folder to
   the current project instead.
+
+### Coding
+
+In a code project, a prompt is answered with code that fits what's there:
+the agent is sent the project's files, with the contents of those the prompt
+concerns, and told to answer from them rather than the web (the project's
+web search is off for that turn). The files its reply gives, each whole in a
+fenced block with its path above, are written into the folder, and the chat
+lists what each gained and lost by lines. A file the agent wasn't shown whole
+isn't replaced by a reply shorter than it. Once the files are written, the
+project is checked with a quick command for its kind, such as `cargo check`,
+`go build ./...`, the package's `build` script or `tsc --noEmit`, shown like
+a `!` command. A project with no build of its own, or a plain folder of
+scripts, gets each file written checked by what it is: `bash -n` for a shell
+script, `python3 -m py_compile` for Python, `node --check`, `ruby -c`,
+`php -l` and so on. If it fails, the errors go back to the
+agent to fix, and the fixed files are checked again, round after round until
+the check passes; it stops only when a round changes nothing, as when the
+check fails the same way again or the reply writes no file, or when you
+press `Esc`. The agent takes a turn as coding
+work when the prompt asks for a change or about the code and the folder is a
+code project (or when the prompt is plainly about programming, anywhere), and
+answers it with the project's model that has the `coding` capability when one
+is enabled (`/models` shows each model's capabilities), else its largest.
+
+A folder is a code project when a manifest sits at its top: `Cargo.toml`,
+`package.json`, `pyproject.toml`, `go.mod`, `pom.xml` and the like. That's
+read off the folder on each prompt, so a project scaffolded after the folder
+was linked counts from then on. `/code` says how the folder stands, `/code on`
+or `/code off` marks it a code or documents project over what its files say,
+in `.docent/manifest.json`, and `/code auto` goes back to its files.
+Elsewhere, a prompt that asks for something to be made (create, generate,
+scaffold, write, add, fix…) is answered with files too.
 
 ## Configuration
 

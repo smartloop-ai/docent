@@ -65,10 +65,22 @@ struct Entry {
     registered: bool,
 }
 
+/// What a folder holds for the agent: code, so a prompt there is answered
+/// with code that fits it, or documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Code,
+    Documents,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Manifest {
     #[serde(default)]
     project: Option<String>,
+    /// Set by `/code on` or `/code off`; none reads it off the files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<Kind>,
     /// Set by `/sync stop`: the chat leaves the folder alone until `/sync`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     paused: bool,
@@ -185,12 +197,17 @@ fn found(path: &Path, known: Option<&Entry>) -> std::io::Result<Found> {
     Ok(Found { path: path.to_path_buf(), hash, size: meta.len(), mtime })
 }
 
+/// Folders of build output and dependencies, never a project's own
+/// documents, whatever the ignore files say.
+const SKIPPED_DIRS: [&str; 9] = ["node_modules", "target", "dist", "build", ".venv", "venv", "__pycache__", "vendor", ".out"];
+
 /// The documents under `root`: files of a kind the agent reads, past the
-/// ignore files and hidden folders.
+/// ignore files, hidden folders and `SKIPPED_DIRS`.
 fn walk(root: &Path) -> impl Iterator<Item = ignore::DirEntry> {
     ignore::WalkBuilder::new(root)
         .add_custom_ignore_filename(IGNORE_FILE)
         .require_git(false)
+        .filter_entry(|e| e.depth() == 0 || !SKIPPED_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
         .build()
         .flatten()
         .filter(|entry| {
@@ -710,6 +727,7 @@ fn watch(
     interval: u64,
     idle: &dyn Fn() -> bool,
     stop: &AtomicBool,
+    nudge: &AtomicBool,
     emit: &mut dyn FnMut(Event),
 ) {
     let mut reported: HashSet<String> = HashSet::new();
@@ -731,9 +749,14 @@ fn watch(
             Err(e) => relay(Event::Failure(e)),
         }
         reported = failures;
+        // The next pass comes after `interval`, or as soon as it's asked
+        // for, as after the chat writes files.
         for _ in 0..interval.max(1) {
             if stop.load(Ordering::Relaxed) {
                 return;
+            }
+            if nudge.swap(false, Ordering::Relaxed) {
+                break;
             }
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -903,6 +926,21 @@ pub fn link(root: &Path, project: &str) -> Result<(), String> {
     bind(root, project)
 }
 
+/// What `root` was marked as holding, if it was.
+pub fn kind(root: &Path) -> Option<Kind> {
+    Manifest::load(root).ok()?.kind
+}
+
+/// Mark `root` as holding `kind`, over what its files say; none goes back
+/// to what they say. Waits out a sync of the folder, which saves the
+/// manifest itself.
+pub fn mark(root: &Path, kind: Option<Kind>) -> Result<(), String> {
+    let _held = lock();
+    let mut manifest = Manifest::load(root)?;
+    manifest.kind = kind;
+    manifest.save(root)
+}
+
 /// Stop syncing `root` until it's linked again, waiting for a sync still
 /// running to finish its save.
 pub fn pause(root: &Path) -> Result<(), String> {
@@ -938,13 +976,15 @@ pub fn status(root: &Path) -> Result<Status, String> {
 /// Keep `root` in step with the project it's linked to until `stop`; for
 /// the chat, which reports through `emit` and holds changes back while
 /// `idle` says it's busy. A project that's gone is never made again: the
-/// folder has to be linked to another.
+/// folder has to be linked to another. A pass runs every `interval`
+/// seconds, or at once when `nudge` is set.
 pub fn follow(
     client: &Client,
     root: &Path,
     interval: u64,
     idle: &dyn Fn() -> bool,
     stop: &AtomicBool,
+    nudge: &AtomicBool,
     emit: &mut dyn FnMut(Event),
 ) {
     let _held = lock();
@@ -973,11 +1013,45 @@ pub fn follow(
     {
         emit(Event::Failure(e));
     }
-    watch(&Remote { client, project }, root, &mut manifest, interval, idle, stop, emit)
+    watch(&Remote { client, project }, root, &mut manifest, interval, idle, stop, nudge, emit)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_folder_is_marked_code_or_documents_by_hand_only() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(super::kind(dir.path()), None);
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        super::mark(dir.path(), Some(super::Kind::Documents)).unwrap();
+        assert_eq!(super::kind(dir.path()), Some(super::Kind::Documents));
+        // Not a link: no project yet.
+        assert!(super::linked(dir.path()).is_none());
+        // Linking keeps a mark made by hand, and makes none: a folder
+        // scaffolded after it's linked is read as it is now.
+        super::link(dir.path(), "p1").unwrap();
+        assert_eq!(super::kind(dir.path()), Some(super::Kind::Documents));
+        super::mark(dir.path(), None).unwrap();
+        assert_eq!(super::kind(dir.path()), None);
+        let other = tempfile::tempdir().unwrap();
+        super::link(other.path(), "p2").unwrap();
+        assert_eq!(super::kind(other.path()), None);
+    }
+
+    #[test]
+    fn build_output_and_dependencies_are_never_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in ["docs/guide.md", "node_modules/pkg/README.md", "target/doc/index.md", ".out/summary.md"] {
+            let full = dir.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, "x").unwrap();
+        }
+        let found: Vec<String> = super::walk(dir.path())
+            .map(|e| e.path().strip_prefix(dir.path()).unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(found, ["docs/guide.md"]);
+    }
+
     use super::*;
 
     fn entry(hash: &str) -> Entry {

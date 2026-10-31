@@ -10,6 +10,7 @@ use progress::Steps;
 mod agent;
 mod chat;
 mod docent;
+mod files;
 mod framework;
 mod links;
 mod mcp;
