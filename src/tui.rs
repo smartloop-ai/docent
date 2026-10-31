@@ -536,6 +536,16 @@ struct Reply {
     /// `text` as last drawn, with its length and width: the conversation
     /// redraws every tick, and only a reply still streaming changes.
     rendered: std::cell::RefCell<Option<(usize, u16, Vec<Line<'static>>)>>,
+    /// When it was last laid out: a reply streaming in is laid out again
+    /// at most once a tick, not once a chunk.
+    rendered_at: std::cell::Cell<Option<Instant>>,
+    /// The folder the reply's files are written into, when it was asked to
+    /// make them: a file block shows as its change against the file there.
+    root: Option<std::path::PathBuf>,
+    /// Each file as it was in `root` before the reply, by path, read once:
+    /// the reply's files are written when it ends, and the change is
+    /// against what was there.
+    olds: std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
 }
 
 impl Reply {
@@ -545,12 +555,28 @@ impl Reply {
     fn body(&self, width: u16) -> Vec<Line<'static>> {
         let text = self.text.trim_end();
         let mut rendered = self.rendered.borrow_mut();
+        let streaming = self.stats.is_none() && self.ended.is_none();
+        let fresh = self.rendered_at.get().is_some_and(|at| at.elapsed() < TICK);
         match &*rendered {
             Some((len, at, lines)) if *len == text.len() && *at == width => lines.clone(),
+            // Still coming in, and laid out a moment ago: that will do until
+            // the next tick.
+            Some((_, at, lines)) if streaming && fresh && *at == width => lines.clone(),
             _ => {
+                self.rendered_at.set(Some(Instant::now()));
+                let blocks = if self.root.is_some() { files::blocks(text) } else { Vec::new() };
                 let mut lines: Vec<Line<'static>> = Vec::new();
-                for (code, segment) in segments(text) {
-                    let part = if code { code_lines(&segment, width) } else { prose_lines(&segment, width) };
+                for (code, segment, start) in segments(text) {
+                    let file = blocks.iter().find(|b| b.fence == start).map(|b| &b.file);
+                    let part = match (code, file) {
+                        (true, Some(file)) => {
+                            let streaming = !files::block_closed(&segment);
+                            let diff = files::diff(&file.path, self.old(&file.path).as_deref(), &file.content, streaming);
+                            code_lines(&format!("```diff\n{}```", diff), width)
+                        }
+                        (true, None) => code_lines(&segment, width),
+                        (false, _) => prose_lines(&segment, width),
+                    };
                     if part.is_empty() {
                         continue;
                     }
@@ -564,33 +590,40 @@ impl Reply {
             }
         }
     }
+
+    /// The file at `path` under the reply's folder as it was before the
+    /// reply, read the first time it's asked for; none when it's new.
+    fn old(&self, path: &str) -> Option<String> {
+        let root = self.root.as_ref()?;
+        self.olds.borrow_mut().entry(path.to_string()).or_insert_with(|| std::fs::read_to_string(root.join(path)).ok()).clone()
+    }
 }
 
 /// `text` split into its prose and its fenced code blocks, in order, each
-/// with whether it's code. A fence left open runs to the end, as it does
-/// while a reply streams.
-fn segments(text: &str) -> Vec<(bool, String)> {
-    let mut out: Vec<(bool, String)> = Vec::new();
+/// with whether it's code and the line it starts on. A fence left open
+/// runs to the end, as it does while a reply streams.
+fn segments(text: &str) -> Vec<(bool, String, usize)> {
+    let mut out: Vec<(bool, String, usize)> = Vec::new();
     let mut fence: Option<String> = None;
-    for line in text.lines() {
+    for (at, line) in text.lines().enumerate() {
         let (code, closing) = match &fence {
             Some(open) => (true, files::closes(line, open)),
             None => {
                 if let Some((open, _)) = files::opening_fence(line) {
                     fence = Some(open);
-                    out.push((true, String::new()));
+                    out.push((true, String::new(), at));
                 }
                 (fence.is_some(), false)
             }
         };
         match out.last_mut() {
-            Some((kind, body)) if *kind == code => {
+            Some((kind, body, _)) if *kind == code => {
                 if !body.is_empty() {
                     body.push('\n');
                 }
                 body.push_str(line);
             }
-            _ => out.push((code, line.to_string())),
+            _ => out.push((code, line.to_string(), at)),
         }
         if closing {
             fence = None;
@@ -842,6 +875,9 @@ struct App {
     scroll_back: u16,
     /// How far up the conversation goes, as of the last draw.
     scroll_limit: std::cell::Cell<u16>,
+    /// Each entry's height as last laid out, by index: the width and the
+    /// entry's version it was measured at, and its rows.
+    heights: std::cell::RefCell<Vec<Option<(u16, usize, usize)>>>,
     /// The conversation pane as last drawn, row by row, for copying a
     /// selection out of it, and the link under each cell, for clicking.
     shown: std::cell::RefCell<Shown>,
@@ -930,6 +966,7 @@ impl App {
             last_esc: None,
             scroll_back: 0,
             scroll_limit: std::cell::Cell::new(0),
+            heights: std::cell::RefCell::new(Vec::new()),
             shown: std::cell::RefCell::new(Shown::default()),
             selection: None,
             copied: None,
@@ -1267,7 +1304,7 @@ impl App {
             };
             self.entries.push(Entry::Warning(warning));
         }
-        self.entries.push(Entry::Reply(Reply::default()));
+        self.entries.push(Entry::Reply(Reply { root: files_dir.clone(), ..Default::default() }));
         let entry = self.entries.len() - 1;
         self.scroll_back = 0;
         // Made per turn: the agent picks its port once it's up, and a new
@@ -3097,10 +3134,33 @@ impl App {
         }
     }
 
-    fn draw_conversation(&self, frame: &mut Frame, area: Rect) {
-        // The welcome card opens the conversation, like a first message, and
-        // scrolls away with it.
-        let mut lines = self.welcome(area.width);
+    /// One entry of the conversation as drawn, after a blank line.
+    fn entry_lines(&self, entry: &Entry, width: u16, lines: &mut Vec<Line<'static>>) {
+        lines.push(Line::default());
+        match entry {
+            Entry::User(text) => {
+                for (i, line) in text.lines().enumerate() {
+                    let mark = if i == 0 { "> " } else { "  " };
+                    lines.push(Line::from(vec![Span::styled(mark, dim()), Span::styled(line.to_string(), dim())]));
+                }
+            }
+            Entry::Reply(reply) => reply_lines(reply, width, lines),
+            Entry::Shell(shell) => shell_lines(shell, self.spinner(), lines),
+            Entry::Notice(text) => {
+                lines.push(Line::from(vec![Span::styled("■ ", Style::new().fg(Color::Green)), Span::raw(text.clone())]))
+            }
+            Entry::Warning(text) => lines.push(Line::from(vec![
+                Span::styled("■ ", Style::new().fg(Color::Yellow)),
+                Span::styled(text.clone(), dim()),
+            ])),
+            Entry::Error(text) => lines.push(error_line(text)),
+        }
+    }
+
+    /// The welcome card that opens the conversation, like a first message,
+    /// and scrolls away with it, with the setup's card and failure.
+    fn head_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = self.welcome(width);
         if !self.setup.steps.is_empty() {
             lines.push(Line::default());
             lines.extend(self.setup.card(self.ticks));
@@ -3109,41 +3169,67 @@ impl App {
             lines.push(Line::default());
             lines.push(error_line(e));
         }
-        for entry in &self.entries {
-            lines.push(Line::default());
-            match entry {
-                Entry::User(text) => {
-                    for (i, line) in text.lines().enumerate() {
-                        let mark = if i == 0 { "> " } else { "  " };
-                        lines.push(Line::from(vec![
-                            Span::styled(mark, dim()),
-                            Span::styled(line.to_string(), dim()),
-                        ]));
-                    }
-                }
-                Entry::Reply(reply) => reply_lines(reply, area.width, &mut lines),
-                Entry::Shell(shell) => shell_lines(shell, self.spinner(), &mut lines),
-                Entry::Notice(text) => lines.push(Line::from(vec![
-                    Span::styled("■ ", Style::new().fg(Color::Green)),
-                    Span::raw(text.clone()),
-                ])),
-                Entry::Warning(text) => lines.push(Line::from(vec![
-                    Span::styled("■ ", Style::new().fg(Color::Yellow)),
-                    Span::styled(text.clone(), dim()),
-                ])),
-                Entry::Error(text) => lines.push(error_line(text)),
-            }
-        }
+        lines
+    }
 
-        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        let total = paragraph.line_count(area.width) as u16;
+    /// Draw the conversation: only the entries the screen shows, from the
+    /// one the scroll position lands in to the last, so a long conversation
+    /// costs no more to draw than a short one. Each entry's height is kept
+    /// from the last time it was laid out, so the whole is still measured
+    /// for scrolling.
+    fn draw_conversation(&self, frame: &mut Frame, area: Rect) {
+        let width = area.width;
+        let rows_of = |lines: &[Line<'static>]| Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false }).line_count(width);
+        let head = self.head_lines(width);
+        let head_rows = rows_of(&head);
+        let mut cache = self.heights.borrow_mut();
+        if cache.len() > self.entries.len() {
+            cache.clear();
+        }
+        cache.resize(self.entries.len(), None);
+        let heights: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| match cache[i] {
+                Some((w, version, rows)) if w == width && version == entry_version(entry) => rows,
+                _ => {
+                    let mut lines = Vec::new();
+                    self.entry_lines(entry, width, &mut lines);
+                    let rows = rows_of(&lines);
+                    // Measured after laying out, as a reply's version is
+                    // what it was laid out from.
+                    cache[i] = Some((width, entry_version(entry), rows));
+                    rows
+                }
+            })
+            .collect();
+        let total = head_rows + heights.iter().sum::<usize>();
+        let height = area.height as usize;
         // Anchored to the bottom, just above the prompt: a short conversation
         // sits low and grows upward, as in Claude Code.
-        let area = Rect { y: area.y + area.height.saturating_sub(total), height: area.height.min(total), ..area };
-        let bottom = total.saturating_sub(area.height);
-        self.scroll_limit.set(bottom);
-        let top = bottom.saturating_sub(self.scroll_back);
-        frame.render_widget(paragraph.scroll((top, 0)), area);
+        let bottom = total.saturating_sub(height);
+        self.scroll_limit.set(bottom.min(u16::MAX as usize) as u16);
+        let top = bottom.saturating_sub(self.scroll_back as usize);
+        // Back from the last entry to the one that holds row `top`.
+        let mut start = total;
+        let mut first = self.entries.len();
+        while first > 0 && start > top {
+            first -= 1;
+            start -= heights[first];
+        }
+        let mut lines = Vec::new();
+        if start > top {
+            lines.extend(head);
+            start = 0;
+        }
+        for entry in &self.entries[first..] {
+            self.entry_lines(entry, width, &mut lines);
+        }
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let drawn = (total.min(height)) as u16;
+        let area = Rect { y: area.y + area.height - drawn, height: drawn, ..area };
+        frame.render_widget(paragraph.scroll(((top - start).min(u16::MAX as usize) as u16, 0)), area);
     }
 
     /// Lines the prompt shows: one per line typed, up to `PROMPT_LINES`.
@@ -3611,6 +3697,20 @@ fn adopted(folder: &str, taken: &[(String, String)], has_folder: impl Fn(&str) -
         n += 1;
     }
     (name, None)
+}
+
+/// What of an entry its height depends on: a reply's text as last laid
+/// out, with its warnings, citations and end; a shell entry's output
+/// having come. The rest never change.
+fn entry_version(entry: &Entry) -> usize {
+    match entry {
+        Entry::Reply(reply) => {
+            let laid_out = reply.rendered.borrow().as_ref().map_or(0, |(len, ..)| *len);
+            laid_out * 8 + reply.warnings.len() + reply.citations.len() * 2 + usize::from(reply.stats.is_some() || reply.ended.is_some()) * 4 + 1
+        }
+        Entry::Shell(shell) => usize::from(shell.output.is_some()) + 1,
+        _ => 1,
+    }
 }
 
 /// Of `paths`, those under `root` but not its `.out/`, relative to it.
@@ -5357,8 +5457,43 @@ mod tests {
         assert_eq!(rows[8], "");
         assert_eq!(rows[9], "Then run.");
         // A block still open while the reply streams is code to its end.
-        assert_eq!(segments("a\n```\nb\n"), [(false, "a".to_string()), (true, "```\nb".to_string())]);
-        assert_eq!(segments("```\nb\n```\n```\nc\n```\nd"), [(true, "```\nb\n```".to_string()), (true, "```\nc\n```".to_string()), (false, "d".to_string())]);
+        assert_eq!(segments("a\n```\nb\n"), [(false, "a".to_string(), 0), (true, "```\nb".to_string(), 1)]);
+        assert_eq!(
+            segments("```\nb\n```\n```\nc\n```\nd"),
+            [(true, "```\nb\n```".to_string(), 0), (true, "```\nc\n```".to_string(), 3), (false, "d".to_string(), 6)]
+        );
+    }
+
+    #[test]
+    fn a_reply_making_files_shows_each_as_its_change_while_it_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {\n    old();\n}\n").unwrap();
+        let mut reply = Reply { root: Some(dir.path().to_path_buf()), ..Default::default() };
+        // Streaming: the block is open, and the old file's end isn't gone yet.
+        reply.text = "Here:\n\n`main.rs`\n```rust\nfn main() {\n    new();".into();
+        let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
+        let at = |rows: &[String]| rows.iter().position(|r| r == "  @@ main.rs · updated, +1 −1 @@").expect("header");
+        let h = at(&rows);
+        assert_eq!(rows[h + 1..h + 4], ["   fn main() {", "  -    old();", "  +    new();"]);
+        assert!(!rows.iter().any(|r| r.contains("-}")), "{:?}", rows);
+        // Closed: the whole change. A new file is all additions.
+        reply.text = "Here:\n\n`main.rs`\n```rust\nfn main() {\n    new();\n}\n```\n\n`lib.rs`\n```rust\npub fn l() {}\n```\n".into();
+        reply.rendered_at.set(None);
+        let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
+        let h = at(&rows);
+        assert_eq!(rows[h + 1..h + 5], ["   fn main() {", "  -    old();", "  +    new();", "   }"]);
+        assert!(rows.contains(&"  @@ lib.rs · created, +1 @@".to_string()), "{:?}", rows);
+        assert!(rows.contains(&"  +pub fn l() {}".to_string()), "{:?}", rows);
+        // Written since, the change still reads against the file as it was.
+        std::fs::write(dir.path().join("main.rs"), "fn main() {\n    new();\n}\n").unwrap();
+        reply.text.push(' ');
+        reply.rendered_at.set(None);
+        let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
+        at(&rows);
+        // Without a folder, a reply's code shows as it is.
+        let plain = Reply { text: "`main.rs`\n```rust\nfn main() {}\n```".into(), ..Default::default() };
+        let rows: Vec<String> = plain.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
+        assert!(rows.contains(&"  fn main() {}".to_string()), "{:?}", rows);
     }
 
     #[test]

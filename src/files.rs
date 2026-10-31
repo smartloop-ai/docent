@@ -251,16 +251,36 @@ pub struct File {
     pub content: String,
 }
 
+/// A file in a reply, with the lines of the reply that give it: its
+/// path's own line when it has one, through the block's end, and the line
+/// its code starts on (the opening fence, or the first indented line).
+pub struct Block {
+    pub file: File,
+    pub lines: std::ops::Range<usize>,
+    pub fence: usize,
+}
+
 /// The files in `reply`: each fenced block whose path is on the line above
 /// it, in its info string (```` ```rust src/main.rs ````), or in a comment
 /// on its first line. A path given twice keeps its last contents.
 pub fn extract(reply: &str) -> Vec<File> {
-    let lines: Vec<&str> = reply.lines().collect();
     let mut files: Vec<File> = Vec::new();
-    let mut above: Option<&str> = None;
+    for block in blocks(reply) {
+        files.retain(|f| f.path != block.file.path);
+        files.push(block.file);
+    }
+    files
+}
+
+/// Every block of `reply` that gives a file, in order, with its lines.
+pub fn blocks(reply: &str) -> Vec<Block> {
+    let lines: Vec<&str> = reply.lines().collect();
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut above: Option<(usize, &str)> = None;
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
+        let at = i;
         i += 1;
         let Some((fence, info)) = opening_fence(line) else {
             // A path on a line of its own, then a block indented by four
@@ -269,14 +289,14 @@ pub fn extract(reply: &str) -> Vec<File> {
             if let Some(path) = label_path(line).or_else(|| file_label(line))
                 && let Some((content, next)) = indented_block(&lines, i)
             {
-                files.retain(|f| f.path != path);
-                files.push(File { path, content });
+                let fence = (i..next).find(|k| !lines[*k].trim().is_empty()).unwrap_or(i);
+                blocks.push(Block { file: File { path, content }, lines: at..next, fence });
                 i = next;
                 above = None;
                 continue;
             }
             if !line.trim().is_empty() {
-                above = Some(line);
+                above = Some((at, line));
             }
             continue;
         };
@@ -287,9 +307,18 @@ pub fn extract(reply: &str) -> Vec<File> {
         let mut body: Vec<&str> = lines[start..i].to_vec();
         // Past the closing fence, when there is one.
         i = (i + 1).min(lines.len());
-        let mut path = info_path(info)
-            .or_else(|| above.and_then(label_path))
-            .or_else(|| body.first().and_then(|first| comment_path(first)));
+        let mut from = at;
+        let mut path = info_path(info);
+        if path.is_none()
+            && let Some((label_at, label)) = above
+            && let Some(labelled) = label_path(label)
+        {
+            path = Some(labelled);
+            from = label_at;
+        }
+        if path.is_none() {
+            path = body.first().and_then(|first| comment_path(first));
+        }
         // A "File: src/main.rs" line leading the block names it, and goes;
         // so does a fence right under it, the block's real start, as small
         // models write it inside a bare one.
@@ -306,10 +335,127 @@ pub fn extract(reply: &str) -> Vec<File> {
         let Some(path) = path else { continue };
         let mut content = body.join("\n");
         content.push('\n');
-        files.retain(|f| f.path != path);
-        files.push(File { path, content });
+        blocks.push(Block { file: File { path, content }, lines: from..i, fence: at });
     }
-    files
+    blocks
+}
+
+/// Whether `block`, a fenced block's text from its opening fence, has its
+/// closing fence: not while it streams.
+pub fn block_closed(block: &str) -> bool {
+    let mut lines = block.lines();
+    let Some((fence, _)) = lines.next().and_then(opening_fence) else { return false };
+    lines.any(|l| closes(l, &fence))
+}
+
+/// Lines of context shown around a change in a diff.
+const CONTEXT: usize = 3;
+/// Lines of a new file shown before the rest is folded.
+const NEW_SHOWN: usize = 40;
+
+/// The change from `old`, the file as it is (none when it's new), to
+/// `new`, the file as a reply gives it, by lines: a header, then `+` and
+/// `-` lines with `CONTEXT` lines around them and `…` between hunks. A new
+/// file is all `+`, folded past `NEW_SHOWN` lines. While the reply is
+/// `streaming` the block, what's left of the old file past the new one's
+/// end isn't taken out yet, so it doesn't show as removed.
+pub fn diff(path: &str, old: Option<&str>, new: &str, streaming: bool) -> String {
+    let b: Vec<&str> = new.lines().collect();
+    let mut out = String::new();
+    let Some(old) = old else {
+        out.push_str(&format!("@@ {} · created, +{} @@\n", path, b.len()));
+        for line in b.iter().take(NEW_SHOWN) {
+            out.push('+');
+            out.push_str(line);
+            out.push('\n');
+        }
+        if b.len() > NEW_SHOWN {
+            out.push_str(&format!("… {} more lines\n", b.len() - NEW_SHOWN));
+        }
+        return out;
+    };
+    let a: Vec<&str> = old.lines().collect();
+    let mut ops: Vec<(char, &str)> = if a.len() * b.len() > 4_000_000 {
+        a.iter().map(|l| ('-', *l)).chain(b.iter().map(|l| ('+', *l))).collect()
+    } else {
+        lcs_ops(&a, &b)
+    };
+    // Streaming, the last run of changes is still arriving: of the old
+    // lines in it, only as many as new lines have come are taken out, as
+    // replaced; the rest may yet be kept, so they don't show as removed.
+    if streaming {
+        let run = ops.iter().rposition(|(c, _)| *c == ' ').map_or(0, |i| i + 1);
+        let arrived = ops[run..].iter().filter(|(c, _)| *c == '+').count();
+        let mut kept = 0;
+        let tail: Vec<(char, &str)> = ops[run..]
+            .iter()
+            .filter(|(c, _)| {
+                if *c != '-' {
+                    return true;
+                }
+                kept += 1;
+                kept <= arrived
+            })
+            .copied()
+            .collect();
+        ops.truncate(run);
+        ops.extend(tail);
+    }
+    let added = ops.iter().filter(|(c, _)| *c == '+').count();
+    let removed = ops.iter().filter(|(c, _)| *c == '-').count();
+    out.push_str(&format!("@@ {} · updated, +{} −{} @@\n", path, added, removed));
+    let changed: Vec<bool> = ops.iter().map(|(c, _)| *c != ' ').collect();
+    let keep = |i: usize| (i.saturating_sub(CONTEXT)..(i + CONTEXT + 1).min(ops.len())).any(|k| changed[k]);
+    let mut gap = false;
+    for (i, (c, line)) in ops.iter().enumerate() {
+        if !keep(i) {
+            gap = true;
+            continue;
+        }
+        if gap {
+            out.push_str("…\n");
+            gap = false;
+        }
+        out.push(*c);
+        out.push_str(line);
+        out.push('\n');
+    }
+    if gap {
+        out.push_str("…\n");
+    }
+    out
+}
+
+/// `a` turned into `b` line by line, by their longest common run: each
+/// line kept (` `), taken out (`-`) or put in (`+`).
+fn lcs_ops<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(char, &'a str)> {
+    let (n, m) = (a.len(), b.len());
+    let w = m + 1;
+    let mut table = vec![0u32; (n + 1) * w];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            table[i * w + j] =
+                if a[i] == b[j] { table[(i + 1) * w + j + 1] + 1 } else { table[(i + 1) * w + j].max(table[i * w + j + 1]) };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut ops = Vec::new();
+    while i < n && j < m {
+        if a[i] == b[j] {
+            ops.push((' ', a[i]));
+            i += 1;
+            j += 1;
+        } else if table[(i + 1) * w + j] >= table[i * w + j + 1] {
+            ops.push(('-', a[i]));
+            i += 1;
+        } else {
+            ops.push(('+', b[j]));
+            j += 1;
+        }
+    }
+    ops.extend(a[i..].iter().map(|l| ('-', *l)));
+    ops.extend(b[j..].iter().map(|l| ('+', *l)));
+    ops
 }
 
 /// The indented code block starting at `lines[from]`, past any blank
@@ -831,6 +977,31 @@ mod tests {
             Some("bash -n 'deploy.sh' && python3 -m py_compile 'tool.py'")
         );
         assert_eq!(check_command(dir.path(), None, &w(&["notes.md"])), None);
+    }
+
+    #[test]
+    fn a_file_in_a_reply_shows_as_its_change_as_it_streams() {
+        let old = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n";
+        let new = "a\nb\nc\nd\nE\nf\ng\nh\ni\nj\nk\nl\nm\n";
+        assert_eq!(
+            diff("x.rs", Some(old), new, false),
+            "@@ x.rs · updated, +2 −1 @@\n…\n b\n c\n d\n-e\n+E\n f\n g\n h\n…\n j\n k\n l\n+m\n"
+        );
+        assert_eq!(diff("x.rs", None, "x\ny\n", false), "@@ x.rs · created, +2 @@\n+x\n+y\n");
+        let long: String = (1..=50).map(|i| format!("l{}\n", i)).collect();
+        assert!(diff("x.rs", None, &long, true).ends_with("+l40\n… 10 more lines\n"));
+        assert_eq!(diff("x.rs", Some("same\n"), "same\n", false), "@@ x.rs · updated, +0 −0 @@\n…\n");
+        // Streaming, the old file's tail isn't removed yet; closed, it is.
+        assert_eq!(diff("x.rs", Some("a\nb\nc\n"), "a\nB\n", true), "@@ x.rs · updated, +1 −1 @@\n a\n-b\n+B\n");
+        assert_eq!(diff("x.rs", Some("a\nb\nc\n"), "a\nB\n", false), "@@ x.rs · updated, +1 −2 @@\n a\n-b\n-c\n+B\n");
+
+        let reply = "Done.\n\n**`src/a.rs`**\n\n```rust\nfn a() {}\n```\n\n`b.txt`\n\n    hello\n\n```sh\nls\n";
+        let blocks = blocks(reply);
+        let seen: Vec<(&str, usize, std::ops::Range<usize>)> =
+            blocks.iter().map(|b| (b.file.path.as_str(), b.fence, b.lines.clone())).collect();
+        assert_eq!(seen, [("src/a.rs", 4, 2..7), ("b.txt", 10, 8..12)]);
+        assert!(block_closed("```rust\nfn a() {}\n```"));
+        assert!(!block_closed("```rust\nfn a() {}"));
     }
 
     #[test]

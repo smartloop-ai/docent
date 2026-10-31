@@ -324,7 +324,9 @@ the agent is sent the project's files, with the contents of those the prompt
 concerns, and told to answer from them rather than the web (the project's
 web search is off for that turn). The files its reply gives, each whole in a
 fenced block with its path above, are written into the folder, and the chat
-lists what each gained and lost by lines. A file the agent wasn't shown whole
+lists what each gained and lost by lines. In the reply, a file shows as its
+change against the file in the folder, lines added and removed with a little
+context, as it streams in; a new file as additions, folded past 40 lines. A file the agent wasn't shown whole
 isn't replaced by a reply shorter than it. Once the files are written, the
 project is checked with a quick command for its kind, such as `cargo check`,
 `go build ./...`, the package's `build` script or `tsc --noEmit`, shown like
