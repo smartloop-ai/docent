@@ -206,6 +206,7 @@ On exit it prints the session id, to resume with `--session`.
 | --- | --- |
 | `/login`, `/logout` | sign in in the browser (`--token` to paste one) |
 | `/models` | enable, disable and download models |
+| `/models <name> caps <list\|auto>` | set a model's capabilities here, over the catalog's, as in `coding,general`; `auto` goes back to the catalog's |
 | `/mcp` | MCP servers; `/mcp add <url>` connects one |
 | `/project` | projects: switch (in a new session), create, import, delete |
 | `/project <name>` | switch to a project by its name or ID |
@@ -343,7 +344,9 @@ press `Esc`. The agent takes a turn as coding
 work when the prompt asks for a change or about the code and the folder is a
 code project (or when the prompt is plainly about programming, anywhere), and
 answers it with the project's model that has the `coding` capability when one
-is enabled (`/models` shows each model's capabilities), else its largest.
+is enabled (`/models` shows each model's capabilities), else its largest. A
+model the catalog doesn't tag can be given the capability here: `/models
+<name> caps coding,general`.
 
 A folder is a code project when a manifest sits at its top: `Cargo.toml`,
 `package.json`, `pyproject.toml`, `go.mod`, `pom.xml` and the like. That's

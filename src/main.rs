@@ -426,6 +426,8 @@ fn project_model_state(
 pub struct ModelRow {
     pub name: String,
     pub capabilities: String,
+    /// Whether the capabilities were set here, over the catalog's.
+    pub overridden: bool,
     pub access: String,
     /// False when the model needs a sign-in first.
     pub accessible: bool,
@@ -452,6 +454,7 @@ pub fn model_rows(client: &Client, project_id: &str) -> Result<Vec<ModelRow>, St
                     .as_array()
                     .map(|c| c.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
                     .unwrap_or_default(),
+                overridden: model["capabilities_overridden"].as_bool().unwrap_or_default(),
                 access: model["access_level"].as_str().unwrap_or_default().to_string(),
                 accessible: model["is_accessible"].as_bool() != Some(false),
                 downloaded: flag("downloaded"),
@@ -460,6 +463,22 @@ pub fn model_rows(client: &Client, project_id: &str) -> Result<Vec<ModelRow>, St
             }
         })
         .collect())
+}
+
+/// Set a model's capabilities here, over the catalog's, for routing: an
+/// empty list takes the setting off. The capabilities as they stand after.
+pub fn set_model_capabilities(client: &Client, name: &str, capabilities: &[String]) -> Result<Vec<String>, String> {
+    let action = "set the model's capabilities";
+    let response = client
+        .patch(format!("{}/models/workspace/{}", api_url(), name))
+        .json(&serde_json::json!({ "capabilities": capabilities }))
+        .send()
+        .map_err(|e| format!("Failed to {}: {}", action, e))?;
+    if !response.status().is_success() {
+        return Err(error_message(action, response));
+    }
+    let reply: serde_json::Value = response.json().map_err(|e| format!("Failed to {}: {}", action, e))?;
+    Ok(reply["capabilities"].as_array().map_or_else(Vec::new, |c| c.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()))
 }
 
 /// PATCH a project's model entry; the server canonicalizes the name.

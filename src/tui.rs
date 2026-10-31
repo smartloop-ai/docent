@@ -2136,6 +2136,33 @@ impl App {
         self.load_models();
     }
 
+    /// `/models <name> caps <list|auto>`: set a model's capabilities here,
+    /// over the catalog's, so the planner routes to it; `auto` goes back to
+    /// the catalog's.
+    fn set_capabilities(&mut self, name: String, list: &str) {
+        let capabilities = match capability_list(list) {
+            Ok(caps) => caps,
+            Err(e) => return self.entries.push(Entry::Error(e)),
+        };
+        if cfg!(test) {
+            return self.entries.push(Entry::Notice(format!("Setting {} capabilities: {}", name, capabilities.join(", "))));
+        }
+        let reload = matches!(self.overlay, Overlay::Models { .. });
+        let project = self.project.clone();
+        self.spawn(move |client, tx| {
+            let _ = tx.send(match crate::set_model_capabilities(&client, &name, &capabilities) {
+                Ok(now) if capabilities.is_empty() => {
+                    AppEvent::Notice(format!("{} capabilities as the catalog has them: {}", name, now.join(", ")))
+                }
+                Ok(now) => AppEvent::Notice(format!("{} capabilities set here: {}", name, now.join(", "))),
+                Err(e) => AppEvent::Error(e),
+            });
+            if reload && let Some((id, _)) = project {
+                let _ = tx.send(AppEvent::Models(crate::model_rows(&client, &id)));
+            }
+        });
+    }
+
     fn open_mcp(&mut self) {
         if self.project.is_none() {
             return;
@@ -2673,7 +2700,20 @@ impl App {
                 })
             }
             "/quit" | "/exit" | "/q" | "exit" => self.quit = true,
-            "/models" => self.open_models(),
+            "/models" => match words.next() {
+                None | Some("list") => self.open_models(),
+                Some(name) => {
+                    let name = name.to_string();
+                    let rest: Vec<&str> = words.collect();
+                    match rest.as_slice() {
+                        ["caps" | "capabilities", list] => self.set_capabilities(name, list),
+                        _ => self.entries.push(Entry::Error(
+                            "Try /models <name> caps <coding,dp,...> to set a model's capabilities here, or /models <name> caps auto"
+                                .to_string(),
+                        )),
+                    }
+                }
+            },
             "/mcp" => match words.next() {
                 None | Some("list") => self.open_mcp(),
                 Some("add") => self.add_mcp(&words.collect::<Vec<_>>().join(" ")),
@@ -3482,6 +3522,9 @@ impl App {
                 spans.push(state);
                 spans.push(Span::raw(" ".repeat(16usize.saturating_sub(state_width))));
                 spans.push(Span::styled(m.capabilities.clone(), dim()));
+                if m.overridden {
+                    spans.push(Span::styled(" · set here", dim()));
+                }
                 if !m.accessible {
                     spans.push(Span::styled("  · sign in to use", Style::new().fg(Color::Yellow)));
                 }
@@ -3752,6 +3795,19 @@ fn entry_version(entry: &Entry) -> usize {
         Entry::Shell(shell) => usize::from(shell.output.is_some()) + 1,
         _ => 1,
     }
+}
+
+/// The capabilities a `/models <name> caps` list names: `auto` for none
+/// of our own, else names split on commas, lower-cased.
+fn capability_list(list: &str) -> Result<Vec<String>, String> {
+    if list.eq_ignore_ascii_case("auto") {
+        return Ok(Vec::new());
+    }
+    let caps: Vec<String> = list.split(',').map(|c| c.trim().to_lowercase()).filter(|c| !c.is_empty()).collect();
+    if caps.is_empty() {
+        return Err("Name the capabilities, as in /models <name> caps coding,general; or auto".to_string());
+    }
+    Ok(caps)
 }
 
 /// Of `paths`, those under `root` but not its `.out/`, relative to it.
@@ -4231,6 +4287,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/code off", "mark this folder a documents project"),
         ("/code auto", "read the folder's kind off its files again"),
         ("/write [path]", "write the last reply's files left unwritten, or one of them"),
+        ("/models <name> caps <list|auto>", "set a model's capabilities here, over the catalog's"),
         ("/status", "account, model, agent and versions"),
         ("/login", "sign in in the browser (--token to paste one)"),
         ("/logout", "log out"),
@@ -4619,6 +4676,38 @@ mod tests {
         app.input = "/write".into();
         app.submit();
         assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n.starts_with("Nothing left unwritten")));
+    }
+
+    #[test]
+    fn models_caps_sets_a_models_capabilities_here() {
+        assert_eq!(capability_list("Coding, dp"), Ok(vec!["coding".to_string(), "dp".to_string()]));
+        assert_eq!(capability_list("auto"), Ok(vec![]));
+        assert!(capability_list(" , ").is_err());
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let last = |app: &App| match app.entries.last() {
+            Some(Entry::Error(e) | Entry::Notice(e)) => e.clone(),
+            _ => String::new(),
+        };
+        app.input = "/models qwen3.5-2b caps coding,general".into();
+        app.submit();
+        assert_eq!(last(&app), "Setting qwen3.5-2b capabilities: coding, general");
+        app.input = "/models qwen3.5-2b".into();
+        app.submit();
+        assert!(last(&app).starts_with("Try /models <name> caps"), "{}", last(&app));
+        let rows: Vec<ModelRow> = vec![ModelRow {
+            name: "qwen3.5-2b".into(),
+            capabilities: "general, coding".into(),
+            overridden: true,
+            access: "free".into(),
+            accessible: true,
+            downloaded: true,
+            enabled: true,
+        }];
+        app.overlay = Overlay::Models { rows: Some(Ok(rows)), selected: 0 };
+        let text = screen(&app, 100, 24);
+        assert!(text.contains("general, coding · set here"), "{}", text);
     }
 
     #[test]
@@ -5163,6 +5252,7 @@ mod tests {
         let model = |name: &str, downloaded, enabled| ModelRow {
             name: name.into(),
             capabilities: "general, vision".into(),
+            overridden: false,
             access: "free".into(),
             accessible: true,
             downloaded,
