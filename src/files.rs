@@ -251,12 +251,10 @@ pub struct File {
     pub content: String,
 }
 
-/// A file in a reply, with the lines of the reply that give it: its
-/// path's own line when it has one, through the block's end, and the line
-/// its code starts on (the opening fence, or the first indented line).
+/// A file in a reply, and the line of the reply its code starts on: the
+/// opening fence, or the first indented line.
 pub struct Block {
     pub file: File,
-    pub lines: std::ops::Range<usize>,
     pub fence: usize,
 }
 
@@ -290,7 +288,7 @@ pub fn blocks(reply: &str) -> Vec<Block> {
                 && let Some((content, next)) = indented_block(&lines, i)
             {
                 let fence = (i..next).find(|k| !lines[*k].trim().is_empty()).unwrap_or(i);
-                blocks.push(Block { file: File { path, content }, lines: at..next, fence });
+                blocks.push(Block { file: File { path, content }, fence });
                 i = next;
                 above = None;
                 continue;
@@ -307,14 +305,12 @@ pub fn blocks(reply: &str) -> Vec<Block> {
         let mut body: Vec<&str> = lines[start..i].to_vec();
         // Past the closing fence, when there is one.
         i = (i + 1).min(lines.len());
-        let mut from = at;
         let mut path = info_path(info);
         if path.is_none()
-            && let Some((label_at, label)) = above
+            && let Some((_, label)) = above
             && let Some(labelled) = label_path(label)
         {
             path = Some(labelled);
-            from = label_at;
         }
         if path.is_none() {
             path = body.first().and_then(|first| comment_path(first));
@@ -335,7 +331,7 @@ pub fn blocks(reply: &str) -> Vec<Block> {
         let Some(path) = path else { continue };
         let mut content = body.join("\n");
         content.push('\n');
-        blocks.push(Block { file: File { path, content }, lines: from..i, fence: at });
+        blocks.push(Block { file: File { path, content }, fence: at });
     }
     blocks
 }
@@ -997,9 +993,8 @@ mod tests {
 
         let reply = "Done.\n\n**`src/a.rs`**\n\n```rust\nfn a() {}\n```\n\n`b.txt`\n\n    hello\n\n```sh\nls\n";
         let blocks = blocks(reply);
-        let seen: Vec<(&str, usize, std::ops::Range<usize>)> =
-            blocks.iter().map(|b| (b.file.path.as_str(), b.fence, b.lines.clone())).collect();
-        assert_eq!(seen, [("src/a.rs", 4, 2..7), ("b.txt", 10, 8..12)]);
+        let seen: Vec<(&str, usize)> = blocks.iter().map(|b| (b.file.path.as_str(), b.fence)).collect();
+        assert_eq!(seen, [("src/a.rs", 4), ("b.txt", 10)]);
         assert!(block_closed("```rust\nfn a() {}\n```"));
         assert!(!block_closed("```rust\nfn a() {}"));
     }
