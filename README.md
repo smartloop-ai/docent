@@ -215,6 +215,7 @@ On exit it prints the session id, to resume with `--session`.
 | `/usage` | web searches left, tokens and cost saved |
 | `/upgrade` | Pro plan: 1,000 web searches a month |
 | `/code [on\|off\|auto]` | whether prompts in this folder are answered with code (see [Coding](#coding)); `on` and `off` mark the folder over what its files say, `auto` unmarks it |
+| `/write [path]` | write the last reply's files that were left unwritten, or one of them |
 | `/clear` | clear the chat and start a new session |
 | `/<skill> [prompt]` | run one of the project's skills; `/` lists them with the commands |
 | `!<command>` | run a shell command in the working directory; its output goes to the agent with your next prompt, so it stays in the session |
@@ -327,7 +328,8 @@ fenced block with its path above, are written into the folder, and the chat
 lists what each gained and lost by lines. In the reply, a file shows as its
 change against the file in the folder, lines added and removed with a little
 context, as it streams in; a new file as additions, folded past 40 lines. A file the agent wasn't shown whole
-isn't replaced by a reply shorter than it. Once the files are written, the
+isn't replaced by a reply shorter than it: its change still shows, and
+`/write` puts it down if it's what you want. Once the files are written, the
 project is checked with a quick command for its kind, such as `cargo check`,
 `go build ./...`, the package's `build` script or `tsc --noEmit`, shown like
 a `!` command. A project with no build of its own, or a plain folder of

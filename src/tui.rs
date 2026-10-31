@@ -906,6 +906,9 @@ struct App {
     check: Option<Check>,
     /// Rounds of fixing a failed check since the user's last prompt.
     fix_round: u32,
+    /// The last reply's files left unwritten, as the agent wasn't shown
+    /// them whole, with their folder: `/write` writes them after all.
+    kept: Option<(std::path::PathBuf, Vec<files::File>)>,
     /// What the check said when it last failed, to tell a round that fixed
     /// nothing.
     last_failure: Option<String>,
@@ -979,6 +982,7 @@ impl App {
             shell_runs: 0,
             check: None,
             fix_round: 0,
+            kept: None,
             last_failure: None,
             hint_at: 0,
             skills: Vec::new(),
@@ -1374,6 +1378,39 @@ impl App {
                 .is_some_and(|dir| code_kind(&dir).is_some() || files::mentions_file(&dir, prompt))
     }
 
+    /// `/write [path]`: write the last reply's files left unwritten, all of
+    /// them or the one named, replacing what's there.
+    fn write_command(&mut self, path: Option<&str>) {
+        let Some((root, kept)) = self.kept.take() else {
+            return self.entries.push(Entry::Notice("Nothing left unwritten from the last reply".to_string()));
+        };
+        let (chosen, rest): (Vec<files::File>, Vec<files::File>) =
+            kept.into_iter().partition(|f| path.is_none_or(|p| p.trim_start_matches("./") == f.path));
+        if chosen.is_empty() {
+            let paths: Vec<&str> = rest.iter().map(|f| f.path.as_str()).collect();
+            self.entries.push(Entry::Error(format!("Nothing by that name left unwritten; there's {}", paths.join(", "))));
+            self.kept = Some((root, rest));
+            return;
+        }
+        let (written, failed) = files::write(&root, &chosen);
+        if !written.is_empty() {
+            self.entries.push(Entry::Notice(format!("Written in {}: {}", root.display(), written.join(", "))));
+        }
+        for failure in failed {
+            self.entries.push(Entry::Error(format!("Failed to write {}", failure)));
+        }
+        if !rest.is_empty() {
+            self.kept = Some((root.clone(), rest));
+        }
+        if !written.is_empty() {
+            if let Some(sync) = &self.sync {
+                sync.nudge.store(true, Ordering::Relaxed);
+            }
+            self.run_check(&root, &written);
+        }
+        self.scroll_back = 0;
+    }
+
     /// `/code`: whether this folder is taken as a code project, so prompts
     /// here are answered with code; `on` and `off` mark it so, over what
     /// its files say.
@@ -1456,10 +1493,13 @@ impl App {
             self.entries.push(Entry::Warning(format!("Not written, outside {}: {}", root.display(), plan.refused.join(", "))));
         }
         if !plan.kept.is_empty() {
+            let paths: Vec<&str> = plan.kept.iter().map(|f| f.path.as_str()).collect();
             self.entries.push(Entry::Warning(format!(
-                "Not written, as the reply holds less than the file and the agent wasn't shown it whole; change by hand: {}",
-                plan.kept.join(", ")
+                "Not written, as the reply holds less than the file and the agent wasn't shown it whole: {}; the change \
+                 shows above, and /write writes it anyway",
+                paths.join(", ")
             )));
+            self.kept = Some((root.to_path_buf(), plan.kept.clone()));
         }
         // Each file's lines added and removed, against what's there now.
         let changes: Vec<(&files::File, bool, (usize, usize))> = plan
@@ -2652,6 +2692,7 @@ impl App {
             }
             "/sync" => self.sync_command(&words.collect::<Vec<_>>()),
             "/code" => self.code_command(words.next()),
+            "/write" => self.write_command(words.next()),
             "/help" | "/?" => self.overlay = Overlay::Help,
             "/status" => self.open_status(),
             "/usage" => self.open_usage(),
@@ -4094,7 +4135,7 @@ fn is_document(path: &std::path::Path) -> bool {
 
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
-const COMMANDS: [(&str, &str); 13] = [
+const COMMANDS: [(&str, &str); 14] = [
     ("/help", "shortcuts and commands"),
     ("/login", "sign in in the browser (--token to paste one)"),
     ("/logout", "log out"),
@@ -4104,6 +4145,7 @@ const COMMANDS: [(&str, &str); 13] = [
     ("/status", "account, model, agent and versions"),
     ("/sync", "sync this folder's documents to the project"),
     ("/code", "answer prompts here with code: on, off, or how it stands"),
+    ("/write", "write the last reply's files left unwritten"),
     ("/usage", "web searches left, tokens and cost saved"),
     ("/upgrade", "Pro plan: 1,000 web searches a month"),
     ("/clear", "clear the chat and start a new session"),
@@ -4188,6 +4230,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/code on", "mark this folder a code project"),
         ("/code off", "mark this folder a documents project"),
         ("/code auto", "read the folder's kind off its files again"),
+        ("/write [path]", "write the last reply's files left unwritten, or one of them"),
         ("/status", "account, model, agent and versions"),
         ("/login", "sign in in the browser (--token to paste one)"),
         ("/logout", "log out"),
@@ -4551,6 +4594,31 @@ mod tests {
         // A stale result, from a check since replaced, is dropped.
         app.apply(AppEvent::Check(id, "late".into(), Some(1)));
         assert!(matches!(app.entries.last(), Some(Entry::Notice(_))));
+    }
+
+    #[test]
+    fn write_puts_down_a_file_the_guard_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let long: String = (1..=100).map(|i| format!("line {}\n", i)).collect();
+        std::fs::write(dir.path().join("big.rs"), &long).unwrap();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        let file = |path: &str, content: &str| files::File { path: path.into(), content: content.into() };
+        let written = app.reply_files(dir.path(), vec![file("big.rs", "fn short() {}\n"), file("b.rs", "b\n")], &[], &[]);
+        assert_eq!(written, ["b.rs"]);
+        assert_eq!(std::fs::read_to_string(dir.path().join("big.rs")).unwrap(), long);
+        let text = screen(&app, 120, 24);
+        assert!(text.contains("/write writes it anyway"), "{}", text);
+        app.input = "/write other.rs".into();
+        app.submit();
+        assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("there's big.rs")));
+        app.input = "/write big.rs".into();
+        app.submit();
+        assert_eq!(std::fs::read_to_string(dir.path().join("big.rs")).unwrap(), "fn short() {}\n");
+        assert!(app.kept.is_none());
+        app.input = "/write".into();
+        app.submit();
+        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n.starts_with("Nothing left unwritten")));
     }
 
     #[test]
@@ -5310,7 +5378,7 @@ mod tests {
         assert_eq!(names, ["/mcp", "/Meeting_Notes", "/models", "/morning"]);
         app.input = "/".into();
         let names: Vec<String> = app.command_hints().into_iter().map(|(name, _)| name).collect();
-        assert_eq!(names.last().map(String::as_str), Some("/usage"));
+        assert_eq!(names.last().map(String::as_str), Some("/write"));
         assert!(names.windows(2).all(|w| w[0].to_lowercase() <= w[1].to_lowercase()), "{:?}", names);
         assert!(!app.command_hints().iter().any(|(_, what)| what.contains("shadowed")));
         app.input = "/mor".into();

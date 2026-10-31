@@ -46,8 +46,8 @@ const LOCKS: [&str; 7] =
 /// Most of the project's files listed for the agent.
 const LISTED: usize = 200;
 /// Most characters of file contents sent with a prompt, and of one file.
-const SHOWN: usize = 24_000;
-const SHOWN_EACH: usize = 8_000;
+const SHOWN: usize = 60_000;
+const SHOWN_EACH: usize = 30_000;
 
 /// The kind of code project `root` is, from the files at its top.
 pub fn project_kind(root: &Path) -> Option<&'static str> {
@@ -597,8 +597,9 @@ pub struct Plan {
     /// Paths that lead outside the folder, left alone.
     pub refused: Vec<String>,
     /// There, and not shown to the agent whole: a reply shorter than the
-    /// file can't be all of it, so it's left as it is, to change by hand.
-    pub kept: Vec<String>,
+    /// file can't be all of it, so it's left as it is, unless `/write`
+    /// says otherwise.
+    pub kept: Vec<File>,
 }
 
 /// Sort `files` against what's under `root`, `whole` being the files the
@@ -612,7 +613,7 @@ pub fn plan(root: &Path, files: Vec<File>, whole: &[String]) -> Plan {
             Some(path) => match fs::read_to_string(&path) {
                 Ok(text) if text == file.content => {}
                 Ok(text) if !whole.contains(&file.path) && file.content.len() < text.len() / 10 * 9 => {
-                    plan.kept.push(file.path)
+                    plan.kept.push(file)
                 }
                 Ok(_) => plan.changed.push(file),
                 Err(_) if path.exists() => plan.changed.push(file),
@@ -849,7 +850,7 @@ mod tests {
         let file = |content: &str| File { path: "big.rs".into(), content: content.into() };
         // A snippet for a file shown in part, or not at all, is kept out.
         let sorted = plan(dir.path(), vec![file("fn snippet() {}\n")], &[]);
-        assert_eq!(sorted.kept, ["big.rs"]);
+        assert_eq!(sorted.kept, [file("fn snippet() {}\n")]);
         assert!(sorted.changed.is_empty());
         // Shown whole, the reply is the edit, however short.
         let sorted = plan(dir.path(), vec![file("fn snippet() {}\n")], &["big.rs".to_string()]);
@@ -910,7 +911,7 @@ mod tests {
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
         fs::write(dir.path().join("src/news.rs"), "pub fn news() {}\n").unwrap();
-        let big: String = (1..=600).map(|i| format!("    let value_{} = {};\n", i, i)).collect();
+        let big: String = (1..=1400).map(|i| format!("    let value_{} = {};\n", i, i)).collect();
         let big = format!("{}fn status_line() {{}}\n{}", big, big);
         fs::write(dir.path().join("src/ui.rs"), &big).unwrap();
         let text = project_context(dir.path(), "Rust", "Fix the status line in the news feed");
@@ -920,7 +921,7 @@ mod tests {
         assert!(at("`src/news.rs`") < at("`src/main.rs`"), "{}", text.text);
         assert!(at("`src/main.rs`") < at("`README.md`"), "{}", text.text);
         // The big file shows the lines around the prompt's words, and says so.
-        assert!(text.text.contains("`src/ui.rs` (13 of its 1201 lines, for reference: don't give this file back whole)"), "{}", text.text);
+        assert!(text.text.contains("`src/ui.rs` (13 of its 2801 lines, for reference: don't give this file back whole)"), "{}", text.text);
         assert!(text.text.contains("fn status_line() {}"), "{}", text.text);
         assert!(!text.text.contains("let value_300 = 300;"), "{}", text.text);
         assert!(!text.whole.contains(&"src/ui.rs".to_string()));
