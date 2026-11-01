@@ -1,9 +1,12 @@
-//! Usage for `/usage`: web search, read from the platform (api.smartloop.ai),
-//! and tokens, read from the agent's own log of every turn.
+//! Usage for `/usage`: web search and credits, read from the platform
+//! (api.smartloop.ai), and tokens, read from the agent's own log of every
+//! turn.
 //!
 //! Web search usage is read from the platform (api.smartloop.ai) rather than
 //! the agent: `GET /v1/websearch/status` carries the month's allowance and
 //! what has been spent of it, which the agent's own gate reduces to a yes/no.
+//! Credits, what cloud models cost by model and load, come the same way from
+//! `GET /v1/usage/credits`.
 //!
 //! The CLI holds no token of its own. The agent keeps the signed-in one in
 //! `SLP_HOME/.credentials`, Fernet-encrypted under `SLP_HOME/.key`, so it is
@@ -83,26 +86,84 @@ impl SearchUsage {
     }
 }
 
-/// The signed-in account's usage, or `None` when nobody is signed in or the
-/// platform can't be reached — the footer then shows nothing.
+/// The account's credit allowance this month: what cloud models cost, by
+/// the model and the tokens a call took, as `/usage/credits` reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreditUsage {
+    pub used: u64,
+    /// `None` when unmetered (admins).
+    pub limit: Option<u64>,
+    /// `free`, `paid`, `plus` or `admin`.
+    pub plan: String,
+    /// When the count goes back to zero, as `YYYY-MM-DD`.
+    pub resets_on: Option<String>,
+    /// Tokens the month's credits paid for.
+    pub tokens: u64,
+}
+
+impl CreditUsage {
+    fn from_status(status: &serde_json::Value) -> Option<Self> {
+        let quota = &status["quota"];
+        if !quota.is_object() {
+            return None;
+        }
+        Some(CreditUsage {
+            used: quota["used"].as_u64().unwrap_or_default(),
+            limit: quota["limit"].as_u64(),
+            plan: quota["plan"].as_str().unwrap_or("free").to_string(),
+            resets_on: quota["resets_at"].as_str().and_then(|at| at.get(..10)).map(str::to_string),
+            tokens: quota["tokens"].as_u64().unwrap_or_default(),
+        })
+    }
+
+    /// Credits left this month; `None` when unmetered.
+    pub fn remaining(&self) -> Option<u64> {
+        self.limit.map(|limit| limit.saturating_sub(self.used))
+    }
+
+    /// Under `/usage`'s bar: `120 used · 12,000 tokens · paid plan · resets 2026-11-01`.
+    pub fn detail(&self) -> String {
+        let mut parts =
+            vec![format!("{} used", self.used), format!("{} tokens", thousands(self.tokens)), format!("{} plan", self.plan)];
+        match (self.limit, &self.resets_on) {
+            (Some(_), Some(on)) => parts.push(format!("resets {}", on)),
+            (None, _) => parts.push("unmetered".to_string()),
+            _ => {}
+        }
+        parts.join(" · ")
+    }
+}
+
+/// The signed-in account's web search usage, or `None` when nobody is
+/// signed in or the platform can't be reached — the footer then shows
+/// nothing.
 pub fn fetch(client: &Client) -> Option<SearchUsage> {
+    SearchUsage::from_status(&platform_status(client, "/v1/websearch/status")?)
+}
+
+/// The signed-in account's credits, as `fetch` gives the searches.
+pub fn fetch_credits(client: &Client) -> Option<CreditUsage> {
+    CreditUsage::from_status(&platform_status(client, "/v1/usage/credits")?)
+}
+
+/// A status reply from the platform under the agent's token, had again
+/// with a fresh one after a 401.
+fn platform_status(client: &Client, path: &str) -> Option<serde_json::Value> {
     let token = stored_token()?;
-    match status(client, &token) {
+    match status(client, &token, path) {
         Err(401) => {
             // Have the agent refresh the token, then try the new one.
             let _ = client.get(format!("{}/auth/status", crate::api_url())).timeout(TIMEOUT).send();
             let token = stored_token()?;
-            status(client, &token).ok()
+            status(client, &token, path).ok()
         }
         result => result.ok(),
     }
-    .as_ref()
-    .and_then(SearchUsage::from_status)
 }
 
-fn status(client: &Client, token: &str) -> Result<serde_json::Value, u16> {
+fn status(client: &Client, token: &str, path: &str) -> Result<serde_json::Value, u16> {
     let response = client
-        .get(format!("{}/v1/websearch/status", platform_url()))
+        .get(format!("{}{}", platform_url(), path))
         .bearer_auth(token)
         .timeout(TIMEOUT)
         .send()
@@ -248,6 +309,15 @@ mod tests {
         });
         assert_eq!(SearchUsage::from_status(&status), Some(usage(12, Some(50))));
         assert_eq!(SearchUsage::from_status(&serde_json::json!({"enabled": false})), None);
+        let credits = serde_json::json!({
+            "enabled": true,
+            "quota": {"limit": 3000, "used": 120, "remaining": 2880, "tokens": 12000, "period": "2026-10",
+                      "resets_at": "2026-11-01T00:00:00Z", "plan": "paid"}
+        });
+        let credits = CreditUsage::from_status(&credits).unwrap();
+        assert_eq!(credits.remaining(), Some(2880));
+        assert_eq!(credits.detail(), "120 used · 12,000 tokens · paid plan · resets 2026-11-01");
+        assert_eq!(CreditUsage::from_status(&serde_json::json!({"detail": "no"})), None);
     }
 
     #[test]

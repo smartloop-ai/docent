@@ -206,14 +206,14 @@ On exit it prints the session id, to resume with `--session`.
 | --- | --- |
 | `/login`, `/logout` | sign in in the browser (`--token` to paste one) |
 | `/models` | enable, disable and download models |
-| `/models <name> caps <list\|auto>` | set a model's capabilities here, over the catalog's, as in `dp,general`; `auto` goes back to the catalog's |
+| `/models <name> caps <list\|auto>` | set a model's capabilities here, over the catalog's, as in `vision,reasoning`; `auto` goes back to the catalog's |
 | `/mcp` | MCP servers; `/mcp add <url>` connects one |
 | `/project` | projects: switch (in a new session), create, import, delete |
 | `/project <name>` | switch to a project by its name or ID |
 | `/project new <name>` | create a project and switch to it |
 | `/project import <zip>` | import an exported project and switch to it |
 | `/status` | account, model, agent and versions |
-| `/usage` | web searches left, tokens and cost saved |
+| `/usage` | web searches and credits left this month, tokens and cost saved |
 | `/upgrade` | Pro plan: 1,000 web searches a month |
 | `/code [on\|off\|auto]` | whether prompts in this folder are answered with code (see [Coding](#coding)); `on` and `off` mark the folder over what its files say, `auto` unmarks it |
 | `/write [path]` | write the last reply's files that were left unwritten, or one of them |
@@ -374,12 +374,13 @@ and give what the task still needs. That stops after three rounds, or at
 line saying so, not in a note that the agent can't run git. The agent takes a turn as coding
 work when the prompt asks for a change or about the code and the folder is a
 code project (or when the prompt is plainly about programming, anywhere).
-Which model answers is the orchestrator's call, from what the turn carries:
-with the project's documents indexed, the model tagged `dp` (document
-processing), as code is a document to read and write, when one is enabled
-(`/models` shows each model's capabilities), else its largest. A model the
-catalog doesn't tag can be given the capability here: `/models <name> caps
-dp,general`.
+Which model answers is the orchestrator's call: it steps up and down through
+the project's enabled models by their size, what they declare and the
+machine's resources, taking the largest that fits. Capabilities are what a
+model has (`vision`, `reasoning`, `thinking`; `/models` shows each model's),
+not what a turn is about, so there is no tag for coding or documents to set.
+A model the catalog doesn't describe can be given a capability here:
+`/models <name> caps vision,reasoning`.
 
 A folder is a code project when a manifest sits at its top: `Cargo.toml`,
 `package.json`, `pyproject.toml`, `go.mod`, `pom.xml` and the like. That's

@@ -48,7 +48,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::chat::{self, ChatEvent, TurnStats};
 use crate::progress::{self, Steps, format_duration, format_size};
-use crate::usage::{SearchUsage, TokenStats};
+use crate::usage::{CreditUsage, SearchUsage, TokenStats};
 use crate::{ModelRow, docent, files, framework, mcp};
 
 const LABEL_WIDTH: usize = 28;
@@ -146,6 +146,8 @@ enum AppEvent {
     Status(Vec<(String, String)>),
     /// The account's web search usage; `None` when signed out.
     Usage(Option<SearchUsage>),
+    /// `/usage`: this month's credits, read with the searches.
+    Credits(Option<CreditUsage>),
     /// The project's web search switch, read or just toggled; `toggled`
     /// says whether to announce it.
     WebSearch { enabled: bool, toggled: bool },
@@ -775,8 +777,8 @@ enum Overlay {
     Help,
     /// `/status`: rows fill in once the agent answers.
     Status(Option<Vec<(String, String)>>),
-    /// `/usage`: this month's web search allowance, re-read on opening
-    /// (`loading` until the platform answers), and the week's tokens.
+    /// `/usage`: this month's web search allowance and credits, re-read on
+    /// opening (`loading` until the platform answers), and the week's tokens.
     Usage { loading: bool, tokens: TokenStats },
 }
 
@@ -956,6 +958,8 @@ struct App {
     indexing_until: Option<Instant>,
     /// This month's web search usage, shown in the footer once known.
     search: Option<SearchUsage>,
+    /// This month's credits, read with `search`.
+    credits: Option<CreditUsage>,
     /// The project's web search switch (ctrl+s), once read.
     web_search: Option<bool>,
     quit: bool,
@@ -1017,6 +1021,7 @@ impl App {
             indexing_total: 0,
             indexing_until: None,
             search: None,
+            credits: None,
             web_search: None,
             quit: false,
         }
@@ -1253,9 +1258,7 @@ impl App {
     /// Re-read the web search usage from the platform. Also the last step
     /// of each turn, which may have spent a search.
     fn load_usage(&self) {
-        self.spawn(|client, tx| {
-            let _ = tx.send(AppEvent::Usage(crate::usage::fetch(&client)));
-        });
+        self.spawn(|client, tx| send_usage(&client, &tx));
     }
 
     fn load_models(&self) {
@@ -1899,6 +1902,7 @@ impl App {
                     *loading = false;
                 }
             }
+            AppEvent::Credits(credits) => self.credits = credits,
             AppEvent::Account(account) => self.account = Some(account),
             AppEvent::Connections(project, servers) => {
                 if self.project.as_ref().is_some_and(|(id, _)| *id == project) {
@@ -2294,8 +2298,9 @@ impl App {
     }
 
     /// `/models <name> caps <list|auto>`: set a model's capabilities here,
-    /// over the catalog's, so the planner routes to it; `auto` goes back to
-    /// the catalog's.
+    /// over the catalog's, so the planner routes to it: what the model has
+    /// (`vision`, `reasoning`, `thinking`), not what a turn is about; `auto`
+    /// goes back to the catalog's.
     fn set_capabilities(&mut self, name: String, list: &str) {
         let capabilities = match capability_list(list) {
             Ok(caps) => caps,
@@ -2865,7 +2870,7 @@ impl App {
                         Err(e) => AppEvent::Error(e),
                     });
                     refresh_models(&client, &tx, project);
-                    let _ = tx.send(AppEvent::Usage(crate::usage::fetch(&client)));
+                    send_usage(&client, &tx);
                     let _ = tx.send(AppEvent::Account(crate::account(&client)));
                 })
             }
@@ -2970,7 +2975,7 @@ impl App {
                 Err(e) => AppEvent::Error(e),
             });
             refresh_models(&client, &tx, project);
-            let _ = tx.send(AppEvent::Usage(crate::usage::fetch(&client)));
+            send_usage(&client, &tx);
             let _ = tx.send(AppEvent::Account(crate::account(&client)));
         });
     }
@@ -2990,7 +2995,7 @@ impl App {
                 Err(e) => AppEvent::Error(e),
             });
             refresh_models(&client, &tx, project);
-            let _ = tx.send(AppEvent::Usage(crate::usage::fetch(&client)));
+            send_usage(&client, &tx);
             let _ = tx.send(AppEvent::Account(crate::account(&client)));
         });
     }
@@ -3845,14 +3850,18 @@ impl App {
             .collect()
     }
 
-    /// `/usage`: how many web searches are left this month, as a bar that
-    /// empties as they're spent, then the week's tokens and what they'd
-    /// have cost on a hosted model, as on the web app's dashboard.
+    /// `/usage`: how many web searches and credits are left this month, as
+    /// bars that empty as they're spent, then the week's tokens and what
+    /// they'd have cost on a hosted model, as on the web app's dashboard.
     ///
     /// ```text
     ///  Web search  ███████████████████████░░░░░░░  38 left of 50
     ///              12 used · free plan · resets 2026-11-01
-    ///              /upgrade to Pro for 1,000 searches a month
+    ///              /upgrade to Pro or Plus for more searches and credits a month
+    ///
+    ///  Credits     ██████████████████████████████  2,880 left of 3,000
+    ///              120 used · 12,000 tokens · paid plan · resets 2026-11-01
+    ///              cloud models cost credits by model and load; local ones cost none
     ///
     ///  Tokens      45,210 in the last 7 days  ▁▁▃▂█▅▁
     ///              40,120 in · 5,090 out · on this machine
@@ -3864,6 +3873,27 @@ impl App {
         let mut lines = self.search_usage_lines(loading);
         let label = |text: &str| Span::styled(format!(" {:<12}", text), dim());
         let indent = || Span::raw(format!(" {:<12}", ""));
+        if let Some(credits) = self.credits.as_ref().filter(|_| self.search.is_some()) {
+            // Credits sit under the searches: the same month, the same plan.
+            lines.push(Line::default());
+            match (credits.limit, credits.remaining()) {
+                (Some(limit), Some(left)) => {
+                    let fraction = if limit == 0 { 0.0 } else { left as f64 / limit as f64 };
+                    lines.push(Line::from(vec![
+                        label("Credits"),
+                        Span::raw(progress::bar(fraction, USAGE_BAR)),
+                        Span::styled(format!("  {} left", crate::usage::thousands(left)), key_style()),
+                        Span::styled(format!(" of {}", crate::usage::thousands(limit)), dim()),
+                    ]));
+                }
+                _ => lines.push(Line::from(vec![label("Credits"), Span::styled("unlimited", key_style())])),
+            }
+            lines.push(Line::from(vec![indent(), Span::styled(credits.detail(), dim())]));
+            lines.push(Line::from(vec![
+                indent(),
+                Span::styled("cloud models cost credits by model and load; local ones cost none", dim()),
+            ]));
+        }
         let days = format!(" in the last {} days", crate::usage::TOKEN_DAYS);
         // A blank line between sections, so each reads on its own.
         lines.push(Line::default());
@@ -3927,12 +3957,14 @@ impl App {
             _ => lines.push(Line::from(vec![label(), Span::styled("unlimited", key_style())])),
         }
         lines.push(Line::from(vec![indent(), Span::styled(usage.detail(), dim())]));
-        if usage.plan == "free" {
-            lines.push(Line::from(vec![
-                indent(),
-                Span::styled("/upgrade", key_style()),
-                Span::styled(" to Pro for 1,000 searches a month", dim()),
-            ]));
+        // The plans with somewhere to go: Pro and Plus for free, Plus for Pro.
+        let more = match usage.plan.as_str() {
+            "free" => Some(" to Pro or Plus for more searches and credits a month"),
+            "paid" => Some(" to Plus for more searches and credits a month"),
+            _ => None,
+        };
+        if let Some(more) = more {
+            lines.push(Line::from(vec![indent(), Span::styled("/upgrade", key_style()), Span::styled(more, dim())]));
         }
         lines.extend(switch);
         lines
@@ -3983,7 +4015,7 @@ fn capability_list(list: &str) -> Result<Vec<String>, String> {
     }
     let caps: Vec<String> = list.split(',').map(|c| c.trim().to_lowercase()).filter(|c| !c.is_empty()).collect();
     if caps.is_empty() {
-        return Err("Name the capabilities, as in /models <name> caps coding,general; or auto".to_string());
+        return Err("Name the capabilities, as in /models <name> caps vision,reasoning; or auto".to_string());
     }
     Ok(caps)
 }
@@ -4237,6 +4269,13 @@ fn error_line(text: &str) -> Line<'static> {
     ])
 }
 
+/// Read this month's searches and credits from the platform, for the
+/// footer and `/usage`.
+fn send_usage(client: &Client, tx: &UnboundedSender<AppEvent>) {
+    let _ = tx.send(AppEvent::Usage(crate::usage::fetch(client)));
+    let _ = tx.send(AppEvent::Credits(crate::usage::fetch_credits(client)));
+}
+
 /// Re-read the project's models: signing in or out changes which ones are
 /// accessible.
 fn refresh_models(client: &Client, tx: &UnboundedSender<AppEvent>, project: Option<(String, String)>) {
@@ -4410,7 +4449,7 @@ const COMMANDS: [(&str, &str); 14] = [
     ("/sync", "sync this folder's documents to the project"),
     ("/code", "answer prompts here with code: on, off, or how it stands"),
     ("/write", "write the last reply's files left unwritten"),
-    ("/usage", "web searches left, tokens and cost saved"),
+    ("/usage", "web searches and credits left, tokens and cost saved"),
     ("/upgrade", "Pro plan: 1,000 web searches a month"),
     ("/clear", "clear the chat and start a new session"),
     ("/quit", "quit"),
@@ -4501,7 +4540,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/status", "account, model, agent and versions"),
         ("/login", "sign in in the browser (--token to paste one)"),
         ("/logout", "log out"),
-        ("/usage", "web searches left, tokens and cost saved"),
+        ("/usage", "web searches and credits left, tokens and cost saved"),
         ("/upgrade", "Pro plan: 1,000 web searches a month"),
         ("/clear", "clear the chat and start a new session"),
         ("/<skill> [prompt]", "run one of the project's skills"),
@@ -5020,7 +5059,7 @@ mod tests {
 
     #[test]
     fn models_caps_sets_a_models_capabilities_here() {
-        assert_eq!(capability_list("Coding, dp"), Ok(vec!["coding".to_string(), "dp".to_string()]));
+        assert_eq!(capability_list("Vision, reasoning"), Ok(vec!["vision".to_string(), "reasoning".to_string()]));
         assert_eq!(capability_list("auto"), Ok(vec![]));
         assert!(capability_list(" , ").is_err());
         let mut app = app();
@@ -5409,7 +5448,7 @@ mod tests {
             "Web search",
             "38 left of 50",
             "12 used · free plan · resets 2026-11-01",
-            "/upgrade to Pro for 1,000 searches a month",
+            "/upgrade to Pro or Plus for more searches and credits a month",
             "Tokens      1,100,550 in the last 7 days  ▁▁▁▁▂▁█",
             "1,000,500 in · 100,050 out · on this machine",
             "Cost saved  $3.5018 in the last 7 days",
