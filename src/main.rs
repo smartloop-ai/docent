@@ -150,20 +150,31 @@ pub fn needs_claim(project: &serde_json::Value) -> bool {
     !project["system"].as_bool().unwrap_or(false) && project["client"].as_str().is_none_or(str::is_empty)
 }
 
+/// Whether `project` is the agent's own, marked docent's by a docent that
+/// didn't yet know better: to be let go, so every client sees it again.
+pub fn needs_release(project: &serde_json::Value) -> bool {
+    project["system"].as_bool().unwrap_or(false) && project["client"].as_str() == Some("docent")
+}
+
 /// Mark project `id` docent's, when it is nobody's yet: a folder linked
 /// before projects carried a client stays out of Studio's list from the
-/// next run on. Returns whether it was claimed now.
+/// next run on. A system project marked docent's is let go instead.
+/// Returns whether anything changed now.
 pub fn try_claim_project(client: &Client, id: &str) -> Result<bool, String> {
     let projects = try_fetch_projects(client)?;
     let Some(project) = projects.iter().find(|p| p["id"].as_str() == Some(id)) else {
         return Ok(false);
     };
-    if !needs_claim(project) {
+    let client_name = if needs_claim(project) {
+        "docent"
+    } else if needs_release(project) {
+        ""
+    } else {
         return Ok(false);
-    }
+    };
     let response = client
         .patch(format!("{}/{}", projects_url(), id))
-        .json(&serde_json::json!({ "client": "docent" }))
+        .json(&serde_json::json!({ "client": client_name }))
         .send()
         .map_err(|e| format!("Failed to claim project: {}", e))?;
     if !response.status().is_success() {
@@ -953,8 +964,12 @@ mod tests {
         assert!(super::needs_claim(&serde_json::json!({"id": "p1", "client": ""})));
         assert!(!super::needs_claim(&serde_json::json!({"id": "p1", "client": "docent"})));
         assert!(!super::needs_claim(&serde_json::json!({"id": "p1", "client": "studio"})));
-        // The agent's own project is every client's, never docent's.
+        // The agent's own project is every client's, never docent's; one
+        // marked so by an older docent is let go.
         assert!(!super::needs_claim(&serde_json::json!({"id": "p1", "system": true})));
+        assert!(super::needs_release(&serde_json::json!({"id": "p1", "system": true, "client": "docent"})));
+        assert!(!super::needs_release(&serde_json::json!({"id": "p1", "system": true})));
+        assert!(!super::needs_release(&serde_json::json!({"id": "p1", "system": false, "client": "docent"})));
     }
 
     use super::describe_agent;
