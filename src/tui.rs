@@ -2186,7 +2186,14 @@ impl App {
                 // background pass shows too; the turn's line keeps what it
                 // was doing.
                 turn.indexing = step == "index";
-                if !turn.indexing {
+                if step == "streaming" {
+                    // The agent's "Generating response" says nothing a
+                    // reader needs; the model writing the answer does.
+                    turn.activity = Some(match &reply.model {
+                        Some(model) => format!("Answering with {}", model),
+                        None => "Answering".to_string(),
+                    });
+                } else if !turn.indexing {
                     turn.activity = Some(message.trim_end_matches(['.', '…']).to_string());
                 }
             }
@@ -4731,6 +4738,14 @@ mod tests {
         let shown = screen(&app, 80, 24);
         assert!(shown.contains("Searching documents…"), "{}", shown);
         assert!(shown.contains("Indexing documents…"), "{}", shown);
+
+        // The answer being written says which model writes it, not the
+        // agent's "Generating response".
+        app.chat_event(ChatEvent::Status { step: "model".into(), message: "Selected minimax-m3 for the response".into() });
+        app.chat_event(ChatEvent::Status { step: "streaming".into(), message: "Generating response...".into() });
+        let shown = screen(&app, 80, 24);
+        assert!(shown.contains("Answering with minimax-m3…"), "{}", shown);
+        assert!(!shown.contains("Generating response"), "{}", shown);
 
         // With no turn, the agent's own state still shows the row; without
         // either, nothing does.
