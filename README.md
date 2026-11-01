@@ -321,12 +321,25 @@ then every few seconds pushes only what was added, changed or removed:
 
 ### Coding
 
+The split is this: the framework, the same one behind smartloop-studio,
+takes a prompt and its sources and produces an answer; its orchestrator
+picks the model that answers and decides on its own whether to search the
+web, for coding as for anything else. Docent is the coding harness around
+that: it builds the prompt from the folder, and takes the answer apart into
+files to write, checks to run and commands to run.
+
 In a code project, a prompt is answered with code that fits what's there:
 the agent is sent the project's files, with the contents of those the prompt
-concerns, and told to answer from them rather than the web (the project's
-web search is off for that turn). How much is sent follows the widest
+concerns, the folder's git state, and the request last with how to answer
+it, and told to answer from the files, with the web for what they don't
+tell, such as a library's current API. How much is sent follows the widest
 context window among the project's enabled models: 60,000 characters for a
-32k-token local model, up to 400,000 for a cloud model with a million. The files its reply gives, each whole in a
+32k-token local model, up to 400,000 for a cloud model with a million. A
+smaller model that the orchestrator picks still gets a prompt it can take:
+the framework fits it to the model's window, keeping the head and the tail
+and dropping the middle, which is why the file list, the git state and the
+manifests come first, the bulk of the contents after, and the request with
+its instructions closes the message. The files its reply gives, each whole in a
 fenced block with its path above, are written into the folder, and the chat
 lists what each gained and lost by lines. In the reply, a file shows as its
 change against the file in the folder, lines added and removed with a little
@@ -342,13 +355,31 @@ script, `python3 -m py_compile` for Python, `node --check`, `ruby -c`,
 agent to fix, and the fixed files are checked again, round after round until
 the check passes; it stops only when a round changes nothing, as when the
 check fails the same way again or the reply writes no file, or when you
-press `Esc`. The agent takes a turn as coding
+press `Esc`. Work that isn't a file, such as committing and pushing, installing
+a dependency or running the tests, the agent answers with the shell commands
+for it, in a fenced block marked `sh` with no path. Once the reply's files
+are written and checked, docent shows the commands and asks, as opencode
+does before a tool runs: `Enter` runs them in the folder, each block as one
+script in turn, shown like a `!` command; `Tab` runs them and turns
+auto-approve on, so every later reply's run without asking; `Esc` skips
+them. `Tab` on an empty prompt turns auto-approve on or off at any time, and
+the footer says when it's on. A command with a
+placeholder to fill in, like `<your-username>`, is left out and said so. To
+keep the agent from guessing, the prompt carries the folder's git state: its
+branch, remotes and changed files. What the commands print goes back to the
+agent, as a tool's result does in opencode: a failed one, to be put right
+with other commands or with files; the last one done, to say what that did
+and give what the task still needs. That stops after three rounds, or at
+`Esc`. So "commit and push the changes" ends in a commit, a push, and a
+line saying so, not in a note that the agent can't run git. The agent takes a turn as coding
 work when the prompt asks for a change or about the code and the folder is a
-code project (or when the prompt is plainly about programming, anywhere), and
-answers it with the project's model tagged `dp` (document processing), as
-code is a document to read and write, when one is enabled (`/models` shows
-each model's capabilities), else its largest. A model the catalog doesn't
-tag can be given the capability here: `/models <name> caps dp,general`.
+code project (or when the prompt is plainly about programming, anywhere).
+Which model answers is the orchestrator's call, from what the turn carries:
+with the project's documents indexed, the model tagged `dp` (document
+processing), as code is a document to read and write, when one is enabled
+(`/models` shows each model's capabilities), else its largest. A model the
+catalog doesn't tag can be given the capability here: `/models <name> caps
+dp,general`.
 
 A folder is a code project when a manifest sits at its top: `Cargo.toml`,
 `package.json`, `pyproject.toml`, `go.mod`, `pom.xml` and the like. That's

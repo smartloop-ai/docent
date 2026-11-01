@@ -5,6 +5,8 @@
 //! carries `HINT`, so the reply gives each file whole, in a fenced block
 //! with its path on the line above; `extract` finds those blocks, and the
 //! TUI writes them, asking before it replaces a file that's already there.
+//! Work that isn't a file, such as a commit, comes as a shell block with
+//! no path; `commands` finds those, and the TUI runs them in the folder.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -15,7 +17,13 @@ changed and why, then give each file's complete contents in its own \
 fenced code block, with the file's path relative to the working folder alone on the line just above the block, \
 like `src/main.rs`. Include every file the change needs, such as the manifest when the code uses a new \
 dependency. The files are written for me from those blocks, so don't tell me to create them by hand or \
-with a command.";
+with a command. Something to do in the folder that isn't a file, such as committing or pushing to git, \
+installing a dependency or running the tests, you do by giving the shell commands for it in a fenced block \
+marked `sh`, with no path: they're run for me in the working folder, in order, and their output comes back \
+to you with my next message. So never say you can't run commands or reach git: give the commands. Use the \
+folder's real values in them, such as its git branch and remote as given below, never a placeholder like \
+`<your-username>`; something you'd need and don't have, such as a remote that isn't set, ask me for \
+instead.";
 
 /// Files at a folder's top that say it's a code project, and its kind.
 const MARKERS: [(&str, &str); 14] = [
@@ -100,7 +108,11 @@ pub struct Context {
 /// source, then the rest; one too big to show whole shows the parts the
 /// prompt's words are in, and says so. `kind` is what the project is,
 /// as in "Rust"; `budget` the characters of contents to send, for the
-/// model's window (`budget_for`), half of it at most for one file.
+/// model's window (`budget_for`), half of it at most for one file. The
+/// framework fits the prompt to the model its orchestrator picks, keeping
+/// its head and tail; so what matters most comes first (the file list,
+/// the git state, the manifests and the files the prompt names), the bulk
+/// after, and the request with `HINT` closes the message.
 pub fn project_context(root: &Path, kind: &str, prompt: &str, budget: usize) -> Context {
     let shown_each = budget / 2;
     let mut paths: Vec<String> = ignore::WalkBuilder::new(root)
@@ -116,9 +128,10 @@ pub fn project_context(root: &Path, kind: &str, prompt: &str, budget: usize) -> 
     paths.sort_by_key(|p| (!is_manifest(p), p.clone()));
     let mut text = format!(
         "I'm working in the {} project at {}. This is about that project, not a general question: answer from \
-         its files below and what's in the folder, not from the web or general knowledge. When I ask for code \
-         or a change, answer with the code itself, not a description of it: change the project's files where \
-         the request fits them, keeping what they already do unless I ask otherwise.\n\n\
+         its files below and what's in the folder; the web is for what they don't tell, such as a library's \
+         current API, not for a general answer. When I ask for code or a change, answer with the code itself, \
+         not a description of it: change the project's files where the request fits them, keeping what they \
+         already do unless I ask otherwise.\n\n\
          Its files:\n",
         kind,
         root.display()
@@ -170,11 +183,88 @@ pub fn project_context(root: &Path, kind: &str, prompt: &str, budget: usize) -> 
         let lang = path.rsplit_once('.').map_or("", |(_, ext)| ext);
         shown.push_str(&format!("\n`{}`{}\n{}{}\n{}\n{}\n", path, note, fence, lang, body, fence));
     }
+    // Ahead of the contents: a model whose window the prompt outruns gets
+    // its head and tail, and loses the middle.
+    if let Some(git) = git_state(root) {
+        text.push_str("\nIts git state:\n```\n");
+        text.push_str(&git);
+        text.push_str("\n```\n");
+    }
     if !shown.is_empty() {
         text.push_str("\nTheir contents now:\n");
         text.push_str(&shown);
     }
     Context { text, whole }
+}
+
+/// The folder's git branch, remotes and changed files, as `git status
+/// --short --branch` and `git remote -v` print them, for commands that
+/// commit or push; `None` where it isn't a repository, or git is missing.
+fn git_state(root: &Path) -> Option<String> {
+    if !root.join(".git").exists() {
+        return None;
+    }
+    let run = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+    };
+    let status = run(&["status", "--short", "--branch"])?;
+    let mut lines: Vec<&str> = status.lines().collect();
+    let more = lines.len().saturating_sub(GIT_STATUS_LINES + 1);
+    lines.truncate(GIT_STATUS_LINES + 1);
+    let mut text = lines.join("\n");
+    if more > 0 {
+        text.push_str(&format!("\n… and {} more changed files", more));
+    }
+    match run(&["remote", "-v"]) {
+        Some(remotes) if !remotes.is_empty() => {
+            text.push('\n');
+            text.push_str(&remotes);
+        }
+        _ => text.push_str("\n(no remote is set)"),
+    }
+    Some(text)
+}
+
+/// Changed files the git state lists, at most.
+const GIT_STATUS_LINES: usize = 40;
+
+/// The placeholders in `script`, a command the agent gave with a value
+/// to fill in, as `<your-username>` or `YOUR_TOKEN`: it mustn't run as
+/// it is. A redirect, `< file`, or a heredoc, `<<EOF`, isn't one.
+pub fn placeholders(script: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut add = |text: String| {
+        if !found.contains(&text) {
+            found.push(text);
+        }
+    };
+    for (i, _) in script.match_indices('<') {
+        let rest = &script[i + 1..];
+        let Some(end) = rest.find('>') else { continue };
+        let inner = &rest[..end];
+        let named = !script[..i].ends_with('<')
+            && inner.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && inner.chars().last().is_some_and(|c| c.is_ascii_alphanumeric())
+            && inner.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ' | '.'))
+            && !inner.contains("  ");
+        if named {
+            add(format!("<{}>", inner));
+        }
+    }
+    for token in script.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        if token.starts_with("YOUR_") && token.len() > 5 {
+            add(token.to_string());
+        }
+    }
+    found
 }
 
 /// Up to `limit` bytes of `content`, a file too big to show whole: the
@@ -350,6 +440,52 @@ pub fn blocks(reply: &str) -> Vec<Block> {
     }
     blocks
 }
+
+/// The shell commands `reply` gives to run, one script per fenced block
+/// marked as shell (`sh`, `bash`, `zsh`, `shell`, `console`, `terminal`)
+/// that names no file, in order. A block written as a transcript, with
+/// `$ ` ahead of each command, keeps the commands and not what they
+/// printed. A block with a path above or in its fence is a file to write,
+/// not a script to run.
+pub fn commands(reply: &str) -> Vec<String> {
+    let files: Vec<usize> = blocks(reply).iter().map(|b| b.fence).collect();
+    let lines: Vec<&str> = reply.lines().collect();
+    let mut scripts = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let at = i;
+        i += 1;
+        let Some((fence, info)) = opening_fence(lines[at]) else { continue };
+        let start = i;
+        while i < lines.len() && !closes(lines[i], &fence) {
+            i += 1;
+        }
+        let body = &lines[start..i];
+        i = (i + 1).min(lines.len());
+        let lang = info.split_whitespace().next().unwrap_or("").to_lowercase();
+        if files.contains(&at) || !SHELL_LANGS.contains(&lang.as_str()) {
+            continue;
+        }
+        // A transcript, with prompts, shows what each command printed too:
+        // only the commands are run.
+        let prompted = |l: &str| l.starts_with("$ ") || l == "$";
+        let transcript = body.iter().any(|l| prompted(l));
+        let script: Vec<&str> = body
+            .iter()
+            .map(|l| l.trim_end())
+            .filter(|l| !transcript || prompted(l))
+            .map(|l| l.strip_prefix('$').map_or(l, str::trim_start))
+            .collect();
+        let script = script.join("\n");
+        if script.lines().any(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')) {
+            scripts.push(script.trim().to_string());
+        }
+    }
+    scripts
+}
+
+/// Info-string languages that mark a block as shell commands to run.
+const SHELL_LANGS: [&str; 6] = ["sh", "bash", "zsh", "shell", "console", "terminal"];
 
 /// Whether `block`, a fenced block's text from its opening fence, has its
 /// closing fence: not while it streams.
@@ -789,6 +925,25 @@ mod tests {
         let reply = "Run this:\n\n```bash\ncargo new hello\n```\n\nThen edit your `Cargo.toml`:\n\n```toml\n\
             [dependencies]\n```\n\nVersion 1.0\n```\nplain\n```\n";
         assert!(extract(reply).is_empty(), "{:?}", extract(reply));
+    }
+
+    #[test]
+    fn shell_blocks_without_a_path_are_commands_to_run() {
+        let reply = "Committing it:\n\n```bash\ngit add -A\ngit commit -m \"feat: tags\"\n```\n\nthen\n\n```sh\n$ git push\n```\n\n\
+            `scripts/run.sh`\n```sh\necho a file\n```\n\n```\nplain\n```\n\n```sh\n# only a comment\n```\n";
+        assert_eq!(commands(reply), ["git add -A\ngit commit -m \"feat: tags\"", "git push"]);
+        assert_eq!(extract(reply).len(), 1);
+        assert!(commands("No commands here\n").is_empty());
+        let transcript = "```console\n$ git status\nOn branch main\nnothing to commit\n$ git push\n```\n";
+        assert_eq!(commands(transcript), ["git status\ngit push"]);
+        assert_eq!(
+            placeholders("git remote add origin https://github.com/<your-username>/todo-app.git\ngit push -u origin main"),
+            ["<your-username>"]
+        );
+        assert_eq!(placeholders("export TOKEN=YOUR_TOKEN_HERE"), ["YOUR_TOKEN_HERE"]);
+        assert_eq!(placeholders("sort < names.txt > out.txt && a <b> c"), ["<b>"]);
+        assert!(placeholders("git push -u origin main").is_empty());
+        assert!(placeholders("cat <<EOF > x\nhi\nEOF").is_empty());
     }
 
     #[test]
