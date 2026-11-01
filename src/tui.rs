@@ -3859,8 +3859,8 @@ impl App {
     ///              12 used · free plan · resets 2026-11-01
     ///              /upgrade to Pro or Plus for more searches and credits a month
     ///
-    ///  Credits     ██████████████████████████████  2,880 left of 3,000
-    ///              120 used · 12,000 tokens · paid plan · resets 2026-11-01
+    ///  Credits     ███████████████████████░░░░░░░  76% left
+    ///              3 calls · 12,000 tokens · paid plan · resets 2026-11-01
     ///              cloud models cost credits by model and load; local ones cost none
     ///
     ///  Tokens      45,210 in the last 7 days  ▁▁▃▂█▅▁
@@ -3875,24 +3875,28 @@ impl App {
         let indent = || Span::raw(format!(" {:<12}", ""));
         if let Some(credits) = self.credits.as_ref().filter(|_| self.search.is_some()) {
             // Credits sit under the searches: the same month, the same plan.
+            // The platform gives every account the share spent and admins
+            // the amounts, so the bar is drawn from the share.
             lines.push(Line::default());
-            match (credits.limit, credits.remaining()) {
-                (Some(limit), Some(left)) => {
-                    let fraction = if limit == 0 { 0.0 } else { left as f64 / limit as f64 };
+            match credits.fraction_left() {
+                Some(fraction) => {
+                    let left = match (credits.remaining(), credits.limit) {
+                        (Some(left), Some(limit)) => {
+                            format!("  {} left of {}", crate::usage::thousands(left), crate::usage::thousands(limit))
+                        }
+                        _ => format!("  {}% left", (fraction * 100.0).round() as u64),
+                    };
                     lines.push(Line::from(vec![
                         label("Credits"),
                         Span::raw(progress::bar(fraction, USAGE_BAR)),
-                        Span::styled(format!("  {} left", crate::usage::thousands(left)), key_style()),
-                        Span::styled(format!(" of {}", crate::usage::thousands(limit)), dim()),
+                        Span::styled(left, key_style()),
                     ]));
                 }
-                _ => lines.push(Line::from(vec![label("Credits"), Span::styled("unlimited", key_style())])),
+                None => lines.push(Line::from(vec![label("Credits"), Span::styled("unlimited", key_style())])),
             }
             lines.push(Line::from(vec![indent(), Span::styled(credits.detail(), dim())]));
-            lines.push(Line::from(vec![
-                indent(),
-                Span::styled("cloud models cost credits by model and load; local ones cost none", dim()),
-            ]));
+            let note = credits.why_off().unwrap_or("cloud models cost credits by model and load; local ones cost none");
+            lines.push(Line::from(vec![indent(), Span::styled(note, dim())]));
         }
         let days = format!(" in the last {} days", crate::usage::TOKEN_DAYS);
         // A blank line between sections, so each reads on its own.
