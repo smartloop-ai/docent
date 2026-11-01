@@ -219,7 +219,10 @@ On exit it prints the session id, to resume with `--session`.
 | `/write [path]` | write the last reply's files that were left unwritten, or one of them |
 | `/clear` | clear the chat and start a new session |
 | `/<skill> [prompt]` | run one of the project's skills; `/` lists them with the commands |
-| `!<command>` | run a shell command in the working directory; its output goes to the agent with your next prompt, so it stays in the session |
+| `!<command>` | run a shell command in the working directory, its output shown as it comes; the output goes to the agent with your next prompt, so it stays in the session. The prompt turns pink with `!` ahead as it's typed, and the footer says shell mode, as in Claude Code |
+| `!<command> &` | run it in the background, as a dev server: nothing waits for it, and it's listed under the prompt, out of the chat, until it ends |
+| `/tasks` | the commands still running, as in Claude Code: `↑` `↓` pick one, `Enter` shows all it printed, `x` stops it; `ctrl+b` opens it too (twice under tmux, where it's the prefix) |
+| `/stop [word]` | stop the shell commands still running, or those with the word in their command; a click on a running command's `✕ stop` in its entry stops it too, and a click on its command expands all it printed |
 | `/help`, `/quit` | |
 
 Pass an initial prompt to send immediately:
@@ -342,10 +345,13 @@ manifests come first, the bulk of the contents after, and the request with
 its instructions closes the message. The files its reply gives, each whole in a
 fenced block with its path above, are written into the folder, and the chat
 lists what each gained and lost by lines. In the reply, a file shows as its
-change against the file in the folder, lines added and removed with a little
-context, as it streams in; a new file as additions, folded past 40 lines. A file the agent wasn't shown whole
-isn't replaced by a reply shorter than it: its change still shows, and
-`/write` puts it down if it's what you want. Once the files are written, the
+change against the file in the folder, the way opencode shows an edit: only
+the changed hunks, each under its `@@` header with a few lines of context,
+every line numbered in the old and the new file, lines put in on green and
+lines taken out on red, as it streams in; a new file as additions, folded
+past 40 lines. A file the agent wasn't shown whole isn't replaced by a reply
+shorter than it: the reply's part shows as it is, not as the rest of the
+file taken out, and `/write` puts it down if it's what you want. Once the files are written, the
 project is checked with a quick command for its kind, such as `cargo check`,
 `go build ./...`, the package's `build` script or `tsc --noEmit`, shown like
 a `!` command. A project with no build of its own, or a plain folder of
@@ -364,7 +370,22 @@ script in turn, shown like a `!` command; `Tab` runs them and turns
 auto-approve on, so every later reply's run without asking; `Esc` skips
 them. `Tab` on an empty prompt turns auto-approve on or off at any time, and
 the footer says when it's on. A command with a
-placeholder to fill in, like `<your-username>`, is left out and said so. To
+placeholder to fill in, like `<your-username>`, is left out and said so. What
+a command prints shows as it comes, so a build or a test run is watched, not
+waited on blind. A command that keeps running, such as a dev server or a
+watcher, the agent gives with `&` at its end, as `npm run dev &`, and so can
+you after `!`: it's started in the background, the next command and the next
+prompt don't wait for it, it stays out of the chat until it ends, and several can
+run at once. Each command still running is listed under the prompt, with
+how long it's been. A click on its line there, or on its command in its
+entry, expands it under the prompt: all it printed, as it comes, and `Esc`
+closes it. From the keyboard, `/tasks` or `ctrl+b` (pressed twice under
+tmux, where it's the prefix) selects among them, as `/tasks` does in Claude
+Code: `↑` `↓` pick one, `Enter` expands it, `x` stops it. A click on its
+`✕ stop`, in its entry or on the expanded one, ends it too, as `x` does
+there; `/stop` ends every command
+still running, `/stop <word>` those with the word in their command, and
+quitting ends them all. To
 keep the agent from guessing, the prompt carries the folder's git state: its
 branch, remotes and changed files. What the commands print goes back to the
 agent, as a tool's result does in opencode: a failed one, to be put right

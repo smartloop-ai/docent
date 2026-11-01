@@ -23,7 +23,9 @@ marked `sh`, with no path: they're run for me in the working folder, in order, a
 to you with my next message. So never say you can't run commands or reach git: give the commands. Use the \
 folder's real values in them, such as its git branch and remote as given below, never a placeholder like \
 `<your-username>`; something you'd need and don't have, such as a remote that isn't set, ask me for \
-instead.";
+instead. A command that keeps running until it's stopped, such as a dev server or a watcher, you give with \
+`&` at its end, as `npm run dev &`, in a block of its own: it's started in the background, and what comes \
+after doesn't wait for it.";
 
 /// Files at a folder's top that say it's a code project, and its kind.
 const MARKERS: [(&str, &str); 14] = [
@@ -507,26 +509,82 @@ const CONTEXT: usize = 3;
 /// Lines of a new file shown before the rest is folded.
 const NEW_SHOWN: usize = 40;
 
+/// The change a reply makes to a file, by lines, as opencode shows an
+/// edit: hunks with `@@` headers, each line numbered in the old and the
+/// new file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diff {
+    pub path: String,
+    /// New: there was no old file.
+    pub created: bool,
+    pub added: usize,
+    pub removed: usize,
+    pub lines: Vec<DiffLine>,
+}
+
+/// A line of a `Diff`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffLine {
+    /// `@@ -old,count +new,count @@`: where the next lines are in each file.
+    Hunk { old: (usize, usize), new: (usize, usize) },
+    /// Kept, with its number in the old and the new file.
+    Keep(usize, usize, String),
+    /// Put in, with its number in the new file.
+    Add(usize, String),
+    /// Taken out, with its number in the old file.
+    Remove(usize, String),
+    /// Lines of a new file past `NEW_SHOWN`, folded.
+    Fold(usize),
+}
+
+impl std::fmt::Display for Diff {
+    /// As a unified diff, under a line naming the file and its counts.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.created {
+            writeln!(f, "{} · created, +{}", self.path, self.added)?;
+        } else {
+            writeln!(f, "{} · updated, +{} −{}", self.path, self.added, self.removed)?;
+        }
+        for line in &self.lines {
+            match line {
+                DiffLine::Hunk { old, new } => writeln!(f, "@@ -{},{} +{},{} @@", old.0, old.1, new.0, new.1)?,
+                DiffLine::Keep(_, _, text) => writeln!(f, " {}", text)?,
+                DiffLine::Add(_, text) => writeln!(f, "+{}", text)?,
+                DiffLine::Remove(_, text) => writeln!(f, "-{}", text)?,
+                DiffLine::Fold(n) => writeln!(f, "… {} more lines", n)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether a reply's `new` contents of a file hold less than the `old`
+/// file there: not all of it, so not a file to write over it.
+pub fn partial(old: &str, new: &str) -> bool {
+    new.len() < old.len() / 10 * 9
+}
+
 /// The change from `old`, the file as it is (none when it's new), to
-/// `new`, the file as a reply gives it, by lines: a header, then `+` and
-/// `-` lines with `CONTEXT` lines around them and `…` between hunks. A new
-/// file is all `+`, folded past `NEW_SHOWN` lines. While the reply is
-/// `streaming` the block, what's left of the old file past the new one's
-/// end isn't taken out yet, so it doesn't show as removed.
-pub fn diff(path: &str, old: Option<&str>, new: &str, streaming: bool) -> String {
+/// `new`, the file as a reply gives it, by lines: `+` and `-` lines with
+/// `CONTEXT` lines around them, in hunks. A new file is all `+`, folded
+/// past `NEW_SHOWN` lines. While the reply is `streaming` the block, what's
+/// left of the old file past the new one's end isn't taken out yet, so it
+/// doesn't show as removed.
+pub fn diff(path: &str, old: Option<&str>, new: &str, streaming: bool) -> Diff {
     let b: Vec<&str> = new.lines().collect();
-    let mut out = String::new();
+    let mut diff = Diff { path: path.to_string(), created: old.is_none(), added: 0, removed: 0, lines: Vec::new() };
     let Some(old) = old else {
-        out.push_str(&format!("@@ {} · created, +{} @@\n", path, b.len()));
-        for line in b.iter().take(NEW_SHOWN) {
-            out.push('+');
-            out.push_str(line);
-            out.push('\n');
+        diff.added = b.len();
+        if !b.is_empty() {
+            diff.lines.push(DiffLine::Hunk { old: (0, 0), new: (1, b.len()) });
+        }
+        for (i, line) in b.iter().enumerate().take(NEW_SHOWN) {
+            diff.lines.push(DiffLine::Add(i + 1, line.to_string()));
         }
         if b.len() > NEW_SHOWN {
-            out.push_str(&format!("… {} more lines\n", b.len() - NEW_SHOWN));
+            diff.lines.push(DiffLine::Fold(b.len() - NEW_SHOWN));
         }
-        return out;
+        return diff;
     };
     let a: Vec<&str> = old.lines().collect();
     let mut ops: Vec<(char, &str)> = if a.len() * b.len() > 4_000_000 {
@@ -555,29 +613,50 @@ pub fn diff(path: &str, old: Option<&str>, new: &str, streaming: bool) -> String
         ops.truncate(run);
         ops.extend(tail);
     }
-    let added = ops.iter().filter(|(c, _)| *c == '+').count();
-    let removed = ops.iter().filter(|(c, _)| *c == '-').count();
-    out.push_str(&format!("@@ {} · updated, +{} −{} @@\n", path, added, removed));
+    diff.added = ops.iter().filter(|(c, _)| *c == '+').count();
+    diff.removed = ops.iter().filter(|(c, _)| *c == '-').count();
     let changed: Vec<bool> = ops.iter().map(|(c, _)| *c != ' ').collect();
     let keep = |i: usize| (i.saturating_sub(CONTEXT)..(i + CONTEXT + 1).min(ops.len())).any(|k| changed[k]);
-    let mut gap = false;
+    // Each run of kept lines is a hunk, headed by where it starts in each
+    // file and how many lines of each it holds.
+    let (mut old_no, mut new_no) = (1, 1);
+    let mut hunk: Option<usize> = None;
     for (i, (c, line)) in ops.iter().enumerate() {
-        if !keep(i) {
-            gap = true;
-            continue;
+        if keep(i) {
+            if hunk.is_none() {
+                hunk = Some(diff.lines.len());
+                diff.lines.push(DiffLine::Hunk { old: (old_no, 0), new: (new_no, 0) });
+            }
+            let at = hunk.unwrap();
+            let DiffLine::Hunk { old, new } = &mut diff.lines[at] else { unreachable!() };
+            match c {
+                '+' => {
+                    new.1 += 1;
+                    diff.lines.push(DiffLine::Add(new_no, line.to_string()));
+                }
+                '-' => {
+                    old.1 += 1;
+                    diff.lines.push(DiffLine::Remove(old_no, line.to_string()));
+                }
+                _ => {
+                    old.1 += 1;
+                    new.1 += 1;
+                    diff.lines.push(DiffLine::Keep(old_no, new_no, line.to_string()));
+                }
+            }
+        } else {
+            hunk = None;
         }
-        if gap {
-            out.push_str("…\n");
-            gap = false;
+        match c {
+            '+' => new_no += 1,
+            '-' => old_no += 1,
+            _ => {
+                old_no += 1;
+                new_no += 1;
+            }
         }
-        out.push(*c);
-        out.push_str(line);
-        out.push('\n');
     }
-    if gap {
-        out.push_str("…\n");
-    }
-    out
+    diff
 }
 
 /// `a` turned into `b` line by line, by their longest common run: each
@@ -770,9 +849,7 @@ pub fn plan(root: &Path, files: Vec<File>, whole: &[String]) -> Plan {
             None => plan.refused.push(file.path),
             Some(path) => match fs::read_to_string(&path) {
                 Ok(text) if text == file.content => {}
-                Ok(text) if !whole.contains(&file.path) && file.content.len() < text.len() / 10 * 9 => {
-                    plan.kept.push(file)
-                }
+                Ok(text) if !whole.contains(&file.path) && partial(&text, &file.content) => plan.kept.push(file),
                 Ok(_) => plan.changed.push(file),
                 Err(_) if path.exists() => plan.changed.push(file),
                 Err(_) => plan.new.push(file),
@@ -1170,16 +1247,24 @@ mod tests {
         let old = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n";
         let new = "a\nb\nc\nd\nE\nf\ng\nh\ni\nj\nk\nl\nm\n";
         assert_eq!(
-            diff("x.rs", Some(old), new, false),
-            "@@ x.rs · updated, +2 −1 @@\n…\n b\n c\n d\n-e\n+E\n f\n g\n h\n…\n j\n k\n l\n+m\n"
+            diff("x.rs", Some(old), new, false).to_string(),
+            "x.rs · updated, +2 −1\n@@ -2,7 +2,7 @@\n b\n c\n d\n-e\n+E\n f\n g\n h\n@@ -10,3 +10,4 @@\n j\n k\n l\n+m\n"
         );
-        assert_eq!(diff("x.rs", None, "x\ny\n", false), "@@ x.rs · created, +2 @@\n+x\n+y\n");
+        let numbered = diff("x.rs", Some(old), new, false);
+        assert_eq!(numbered.lines[4..6], [DiffLine::Remove(5, "e".into()), DiffLine::Add(5, "E".into())]);
+        assert_eq!(numbered.lines[13], DiffLine::Add(13, "m".into()));
+        assert_eq!(diff("x.rs", None, "x\ny\n", false).to_string(), "x.rs · created, +2\n@@ -0,0 +1,2 @@\n+x\n+y\n");
         let long: String = (1..=50).map(|i| format!("l{}\n", i)).collect();
-        assert!(diff("x.rs", None, &long, true).ends_with("+l40\n… 10 more lines\n"));
-        assert_eq!(diff("x.rs", Some("same\n"), "same\n", false), "@@ x.rs · updated, +0 −0 @@\n…\n");
+        assert!(diff("x.rs", None, &long, true).to_string().ends_with("+l40\n… 10 more lines\n"));
+        assert_eq!(diff("x.rs", Some("same\n"), "same\n", false).to_string(), "x.rs · updated, +0 −0\n");
         // Streaming, the old file's tail isn't removed yet; closed, it is.
-        assert_eq!(diff("x.rs", Some("a\nb\nc\n"), "a\nB\n", true), "@@ x.rs · updated, +1 −1 @@\n a\n-b\n+B\n");
-        assert_eq!(diff("x.rs", Some("a\nb\nc\n"), "a\nB\n", false), "@@ x.rs · updated, +1 −2 @@\n a\n-b\n-c\n+B\n");
+        assert_eq!(diff("x.rs", Some("a\nb\nc\n"), "a\nB\n", true).to_string(), "x.rs · updated, +1 −1\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n");
+        assert_eq!(
+            diff("x.rs", Some("a\nb\nc\n"), "a\nB\n", false).to_string(),
+            "x.rs · updated, +1 −2\n@@ -1,3 +1,2 @@\n a\n-b\n-c\n+B\n"
+        );
+        // A reply with much less than the file isn't all of it.
+        assert!(partial(old, "a\nb\n") && !partial(old, new));
 
         let reply = "Done.\n\n**`src/a.rs`**\n\n```rust\nfn a() {}\n```\n\n`b.txt`\n\n    hello\n\n```sh\nls\n";
         let blocks = blocks(reply);

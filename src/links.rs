@@ -6,6 +6,10 @@
 //! with no bookkeeping: the underline color holds the URL's number in a
 //! table here. That color is only a marker; `apply` takes it off every cell
 //! before the frame reaches the terminal.
+//!
+//! An action rides the same way: `action` marks text with a `docent:` URL,
+//! which a click answers in the app rather than the browser, and which
+//! isn't made a hyperlink.
 
 use std::ops::Range;
 use std::sync::Mutex;
@@ -39,6 +43,19 @@ pub fn mark(style: Style, url: &str) -> Style {
     let [_, r, g, b] = (id as u32).to_be_bytes();
     style.underline_color(Color::Rgb(r, g, b))
 }
+
+/// `style` marked as doing `what` when clicked, as `stop/3`: the URL
+/// `docent:stop/3`, which `action_of` reads back.
+pub fn action(style: Style, what: &str) -> Style {
+    mark(style, &format!("{}{}", ACTION, what))
+}
+
+/// What a click on `url` does in the app, if it's an action's URL.
+pub fn action_of(url: &str) -> Option<&str> {
+    url.strip_prefix(ACTION)
+}
+
+const ACTION: &str = "docent:";
 
 /// The URL numbered `id`.
 pub fn url(id: u32) -> Option<String> {
@@ -391,7 +408,8 @@ pub fn apply(buffer: &mut Buffer, area: Rect, hyperlinks: bool) -> Vec<Vec<Optio
                     let width = cell.symbol().width();
                     // The second column of a wide character has nothing to
                     // wrap; the first one covers it.
-                    if hyperlinks && width > 0 {
+                    // An action is the app's to answer, not the terminal's.
+                    if hyperlinks && width > 0 && opens(url) {
                         let symbol = format!("\x1b]8;id={};{}\x1b\\{}\x1b]8;;\x1b\\", id, url, cell.symbol());
                         cell.set_symbol(&symbol);
                         // The escapes have no width on screen, so say how

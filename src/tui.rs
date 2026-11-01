@@ -166,14 +166,22 @@ enum AppEvent {
     Connections(String, Vec<mcp::Server>),
     /// The skills of this project, by id, for the slash-command hints.
     Skills(String, Vec<(String, String)>),
-    /// A `!command` finished: its run's id, its output and exit code.
-    Shell(usize, String, Option<i32>),
-    /// A reply's script finished: as `Shell`, with the project it ran for
-    /// and whether it was the last of the reply's.
-    Ran(usize, String, bool, String, Option<i32>),
+    /// A shell run's process is up: its run's id and process id, for
+    /// `/stop`.
+    Started(usize, u32),
+    /// A shell run printed more: its run's id, and all it printed so far.
+    Printed(usize, String),
+    /// A `!command` finished: its run's id, its output and how it ended.
+    /// `None` when it goes on in the background, told once; its end comes
+    /// later as another `Shell`.
+    Shell(usize, String, Option<Ended>),
+    /// A reply's script finished, or went on in the background: as
+    /// `Shell`, with the project it ran for and whether it was the last
+    /// of the reply's.
+    Ran(usize, String, bool, String, Option<Ended>),
     /// A check of the project after files were written: its shell entry's
-    /// id, output and exit code.
-    Check(usize, String, Option<i32>),
+    /// id, output and end.
+    Check(usize, String, Ended),
 }
 
 /// One `Steps` call, carried from a worker thread to the app.
@@ -521,11 +529,77 @@ enum Entry {
     Error(String),
 }
 
-/// A `!command` run in the working directory, with its output once done.
+/// A `!command`, a reply's script or a check run in the working directory,
+/// with what it printed so far and how it ended.
 struct Shell {
     id: usize,
     command: String,
-    output: Option<(String, Option<i32>)>,
+    /// What it printed so far, as a terminal would show it.
+    output: String,
+    /// How it ended; `None` while it runs.
+    ended: Option<Ended>,
+    /// Given with `&` at its end, as `npm run dev &`: started in the
+    /// background, nothing waits for it to end.
+    background: bool,
+    /// Told to the agent as running in the background, so its end is told
+    /// as that one's.
+    detached: bool,
+}
+
+/// How a shell run ended.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Ended {
+    Exited(i32),
+    /// By a signal from outside.
+    Killed,
+    /// By the user: `/stop`, or quitting.
+    Stopped,
+}
+
+impl Ended {
+    /// The exit code, as a terminal's `$?`: none for a signal.
+    fn code(self) -> Option<i32> {
+        match self {
+            Ended::Exited(code) => Some(code),
+            _ => None,
+        }
+    }
+
+    /// Whether the run went wrong. A stop isn't a failure: the user
+    /// wanted it.
+    fn failed(self) -> bool {
+        !matches!(self, Ended::Exited(0) | Ended::Stopped)
+    }
+
+    /// How it ended, for the agent: "exited with 1".
+    fn describe(self) -> String {
+        match self {
+            Ended::Exited(code) => format!("exited with {}", code),
+            Ended::Killed => "was killed by a signal".to_string(),
+            Ended::Stopped => "was stopped by me".to_string(),
+        }
+    }
+}
+
+/// A shell run still going, listed under the prompt, for `/stop` and for a
+/// click on it.
+struct Job {
+    id: usize,
+    command: String,
+    started: Instant,
+    /// The shell's process id once it runs; its group is what a stop ends.
+    pid: Option<u32>,
+    /// Set to stop it: the run's thread ends the process, and the run
+    /// ends as stopped rather than failed.
+    stopped: Arc<AtomicBool>,
+}
+
+/// Where a shell run's thread reports: the run's id, the app's channel,
+/// and the flag a `/stop` sets.
+struct Report {
+    id: usize,
+    tx: UnboundedSender<AppEvent>,
+    stopped: Arc<AtomicBool>,
 }
 
 /// One answer as it streams in. The agent's steps show on the status line
@@ -553,6 +627,9 @@ struct Reply {
     /// the reply's files are written when it ends, and the change is
     /// against what was there.
     olds: std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
+    /// The files the agent was shown whole: a reply giving back less of
+    /// one is still all of it.
+    whole: Vec<String>,
 }
 
 impl Reply {
@@ -578,8 +655,23 @@ impl Reply {
                     let part = match (code, file) {
                         (true, Some(file)) => {
                             let streaming = !files::block_closed(&segment);
-                            let diff = files::diff(&file.path, self.old(&file.path).as_deref(), &file.content, streaming);
-                            code_lines(&format!("```diff\n{}```", diff), width)
+                            let old = self.old(&file.path);
+                            match old.as_deref() {
+                                // Holding less than the file, it isn't all
+                                // of it: shown as it is, since as a change
+                                // the rest of the file would read as taken
+                                // out; and not written, see `reply_files`.
+                                Some(old) if !streaming && !self.whole.contains(&file.path) && files::partial(old, &file.content) => {
+                                    let mut part = vec![Line::from(vec![
+                                        Span::styled("← ", dim()),
+                                        Span::styled(file.path.clone(), Style::new().bold()),
+                                        Span::styled(" · less than the file, so not written over it", dim()),
+                                    ])];
+                                    part.extend(code_lines(&segment, width));
+                                    part
+                                }
+                                _ => diff_lines(&files::diff(&file.path, old.as_deref(), &file.content, streaming), width),
+                            }
                         }
                         (true, None) => code_lines(&segment, width),
                         (false, _) => prose_lines(&segment, width),
@@ -671,9 +763,7 @@ const CODE_PAD: usize = 2;
 /// `CODE_PAD` columns of background either side of the code and a row of
 /// it below.
 fn code_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
-    let pad = if width as usize > 2 * CODE_PAD { CODE_PAD } else { 0 };
-    let width = (width as usize).saturating_sub(2 * pad);
-    let mut out = Vec::new();
+    let mut rows = Vec::new();
     for line in tui_markdown::from_str_with_options(markdown, &tui_markdown::Options::new(Markdown)).lines {
         let mut column = 0;
         let mut spans: Vec<Span<'static>> = Vec::new();
@@ -695,18 +785,107 @@ fn code_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
             }
             spans.push(Span::styled(text, style));
         }
+        rows.push((spans, CODE_BG));
+    }
+    block_lines(rows, width)
+}
+
+/// Background of a line put in by a change, and of one taken out.
+const ADDED_BG: Color = Color::Rgb(31, 58, 43);
+const REMOVED_BG: Color = Color::Rgb(69, 37, 41);
+
+/// A file's change laid out as a block, the way opencode shows an edit:
+/// a line naming the file with what the change adds and removes, then
+/// each hunk under its `@@` header, every line numbered in the old and
+/// the new file, those put in on a green background and those taken out
+/// on a red one, with their sign ahead of them.
+fn diff_lines(diff: &files::Diff, width: u16) -> Vec<Line<'static>> {
+    use files::DiffLine;
+    let mut head = vec![
+        Span::styled(if diff.created { "# " } else { "← " }, dim()),
+        Span::styled(diff.path.clone(), Style::new().bold()),
+        Span::styled(format!("  +{}", diff.added), Style::new().fg(Color::Green)),
+    ];
+    if !diff.created {
+        head.push(Span::styled(format!(" −{}", diff.removed), Style::new().fg(Color::Red)));
+    }
+    let mut lines = vec![Line::from(head)];
+    // The gutter holds the old and the new line number, as wide as the
+    // largest; a new file's lines have only the new one.
+    let largest = diff.lines.iter().map(|l| match l {
+        DiffLine::Keep(o, n, _) => (*o).max(*n),
+        DiffLine::Add(n, _) => *n,
+        DiffLine::Remove(o, _) => *o,
+        _ => 0,
+    }).max().unwrap_or(0);
+    let digits = largest.to_string().len().max(2);
+    let number = |n: Option<usize>| match n {
+        Some(n) => format!("{:>digits$}", n),
+        None => " ".repeat(digits),
+    };
+    let gutter = |old: Option<usize>, new: Option<usize>, bg: Color| {
+        let text = if diff.created { format!("{} ", number(new)) } else { format!("{} {} ", number(old), number(new)) };
+        Span::styled(text, Style::new().fg(CODE_FG).bg(bg).add_modifier(Modifier::DIM))
+    };
+    let code = |text: &str, bg: Color| Span::styled(expand_tabs(text, CODE_TAB), Style::new().fg(CODE_FG).bg(bg));
+    let rows: Vec<(Vec<Span<'static>>, Color)> = diff
+        .lines
+        .iter()
+        .map(|line| match line {
+            DiffLine::Hunk { old, new } => {
+                let header = format!("@@ -{},{} +{},{} @@", old.0, old.1, new.0, new.1);
+                (vec![Span::styled(header, Style::new().fg(CODE_FG).bg(CODE_BG).add_modifier(Modifier::DIM))], CODE_BG)
+            }
+            DiffLine::Keep(old, new, text) => {
+                (vec![gutter(Some(*old), Some(*new), CODE_BG), Span::styled(" ", Style::new().bg(CODE_BG)), code(text, CODE_BG)], CODE_BG)
+            }
+            DiffLine::Add(new, text) => (
+                vec![
+                    gutter(None, Some(*new), ADDED_BG),
+                    Span::styled("+", Style::new().fg(Color::Green).bg(ADDED_BG)),
+                    code(text, ADDED_BG),
+                ],
+                ADDED_BG,
+            ),
+            DiffLine::Remove(old, text) => (
+                vec![
+                    gutter(Some(*old), None, REMOVED_BG),
+                    Span::styled("-", Style::new().fg(Color::Red).bg(REMOVED_BG)),
+                    code(text, REMOVED_BG),
+                ],
+                REMOVED_BG,
+            ),
+            DiffLine::Fold(n) => (
+                vec![Span::styled(format!("… {} more lines", n), Style::new().fg(CODE_FG).bg(CODE_BG).add_modifier(Modifier::DIM))],
+                CODE_BG,
+            ),
+        })
+        .collect();
+    lines.extend(block_lines(rows, width));
+    lines
+}
+
+/// Rows of spans laid out as a block: each split into rows of `width`
+/// rather than wrapped as prose, each row filled with its background to
+/// the width, with `CODE_PAD` columns of background either side and a row
+/// of it below.
+fn block_lines(rows: Vec<(Vec<Span<'static>>, Color)>, width: u16) -> Vec<Line<'static>> {
+    let pad = if width as usize > 2 * CODE_PAD { CODE_PAD } else { 0 };
+    let width = (width as usize).saturating_sub(2 * pad);
+    let mut out = Vec::new();
+    for (spans, bg) in rows {
         if width == 0 {
             out.push(Line::from(spans));
             continue;
         }
-        let (mut row, mut used): (Vec<Span<'static>>, usize) = (margin(pad), 0);
+        let (mut row, mut used): (Vec<Span<'static>>, usize) = (margin(pad, bg), 0);
         for span in spans {
             let mut piece = String::new();
             for c in span.content.chars() {
                 let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
                 if used + w > width && used > 0 {
                     row.push(Span::styled(std::mem::take(&mut piece), span.style));
-                    out.push(filled(std::mem::replace(&mut row, margin(pad)), used, width + pad));
+                    out.push(filled(std::mem::replace(&mut row, margin(pad, bg)), used, width + pad, bg));
                     used = 0;
                 }
                 piece.push(c);
@@ -716,24 +895,30 @@ fn code_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
                 row.push(Span::styled(piece, span.style));
             }
         }
-        out.push(filled(row, used, width + pad));
+        out.push(filled(row, used, width + pad, bg));
     }
     if width > 0 && !out.is_empty() {
-        out.push(filled(margin(pad), 0, width + pad));
+        out.push(filled(margin(pad, CODE_BG), 0, width + pad, CODE_BG));
     }
     out
 }
 
-/// The `pad` columns of background a code row starts with.
-fn margin(pad: usize) -> Vec<Span<'static>> {
-    if pad == 0 { Vec::new() } else { vec![Span::styled(" ".repeat(pad), Style::new().fg(CODE_FG).bg(CODE_BG))] }
+/// The key that opens the running commands: `ctrl+b`, which under tmux
+/// is its prefix, so there it's pressed twice, as Claude Code has it.
+fn tasks_key() -> &'static str {
+    if std::env::var_os("TMUX").is_some() { "ctrl+b ctrl+b" } else { "ctrl+b" }
 }
 
-/// `row`, `used` columns of code past its margin, filled with the code
-/// background to `width` more.
-fn filled(mut row: Vec<Span<'static>>, used: usize, width: usize) -> Line<'static> {
+/// The `pad` columns of background `bg` a code row starts with.
+fn margin(pad: usize, bg: Color) -> Vec<Span<'static>> {
+    if pad == 0 { Vec::new() } else { vec![Span::styled(" ".repeat(pad), Style::new().fg(CODE_FG).bg(bg))] }
+}
+
+/// `row`, `used` columns of code past its margin, filled with `bg` to
+/// `width` more.
+fn filled(mut row: Vec<Span<'static>>, used: usize, width: usize, bg: Color) -> Line<'static> {
     if used < width {
-        row.push(Span::styled(" ".repeat(width - used), Style::new().fg(CODE_FG).bg(CODE_BG)));
+        row.push(Span::styled(" ".repeat(width - used), Style::new().fg(CODE_FG).bg(bg)));
     }
     Line::from(row)
 }
@@ -780,6 +965,11 @@ enum Overlay {
     /// `/usage`: this month's web search allowance and credits, re-read on
     /// opening (`loading` until the platform answers), and the week's tokens.
     Usage { loading: bool, tokens: TokenStats },
+    /// A shell run, clicked: all it printed, under the prompt.
+    Shell(usize),
+    /// `ctrl+b`: the commands still running, one selected from the
+    /// keyboard, to expand or stop.
+    Jobs { selected: usize },
 }
 
 enum Phase {
@@ -888,6 +1078,9 @@ struct App {
     shown: std::cell::RefCell<Shown>,
     /// Text being selected with the mouse, in screen cells.
     selection: Option<Selection>,
+    /// Where the left button went down in the footer, for a click on an
+    /// action there, which isn't selected over.
+    pressed: Option<(u16, u16)>,
     /// What the last selection copied, flashed in the footer for a moment.
     copied: Option<(usize, Instant)>,
     /// The link last clicked, flashed in the footer as it opens.
@@ -906,6 +1099,8 @@ struct App {
     shell_context: Vec<String>,
     /// Ids for `!command` runs, so each result finds its entry.
     shell_runs: usize,
+    /// The shell runs still going, which `/stop` ends, and quitting too.
+    jobs: Vec<Job>,
     /// The check running on the project after a reply's files were
     /// written, if one is.
     check: Option<Check>,
@@ -994,6 +1189,7 @@ impl App {
             heights: std::cell::RefCell::new(Vec::new()),
             shown: std::cell::RefCell::new(Shown::default()),
             selection: None,
+            pressed: None,
             copied: None,
             opened: None,
             clipboard: None,
@@ -1002,6 +1198,7 @@ impl App {
             attachments: Vec::new(),
             shell_context: Vec::new(),
             shell_runs: 0,
+            jobs: Vec::new(),
             check: None,
             fix_round: 0,
             window: None,
@@ -1065,6 +1262,9 @@ impl App {
                 }
             }
         }
+        // Nothing started here outlives it: a dev server left behind would
+        // hold its port, unseen.
+        self.stop_jobs(|_| true);
         Ok(self.session)
     }
 
@@ -1340,7 +1540,7 @@ impl App {
             };
             self.entries.push(Entry::Warning(warning));
         }
-        self.entries.push(Entry::Reply(Reply { root: files_dir.clone(), ..Default::default() }));
+        self.entries.push(Entry::Reply(Reply { root: files_dir.clone(), whole: whole.clone(), ..Default::default() }));
         let entry = self.entries.len() - 1;
         self.scroll_back = 0;
         // Made per turn: the agent picks its port once it's up, and a new
@@ -1552,19 +1752,99 @@ impl App {
     }
 
     /// Run `command` with the shell in the working directory, showing its
-    /// output as it ends.
+    /// output as it comes. Ending in `&`, as `npm run dev &`, it's started
+    /// in the background: the next prompt doesn't wait for it, and `/stop`
+    /// ends it, or a click on its entry.
     fn run_shell(&mut self, command: String) {
         if command.is_empty() {
             return self.entries.push(Entry::Error("Give a command to run: !<command>".to_string()));
         }
+        let (command, background) = detached(&command);
+        let (id, report) = self.shell_entry(command.clone(), background);
+        self.spawn(move |_, tx| {
+            let (output, ended) = run_command(&command, None, background, report);
+            let _ = tx.send(AppEvent::Shell(id, output, ended));
+        });
+    }
+
+    /// A shell entry for `command`, and its run as a job: the entry's id,
+    /// and what the run's thread reports through.
+    fn shell_entry(&mut self, command: String, background: bool) -> (usize, Report) {
         self.shell_runs += 1;
         let id = self.shell_runs;
-        self.entries.push(Entry::Shell(Shell { id, command: command.clone(), output: None }));
+        let shell = Shell { id, command: command.clone(), output: String::new(), ended: None, background, detached: false };
+        self.entries.push(Entry::Shell(shell));
+        let stopped = Arc::new(AtomicBool::new(false));
+        self.jobs.push(Job { id, command, started: Instant::now(), pid: None, stopped: stopped.clone() });
         self.scroll_back = 0;
-        self.spawn(move |_, tx| {
-            let (output, code) = run_command(&command, None);
-            let _ = tx.send(AppEvent::Shell(id, output, code));
-        });
+        (id, Report { id, tx: self.tx.clone(), stopped })
+    }
+
+    /// The shell entry of run `id`, unless a `/clear` took it.
+    fn shell_of(&self, id: usize) -> Option<&Shell> {
+        self.entries.iter().find_map(|e| match e {
+            Entry::Shell(s) if s.id == id => Some(s),
+            _ => None,
+        })
+    }
+
+    /// The shell entry of run `id`, unless a `/clear` took it.
+    fn shell_mut(&mut self, id: usize) -> Option<&mut Shell> {
+        self.entries.iter_mut().find_map(|e| match e {
+            Entry::Shell(s) if s.id == id => Some(s),
+            _ => None,
+        })
+    }
+
+    /// Run `id` reported in: ended, its job is done with; its entry shows
+    /// its output and its end, or that it goes on in the background. What
+    /// the agent is told of it, for the next prompt.
+    fn shell_reported(&mut self, id: usize, output: &str, ended: Option<Ended>) -> Option<String> {
+        if ended.is_some() {
+            self.jobs.retain(|j| j.id != id);
+            // The running commands panel follows the list: an empty one
+            // closes it, and the selection stays on a row.
+            if let Overlay::Jobs { selected } = &mut self.overlay {
+                match self.jobs.len() {
+                    0 => self.overlay = Overlay::None,
+                    n => *selected = (*selected).min(n - 1),
+                }
+            }
+        }
+        let shell = self.shell_mut(id)?;
+        let context = shell_context(&shell.command, output, ended, shell.detached);
+        shell.output = output.to_string();
+        shell.ended = ended;
+        shell.detached |= ended.is_none();
+        Some(context)
+    }
+
+    /// `/stop [word]`: end the shell runs still going, or those with
+    /// `word` in their command.
+    fn stop_command(&mut self, word: &str) {
+        let stopped = self.stop_jobs(|job| word.is_empty() || job.command.contains(word));
+        let notice = match (stopped.is_empty(), word.is_empty()) {
+            (true, true) => "Nothing is running".to_string(),
+            (true, false) => format!("Nothing running has `{}` in it; /stop alone stops everything", word),
+            _ => format!("Stopping: {}", stopped.join("; ").replace('\n', "; ")),
+        };
+        self.entries.push(Entry::Notice(notice));
+        self.scroll_back = 0;
+    }
+
+    /// Stop the jobs `which` picks: their commands. Each run's thread sees
+    /// the flag and ends its run as stopped; the process is ended here as
+    /// well, so quitting leaves none behind.
+    fn stop_jobs(&self, which: impl Fn(&Job) -> bool) -> Vec<String> {
+        let mut stopped = Vec::new();
+        for job in self.jobs.iter().filter(|j| which(j)) {
+            job.stopped.store(true, Ordering::Relaxed);
+            if let Some(pid) = job.pid {
+                terminate(pid, false);
+            }
+            stopped.push(job.command.clone());
+        }
+        stopped
     }
 
     /// Check that the project at `root` still builds after `written`
@@ -1573,29 +1853,25 @@ impl App {
     fn run_check(&mut self, root: &std::path::Path, written: &[String]) {
         let Some((project, _)) = self.project.clone() else { return };
         let Some(command) = files::check_command(root, code_kind(root), written) else { return };
-        self.shell_runs += 1;
-        let id = self.shell_runs;
-        self.entries.push(Entry::Shell(Shell { id, command: command.clone(), output: None }));
+        let (id, report) = self.shell_entry(command.clone(), false);
         self.check = Some(Check { id, project, command: command.clone() });
-        self.scroll_back = 0;
         if cfg!(test) {
             return;
         }
         let dir = root.to_path_buf();
         self.spawn(move |_, tx| {
-            let (output, code) = run_command(&command, Some(&dir));
-            let _ = tx.send(AppEvent::Check(id, output, code));
+            let (output, ended) = run_command(&command, Some(&dir), false, report);
+            let _ = tx.send(AppEvent::Check(id, output, ended.unwrap_or(Ended::Killed)));
         });
     }
 
     /// A check ended: passed, it's said; failed, the agent is asked to fix
     /// the errors, again and again until they are, or until a round fixes
     /// nothing.
-    fn check_ended(&mut self, id: usize, output: String, code: Option<i32>) {
+    fn check_ended(&mut self, id: usize, output: String, ended: Ended) {
+        self.shell_reported(id, &output, Some(ended));
         let Some(check) = self.check.take_if(|c| c.id == id) else { return };
-        if let Some(Entry::Shell(shell)) = self.entries.iter_mut().find(|e| matches!(e, Entry::Shell(s) if s.id == id)) {
-            shell.output = Some((output.clone(), code));
-        }
+        let code = ended.code();
         // The project switched meanwhile: its errors aren't this one's.
         if self.project.as_ref().is_none_or(|(p, _)| *p != check.project) {
             self.commands = None;
@@ -1693,29 +1969,28 @@ impl App {
     }
 
     /// Run `commands` in `root`, each block as one script, one after the
-    /// other, shown like a `!` command; what they print goes to the agent
-    /// with the next prompt, so it can go on from there.
+    /// other, shown like a `!` command; one ending in `&` is left running
+    /// in the background and the next starts. What they print goes to the
+    /// agent with the next prompt, so it can go on from there.
     fn run_allowed(&mut self, root: std::path::PathBuf, commands: Vec<String>) {
         let Some((project, _)) = self.project.clone() else { return };
         let mut runs = Vec::new();
         for command in self.runnable(commands) {
-            self.shell_runs += 1;
-            let id = self.shell_runs;
-            self.entries.push(Entry::Shell(Shell { id, command: command.clone(), output: None }));
-            runs.push((id, command));
+            let (command, background) = detached(&command);
+            let (id, report) = self.shell_entry(command.clone(), background);
+            runs.push((id, command, background, report));
         }
-        self.scroll_back = 0;
         if cfg!(test) {
             return;
         }
         self.spawn(move |_, tx| {
             let count = runs.len();
-            for (i, (id, command)) in runs.into_iter().enumerate() {
-                let (output, code) = run_command(&command, Some(&root));
-                let failed = code != Some(0);
-                let _ = tx.send(AppEvent::Ran(id, project.clone(), i + 1 == count, output, code));
-                // The rest would build on what this one didn't do.
-                if failed {
+            for (i, (id, command, background, report)) in runs.into_iter().enumerate() {
+                let (output, ended) = run_command(&command, Some(&root), background, report);
+                let _ = tx.send(AppEvent::Ran(id, project.clone(), i + 1 == count, output, ended));
+                // The rest would build on what this one didn't do, or on
+                // what the user cut short.
+                if ended.is_some_and(|e| e.failed() || e == Ended::Stopped) {
                     break;
                 }
             }
@@ -1727,16 +2002,17 @@ impl App {
     /// with other commands or with files; the last one done, to say what
     /// that did and give what the task still needs. Either way for a few
     /// rounds only, and what was printed rides with the next prompt too.
-    fn ran(&mut self, id: usize, project: String, last: bool, output: String, code: Option<i32>) {
-        let Some(Entry::Shell(shell)) = self.entries.iter_mut().find(|e| matches!(e, Entry::Shell(s) if s.id == id))
-        else {
-            return;
-        };
-        let command = shell.command.clone();
-        self.shell_context.push(shell_context(&command, &output, code));
-        shell.output = Some((output.clone(), code));
-        let failed = code != Some(0);
-        if (!failed && !last) || self.turn.is_some() || self.project.as_ref().is_none_or(|(p, _)| *p != project) {
+    fn ran(&mut self, id: usize, project: String, last: bool, output: String, ended: Option<Ended>) {
+        let Some(context) = self.shell_reported(id, &output, ended) else { return };
+        let command = self.shell_mut(id).map(|s| s.command.clone()).unwrap_or_default();
+        self.shell_context.push(context);
+        let failed = ended.is_some_and(Ended::failed);
+        // Stopped by the user, the rest is theirs to say.
+        if ended == Some(Ended::Stopped)
+            || (!failed && !last)
+            || self.turn.is_some()
+            || self.project.as_ref().is_none_or(|(p, _)| *p != project)
+        {
             return;
         }
         if self.command_round >= COMMAND_ROUNDS {
@@ -1898,15 +2174,21 @@ impl App {
             AppEvent::Error(text) => self.entries.push(Entry::Error(text)),
             AppEvent::Check(id, output, code) => self.check_ended(id, output, code),
             AppEvent::Ran(id, project, last, output, code) => self.ran(id, project, last, output, code),
-            AppEvent::Shell(id, output, code) => {
-                // Gone with a /clear: nothing to show or keep.
-                let Some(Entry::Shell(shell)) =
-                    self.entries.iter_mut().find(|e| matches!(e, Entry::Shell(s) if s.id == id))
-                else {
-                    return;
-                };
-                self.shell_context.push(shell_context(&shell.command, &output, code));
-                shell.output = Some((output, code));
+            AppEvent::Started(id, pid) => {
+                if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+                    job.pid = Some(pid);
+                }
+            }
+            AppEvent::Printed(id, output) => {
+                if let Some(shell) = self.shell_mut(id).filter(|s| s.ended.is_none()) {
+                    shell.output = output;
+                }
+            }
+            // Gone with a /clear, there's nothing to show or keep.
+            AppEvent::Shell(id, output, ended) => {
+                if let Some(context) = self.shell_reported(id, &output, ended) {
+                    self.shell_context.push(context);
+                }
             }
             AppEvent::Usage(usage) => {
                 self.search = usage;
@@ -2211,8 +2493,9 @@ impl App {
             MouseEventKind::ScrollUp => self.scroll(WHEEL_LINES as i32),
             MouseEventKind::ScrollDown => self.scroll(-(WHEEL_LINES as i32)),
             MouseEventKind::Down(MouseButton::Left) => {
-                let area = self.shown.borrow().area;
+                let (area, footer) = (self.shown.borrow().area, self.shown.borrow().footer);
                 self.selection = area.contains(at.into()).then_some(Selection { anchor: at, head: at });
+                self.pressed = footer.contains(at.into()).then_some(at);
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(selection) = &mut self.selection {
@@ -2222,9 +2505,13 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 let clicked = self.selection.as_ref().filter(|s| s.anchor == s.head).map(|s| s.anchor);
+                let clicked = clicked.or(self.pressed.take().filter(|&down| down == at));
                 if let Some(url) = clicked.and_then(|at| self.shown.borrow().link_at(at)) {
                     self.selection = None;
-                    return self.open(url);
+                    return match crate::links::action_of(&url) {
+                        Some(action) => self.act(action),
+                        None => self.open(url),
+                    };
                 }
                 let text = self.selection.as_ref().filter(|s| s.anchor != s.head).map(|s| self.selected_text(s));
                 match text.filter(|t| !t.trim().is_empty()) {
@@ -2249,6 +2536,21 @@ impl App {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A clicked action: `stop/<id>` ends shell run `id`, as `/stop` does,
+    /// without a notice, as the run's entry says it's stopped; `show/<id>`
+    /// expands the run under the prompt.
+    fn act(&mut self, action: &str) {
+        let (what, id) = action.split_once('/').unwrap_or_default();
+        let Ok(id) = id.parse::<usize>() else { return };
+        match what {
+            "stop" => {
+                self.stop_jobs(|job| job.id == id);
+            }
+            "show" if self.shell_of(id).is_some() => self.overlay = Overlay::Shell(id),
+            _ => {}
+        }
     }
 
     /// Open a clicked link in the browser.
@@ -2289,6 +2591,7 @@ impl App {
             }
             (KeyCode::Char('o'), true) => return self.open_models(),
             (KeyCode::Char('p'), true) => return self.open_projects(),
+            (KeyCode::Char('b'), true) => return self.open_jobs(),
             (KeyCode::Char('s'), true) => return self.toggle_web_search(),
             _ => {}
         }
@@ -2297,7 +2600,13 @@ impl App {
             Overlay::Models { .. } => self.key_models(key),
             Overlay::Mcp { .. } => self.key_mcp(key),
             Overlay::Projects { .. } => self.key_projects(key),
-            Overlay::Help | Overlay::Status(_) | Overlay::Usage { .. } => {
+            Overlay::Jobs { .. } => self.key_jobs(key),
+            // `x` stops the run shown while it goes.
+            Overlay::Shell(id) if key.code == KeyCode::Char('x') => {
+                self.stop_jobs(|job| job.id == id);
+                true
+            }
+            Overlay::Help | Overlay::Status(_) | Overlay::Usage { .. } | Overlay::Shell(_) => {
                 let close = matches!(key.code, KeyCode::Esc | KeyCode::Enter);
                 if close {
                     self.overlay = Overlay::None;
@@ -2359,6 +2668,42 @@ impl App {
 
     /// `/project`: list the projects to switch to. Also with none to chat
     /// in yet, so one can be created.
+    /// `/tasks` or `ctrl+b`: the commands still running, the first
+    /// selected; none, said so, as `/stop` says it.
+    fn open_jobs(&mut self) {
+        if self.jobs.is_empty() {
+            self.entries.push(Entry::Notice("Nothing is running".to_string()));
+            self.scroll_back = 0;
+            return;
+        }
+        self.overlay = Overlay::Jobs { selected: 0 };
+    }
+
+    /// The running commands panel's keys; false for any other, which is
+    /// typing. `enter` expands the selected run, `x` stops it.
+    fn key_jobs(&mut self, key: KeyEvent) -> bool {
+        let Overlay::Jobs { selected } = &mut self.overlay else { return false };
+        let count = self.jobs.len();
+        let id = self.jobs.get(*selected).map(|job| job.id);
+        match key.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Down => *selected = (*selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Enter => {
+                if let Some(id) = id.filter(|&id| self.shell_of(id).is_some()) {
+                    self.overlay = Overlay::Shell(id);
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(id) = id {
+                    self.stop_jobs(|job| job.id == id);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn open_projects(&mut self) {
         if !matches!(self.phase, Phase::Ready) {
             return;
@@ -2932,6 +3277,8 @@ impl App {
             "/sync" => self.sync_command(&words.collect::<Vec<_>>()),
             "/code" => self.code_command(words.next()),
             "/write" => self.write_command(words.next()),
+            "/stop" => self.stop_command(&words.collect::<Vec<_>>().join(" ")),
+            "/tasks" => self.open_jobs(),
             "/help" | "/?" => self.overlay = Overlay::Help,
             "/status" => self.open_status(),
             "/usage" => self.open_usage(),
@@ -3129,8 +3476,10 @@ impl App {
         // and an open panel takes it in the same way, under the prompt.
         let hints = self.hint_lines(frame.area().width as usize);
         let room = frame.area().height.saturating_sub(12);
+        // The commands still running are listed over the key hints.
         let under = match self.panel_height() {
             Some(height) => height.min(room),
+            None if hints.is_empty() => (1 + self.jobs.len().min(room as usize)) as u16,
             None => hints.len().max(1) as u16,
         };
         // A blank row at the top, and one between the conversation and the
@@ -3146,7 +3495,6 @@ impl App {
         .areas(frame.area());
 
         self.draw_conversation(frame, body);
-        self.keep_shown(frame, body);
         frame.render_widget(Paragraph::new(status), status_area);
         self.draw_input(frame, input);
         match &self.overlay {
@@ -3167,7 +3515,11 @@ impl App {
                 let block = panel(&bar_hints(&[("esc", "close")]));
                 frame.render_widget(Paragraph::new(self.usage_panel_lines(*loading, tokens)).block(block), footer);
             }
+            Overlay::Shell(id) => self.draw_shell(frame, footer, *id),
+            Overlay::Jobs { selected } => self.draw_jobs(frame, footer, *selected),
         }
+        // After the footer, whose actions it keeps.
+        self.keep_shown(frame, body, footer);
     }
 
     /// Rows an open panel needs under the prompt, border included.
@@ -3183,6 +3535,9 @@ impl App {
             Overlay::Help => help_lines().len(),
             Overlay::Status(rows) => self.status_panel_lines(rows).len(),
             Overlay::Usage { loading, tokens } => self.usage_panel_lines(*loading, tokens).len(),
+            // Its command, all it printed, and how it ended or that it runs.
+            Overlay::Shell(id) => self.shell_of(*id).map_or(1, |s| s.command.lines().count() + s.output.lines().count() + 1),
+            Overlay::Jobs { .. } => self.jobs.len().max(1),
         };
         // And the row of keys under them.
         Some(rows as u16 + 1)
@@ -3400,14 +3755,17 @@ impl App {
 
     /// Remember the conversation as drawn, for copying and for clicking its
     /// links, make the links hyperlinks, and highlight the selection over it.
-    fn keep_shown(&self, frame: &mut Frame, area: Rect) {
+    /// The footer's actions are kept for clicking too; it isn't selected
+    /// over.
+    fn keep_shown(&self, frame: &mut Frame, area: Rect, footer: Rect) {
         let buffer = frame.buffer_mut();
         let rows = (area.top()..area.bottom())
             .map(|y| (area.left()..area.right()).map(|x| buffer[(x, y)].symbol().to_string()).collect())
             .collect();
         // Tests read the screen back as text, so they go without the escapes.
         let links = crate::links::apply(buffer, area, !cfg!(test));
-        *self.shown.borrow_mut() = Shown { area, rows, links };
+        let footer_links = crate::links::apply(buffer, footer, !cfg!(test));
+        *self.shown.borrow_mut() = Shown { area, rows, links, footer, footer_links };
         if let Some(selection) = &self.selection {
             for (y, from, to) in selection.rows(area) {
                 for x in from..=to {
@@ -3419,6 +3777,11 @@ impl App {
 
     /// One entry of the conversation as drawn, after a blank line.
     fn entry_lines(&self, entry: &Entry, width: u16, lines: &mut Vec<Line<'static>>) {
+        // A command running in the background is listed under the prompt
+        // instead, out of the conversation's way until it ends.
+        if matches!(entry, Entry::Shell(s) if s.background && s.ended.is_none()) {
+            return;
+        }
         lines.push(Line::default());
         match entry {
             Entry::User(text) => {
@@ -3428,7 +3791,7 @@ impl App {
                 }
             }
             Entry::Reply(reply) => reply_lines(reply, width, lines),
-            Entry::Shell(shell) => shell_lines(shell, self.spinner(), lines),
+            Entry::Shell(shell) => shell_lines(shell, self.spinner(), SHELL_SHOWN, lines),
             Entry::Ask(commands) => ask_lines(commands, lines),
             Entry::Notice(text) => {
                 lines.push(Line::from(vec![Span::styled("■ ", Style::new().fg(Color::Green)), Span::raw(text.clone())]))
@@ -3529,13 +3892,24 @@ impl App {
         let block = Block::new().borders(Borders::TOP | Borders::BOTTOM).border_style(rules);
         let inner = block.inner(area);
         let ready = matches!(self.phase, Phase::Ready) && self.project.is_some();
-        let label = if self.token_entry { "token: " } else { "> " };
+        // A shell command has `!` ahead of it, as Claude Code's shell mode
+        // does: the `!` typed is what the mark stands for, so it isn't
+        // shown twice, and the cursor moves up with it.
+        let label = if self.token_entry { "token: " } else if shell { "! " } else { "> " };
         let prompt = Span::styled(label, Style::new().fg(pink()).bold());
         // A token shows as dots.
-        let input = if self.token_entry { "•".repeat(self.input.chars().count()) } else { self.input.clone() };
+        let input = if self.token_entry {
+            "•".repeat(self.input.chars().count())
+        } else if shell {
+            self.input[1..].to_string()
+        } else {
+            self.input.clone()
+        };
+        let cursor = if shell { self.cursor.saturating_sub(1) } else { self.cursor };
         let line = if self.token_entry && input.is_empty() {
             Line::from(vec![prompt, Span::styled("paste your Smartloop token", dim())])
-        } else if input.is_empty() && !ready {
+        } else if input.is_empty() && !ready && !shell {
+            // A shell command runs with no agent, so `!` isn't held up.
             Line::from(vec![prompt, Span::styled("waiting for setup…", dim())])
         } else {
             // One row per line typed. The cursor's line shows its tail when
@@ -3543,7 +3917,7 @@ impl App {
             // more lines than rows, the rows follow the cursor.
             let indent = label.len() as u16;
             let room = inner.width.saturating_sub(indent + 1) as usize;
-            let before: String = input.chars().take(self.cursor).collect();
+            let before: String = input.chars().take(cursor).collect();
             let row = before.matches('\n').count();
             let col_text = before.rsplit('\n').next().unwrap_or_default();
             let lines: Vec<&str> = input.split('\n').collect();
@@ -3555,7 +3929,9 @@ impl App {
                 let visible: String = text.chars().skip(offset).collect();
                 let mut spans = vec![mark, Span::raw(visible)];
                 // Until something's typed, say what the prompt takes.
-                if input.is_empty() && !self.token_entry {
+                if input.is_empty() && shell {
+                    spans.push(Span::styled("a command to run in the folder; & at its end runs it in the background", dim()));
+                } else if input.is_empty() && !self.token_entry {
                     spans.push(Span::styled("Ask anything, or drop a file to attach it", dim()));
                 }
                 shown.push(Line::from(spans));
@@ -3623,8 +3999,66 @@ impl App {
         rows.into_iter().skip(first).take(last + 1 - first).flatten().collect()
     }
 
-    /// Key hints under the prompt.
+    /// A shell run expanded under the prompt: its command and all it
+    /// printed, the end of it when there's more than fits, and how it
+    /// ended, or that it runs, with `✕ stop` to click while it does. Gone
+    /// with a `/clear`, the key hints show instead.
+    fn draw_shell(&self, frame: &mut Frame, area: Rect, id: usize) {
+        let Some(shell) = self.shell_of(id) else { return self.draw_footer(frame, area) };
+        let mut lines = Vec::new();
+        shell_lines(shell, self.spinner(), usize::MAX, &mut lines);
+        let mut bar = bar_hints(&[("esc", "close")]);
+        if shell.ended.is_none() {
+            // The key stops it, and a click on the key's hint too.
+            let stop = crate::links::action(Style::new(), &format!("stop/{}", id));
+            bar.extend(key_hints(&[("x", "stop")]).into_iter().map(|span| span.patch_style(stop)));
+            bar.push(Span::raw(" "));
+        }
+        let block = panel(&bar);
+        let skip = lines.len().saturating_sub(block.inner(area).height as usize);
+        frame.render_widget(Paragraph::new(lines).block(block).scroll((skip.min(u16::MAX as usize) as u16, 0)), area);
+    }
+
+    /// `ctrl+b`: the commands still running as the footer lists them, the
+    /// selected one marked, with the keys that expand or stop it.
+    fn draw_jobs(&self, frame: &mut Frame, area: Rect, selected: usize) {
+        let block = panel(&bar_hints(&[("↑↓", "select"), ("enter", "output"), ("x", "stop"), ("esc", "close")]));
+        frame.render_widget(Clear, area);
+        let lines = self.job_lines(block.inner(area), Some(selected));
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    /// A row for each command still running, as many as fit `area`: its
+    /// first line, which a click expands, and how long it's been. With one
+    /// `selected`, a `›` marks it; `/tasks` or `ctrl+b` picks one to stop
+    /// or expand from the keyboard, as `/tasks` does in Claude Code.
+    fn job_lines(&self, area: Rect, selected: Option<usize>) -> Vec<Line<'static>> {
+        let room = area.height as usize;
+        let mut lines = Vec::new();
+        for (i, job) in self.jobs.iter().enumerate().rev().take(room).rev() {
+            let command = job.command.lines().next().unwrap_or_default();
+            let background = if self.entries.iter().any(|e| matches!(e, Entry::Shell(s) if s.id == job.id && s.background)) {
+                ", background"
+            } else {
+                ""
+            };
+            let chosen = selected == Some(i);
+            let mark = if chosen { "› " } else { "  " };
+            let name = if chosen { Style::new().fg(pink()).bold() } else { key_style() };
+            let show = crate::links::action(name, &format!("show/{}", job.id));
+            lines.push(Line::from(vec![
+                Span::styled(mark, Style::new().fg(pink()).bold()),
+                Span::styled(format!("{} ", self.spinner()), dim()),
+                Span::styled(truncate(command, (area.width as usize).saturating_sub(30).max(10)), show),
+                Span::styled(format!(" ({}{})", format_duration(job.started.elapsed()), background), dim()),
+            ]));
+        }
+        lines
+    }
+
+    /// Key hints under the prompt, under the commands still running.
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
+        let mut lines = self.job_lines(Rect { height: area.height.saturating_sub(1), ..area }, None);
         let mut hints = vec![Span::raw("  ")];
         let recent = |at: &Instant| at.elapsed() < Duration::from_secs(2);
         let opened = self.opened.as_ref().filter(|(_, at)| recent(at));
@@ -3639,6 +4073,9 @@ impl App {
             hints.extend(key_hints(&[("pgdn", "scroll down"), ("end", "latest")]));
         } else if self.token_entry {
             hints.extend(key_hints(&[("enter", "sign in"), ("esc", "cancel")]));
+        } else if self.input.starts_with('!') {
+            // Shell mode, said as Claude Code says it, in the rules' color.
+            hints.push(Span::styled("! for shell mode", Style::new().fg(pink())));
         } else if self.ask.is_some() && self.input.is_empty() && self.turn.is_none() {
             hints.extend(key_hints(&[("enter", "run"), ("tab", "always this session"), ("esc", "skip")]));
         } else if self.input.trim() == "/project import" {
@@ -3649,13 +4086,20 @@ impl App {
         } else if let Some(warning) = self.search_warning(area.width.saturating_sub(2) as usize) {
             // Takes the key hints' place, so a narrow terminal can't hide it.
             hints.extend(warning);
-        } else if self.always_run {
-            hints.extend(key_hints(&[("enter", "send"), ("esc", "interrupt"), ("tab", "auto-approve on"), ("?", "shortcuts")]));
         } else {
             // The rest live under help, as in Claude Code.
-            hints.extend(key_hints(&[("enter", "send"), ("esc", "interrupt"), ("?", "shortcuts")]));
+            let mut keys = vec![("enter", "send"), ("esc", "interrupt")];
+            if self.always_run {
+                keys.push(("tab", "auto-approve on"));
+            }
+            if !self.jobs.is_empty() {
+                keys.push((tasks_key(), "running"));
+            }
+            keys.push(("?", "shortcuts"));
+            hints.extend(key_hints(&keys));
         }
-        frame.render_widget(Paragraph::new(Line::from(hints)), area);
+        lines.push(Line::from(hints));
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     /// From 70% of the month's web searches, the footer says how much of the
@@ -4030,7 +4474,7 @@ fn entry_version(entry: &Entry) -> usize {
             let laid_out = reply.rendered.borrow().as_ref().map_or(0, |(len, ..)| *len);
             laid_out * 8 + reply.warnings.len() + reply.citations.len() * 2 + usize::from(reply.stats.is_some() || reply.ended.is_some()) * 4 + 1
         }
-        Entry::Shell(shell) => usize::from(shell.output.is_some()) + 1,
+        Entry::Shell(shell) => shell.output.len() * 2 + usize::from(shell.ended.is_some()) + 1,
         _ => 1,
     }
 }
@@ -4146,11 +4590,48 @@ const COMMAND_ROUNDS: u32 = 3;
 /// Characters of output the agent gets, from its end.
 const SHELL_KEPT: usize = 8000;
 
-/// Run `command` with the platform's shell, its stdin closed: stdout then
-/// stderr, and the exit code (none when killed by a signal).
-/// Run `command` with the shell, in `dir` or the working directory: its
-/// output, as a terminal would show it, and its exit code.
-fn run_command(command: &str, dir: Option<&std::path::Path>) -> (String, Option<i32>) {
+/// How long a background command (`… &`) is watched before what waits on
+/// it goes on: a failure that comes at once, as a missing script, is still
+/// caught.
+const BACKGROUND_GRACE: Duration = Duration::from_secs(3);
+/// How often a running command's output goes to the screen, at most.
+const FLUSH: Duration = Duration::from_millis(100);
+/// Bytes of a running command's output kept, from its end: a dev server's
+/// log doesn't grow without end.
+const RAW_KEPT: usize = 64 * 1024;
+/// How long a stopped command gets to end on its own before it's killed.
+const KILL_AFTER: Duration = Duration::from_secs(3);
+
+/// Run `command` with the platform's shell, its stdin closed, in `dir` or
+/// the working directory, on a thread of its own: what it printed, as a
+/// terminal would show it, and how it ended. As it runs, its output goes
+/// to the screen as `Printed`, and its process id as `Started`, so `/stop`
+/// can end it. `background`, it's given `BACKGROUND_GRACE` to fail; still
+/// running then, this returns `None` with its output so far, and its end
+/// comes to the app as a `Shell` event.
+fn run_command(command: &str, dir: Option<&std::path::Path>, background: bool, report: Report) -> (String, Option<Ended>) {
+    let (settled_tx, settled) = std::sync::mpsc::channel();
+    let (command, dir) = (command.to_string(), dir.map(std::path::Path::to_path_buf));
+    std::thread::spawn(move || stream(&command, dir.as_deref(), background, &report, settled_tx));
+    settled.recv().unwrap_or_else(|_| ("Failed to run".to_string(), Some(Ended::Killed)))
+}
+
+/// `run_command`'s thread. The shell runs in a process group of its own,
+/// so a stop ends what it started too. `settled` gets the end, or the
+/// output so far once a background command outlives its grace; after
+/// that, the end goes to the app as `Shell`.
+fn stream(
+    command: &str,
+    dir: Option<&std::path::Path>,
+    background: bool,
+    report: &Report,
+    settled: std::sync::mpsc::Sender<(String, Option<Ended>)>,
+) {
+    // Stopped before its turn came, as in a reply's chain.
+    if report.stopped.load(Ordering::Relaxed) {
+        let _ = settled.send((String::new(), Some(Ended::Stopped)));
+        return;
+    }
     let mut shell = if cfg!(windows) {
         let mut c = std::process::Command::new("cmd");
         c.arg("/C");
@@ -4163,13 +4644,137 @@ fn run_command(command: &str, dir: Option<&std::path::Path>) -> (String, Option<
     if let Some(dir) = dir {
         shell.current_dir(dir);
     }
-    match shell.arg(command).stdin(std::process::Stdio::null()).output() {
-        Ok(out) => {
-            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&out.stderr));
-            (strip_ansi(&text).trim_end().to_string(), out.status.code())
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        shell.process_group(0);
+    }
+    let mut child = match shell
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = settled.send((format!("Failed to run: {}", e), Some(Ended::Exited(127))));
+            return;
         }
-        Err(e) => (format!("Failed to run: {}", e), None),
+    };
+    let pid = child.id();
+    let _ = report.tx.send(AppEvent::Started(report.id, pid));
+    // Both pipes are read on threads of their own, into one stream of
+    // chunks, as they come.
+    let (chunks_tx, chunks) = std::sync::mpsc::channel::<Vec<u8>>();
+    let pipes: [Option<Box<dyn std::io::Read + Send>>; 2] =
+        [child.stdout.take().map(|p| Box::new(p) as _), child.stderr.take().map(|p| Box::new(p) as _)];
+    for mut pipe in pipes.into_iter().flatten() {
+        let chunks_tx = chunks_tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = pipe.read(&mut buf) {
+                if n == 0 || chunks_tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(chunks_tx);
+    let text = |raw: &[u8]| strip_ansi(&String::from_utf8_lossy(raw)).trim_end().to_string();
+    let started = Instant::now();
+    let mut raw: Vec<u8> = Vec::new();
+    let (mut dirty, mut flushed) = (false, Instant::now());
+    let mut detached = false;
+    let mut exited = None;
+    let mut stopping: Option<Instant> = None;
+    let mut killed = false;
+    loop {
+        match chunks.recv_timeout(FLUSH) {
+            Ok(chunk) => {
+                raw.extend(chunk);
+                if raw.len() > 2 * RAW_KEPT {
+                    let from = raw.len() - RAW_KEPT;
+                    let cut = raw[from..].iter().position(|&b| b == b'\n').map_or(from, |i| from + i + 1);
+                    raw.drain(..cut);
+                }
+                dirty = true;
+            }
+            // The shell gone and nothing more coming: what still holds the
+            // pipes is something it left behind, not waited for.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if exited.is_some() => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if dirty && flushed.elapsed() >= FLUSH {
+            let _ = report.tx.send(AppEvent::Printed(report.id, text(&raw)));
+            (dirty, flushed) = (false, Instant::now());
+        }
+        if exited.is_none() {
+            exited = child.try_wait().ok().flatten();
+        }
+        if background && !detached && started.elapsed() >= BACKGROUND_GRACE {
+            detached = true;
+            let _ = settled.send((text(&raw), None));
+        }
+        if report.stopped.load(Ordering::Relaxed) {
+            match stopping {
+                None => {
+                    stopping = Some(Instant::now());
+                    terminate(pid, false);
+                }
+                Some(since) if !killed && since.elapsed() >= KILL_AFTER => {
+                    killed = true;
+                    terminate(pid, true);
+                }
+                _ => {}
+            }
+        }
+    }
+    let status = exited.or_else(|| child.wait().ok());
+    let ended = if report.stopped.load(Ordering::Relaxed) {
+        Ended::Stopped
+    } else {
+        match status.and_then(|s| s.code()) {
+            Some(code) => Ended::Exited(code),
+            None => Ended::Killed,
+        }
+    };
+    let output = text(&raw);
+    if detached {
+        let _ = report.tx.send(AppEvent::Shell(report.id, output, Some(ended)));
+    } else {
+        let _ = settled.send((output, Some(ended)));
+    }
+}
+
+/// End the shell of `pid` and what it started: its process group, with
+/// SIGTERM, or SIGKILL when `hard`.
+#[cfg(unix)]
+fn terminate(pid: u32, hard: bool) {
+    let signal = if hard { libc::SIGKILL } else { libc::SIGTERM };
+    // SAFETY: a plain system call, on a process group we started.
+    unsafe {
+        libc::kill(-(pid as i32), signal);
+    }
+}
+
+/// End the shell of `pid` and its process tree.
+#[cfg(windows)]
+fn terminate(pid: u32, _hard: bool) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// `command` without a `&` at its end, and whether it had one: a command
+/// to start in the background, as `npm run dev &`. `&&` isn't that.
+fn detached(command: &str) -> (String, bool) {
+    match command.trim_end().strip_suffix('&') {
+        Some(rest) if !rest.ends_with('&') => (rest.trim_end().to_string(), true),
+        _ => (command.to_string(), false),
     }
 }
 
@@ -4230,42 +4835,60 @@ fn expand_tabs(line: &str, stop: usize) -> String {
     out
 }
 
-/// What the agent is told of a `!command` run, ahead of the next prompt.
-fn shell_context(command: &str, output: &str, code: Option<i32>) -> String {
+/// What the agent is told of a shell run, ahead of the next prompt: how
+/// it ended, or that it goes on in the background; `since`, the end of
+/// one it was told goes on.
+fn shell_context(command: &str, output: &str, ended: Option<Ended>, since: bool) -> String {
     let start = output.char_indices().rev().nth(SHELL_KEPT - 1).map_or(0, |(i, _)| i);
     let cut = if start > 0 { "(earlier output cut)\n" } else { "" };
-    let ended = code.map_or_else(|| "was stopped".to_string(), |c| format!("exited with {}", c));
-    format!("I ran `{}` in the shell; it {}:\n```\n{}{}\n```", command, ended, cut, &output[start..])
+    let what = match ended {
+        None => format!("I started `{}` in the shell; it's still running in the background, so far it printed", command),
+        Some(ended) if since => format!("The background `{}` I started in the shell has since {}", command, ended.describe()),
+        Some(ended) => format!("I ran `{}` in the shell; it {}", command, ended.describe()),
+    };
+    format!("{}:\n```\n{}{}\n```", what, cut, &output[start..])
 }
 
-fn shell_lines(shell: &Shell, spinner: &str, lines: &mut Vec<Line<'static>>) {
-    let mark = match &shell.output {
-        None => Span::styled(format!("{} ", spinner), Style::new().fg(Color::Cyan)),
-        Some((_, Some(0))) => Span::styled("! ", Style::new().fg(Color::Cyan).bold()),
-        Some(_) => Span::styled("! ", Style::new().fg(Color::Red).bold()),
+/// The entry for a shell run, with the last `shown` lines it printed. Its
+/// command line is clicked to expand it under the prompt, and while it
+/// runs, the `✕ stop` closing it is clicked to stop it, as `/stop` does.
+fn shell_lines(shell: &Shell, spinner: &str, shown: usize, lines: &mut Vec<Line<'static>>) {
+    let show = |style: Style| crate::links::action(style, &format!("show/{}", shell.id));
+    let stop = crate::links::action(Style::new().fg(Color::Yellow).bold(), &format!("stop/{}", shell.id));
+    let mark = match shell.ended {
+        None => Span::styled(format!("{} ", spinner), show(Style::new().fg(Color::Cyan))),
+        Some(Ended::Exited(0)) => Span::styled("! ", show(Style::new().fg(Color::Cyan).bold())),
+        Some(Ended::Stopped) => Span::styled("! ", show(Style::new().fg(Color::Yellow).bold())),
+        Some(_) => Span::styled("! ", show(Style::new().fg(Color::Red).bold())),
     };
     // A script of several commands shows each on its own line, `$` ahead
-    // of all but the first, which the mark leads; what they printed sits
-    // under them behind a bar, and how it ended closes the entry.
+    // of all but the first, which the mark leads; what they printed so far
+    // sits under them behind a bar, and how it ended, or that it runs on,
+    // closes the entry.
     let mut command = shell.command.lines();
-    lines.push(Line::from(vec![mark, Span::styled(command.next().unwrap_or_default().to_string(), key_style())]));
+    lines.push(Line::from(vec![mark, Span::styled(command.next().unwrap_or_default().to_string(), show(key_style()))]));
     for more in command {
         lines.push(Line::from(vec![Span::styled("$ ", dim()), Span::styled(more.to_string(), key_style())]));
     }
-    let Some((output, code)) = &shell.output else { return };
-    let all: Vec<&str> = output.lines().collect();
-    let skipped = all.len().saturating_sub(SHELL_SHOWN);
+    let all: Vec<&str> = shell.output.lines().collect();
+    let skipped = all.len().saturating_sub(shown);
     if skipped > 0 {
         lines.push(Line::from(vec![Span::styled("  │ ", dim()), Span::styled(format!("… {} earlier lines", skipped), dim())]));
     }
     for line in &all[skipped..] {
         lines.push(Line::from(vec![Span::styled("  │ ", dim()), Span::styled(expand_tabs(line, 8), dim())]));
     }
-    match code {
-        Some(0) => lines.push(Line::from(Span::styled("  ✓ done", Style::new().fg(Color::Green)))),
-        Some(c) => lines.push(Line::from(Span::styled(format!("  ✗ exited with {}", c), Style::new().fg(Color::Red)))),
-        None => lines.push(Line::from(Span::styled("  ✗ stopped", Style::new().fg(Color::Red)))),
-    }
+    let end = match shell.ended {
+        None => {
+            let what = if shell.background { "  … running in the background" } else { "  … running" };
+            vec![Span::styled(what, dim()), Span::styled("  ✕ stop", stop)]
+        }
+        Some(Ended::Exited(0)) => vec![Span::styled("  ✓ done", Style::new().fg(Color::Green))],
+        Some(Ended::Exited(c)) => vec![Span::styled(format!("  ✗ exited with {}", c), Style::new().fg(Color::Red))],
+        Some(Ended::Killed) => vec![Span::styled("  ✗ killed by a signal", Style::new().fg(Color::Red))],
+        Some(Ended::Stopped) => vec![Span::styled("  ■ stopped", Style::new().fg(Color::Yellow))],
+    };
+    lines.push(Line::from(end));
 }
 
 /// The reply's commands, to allow or skip: each script's lines. The keys
@@ -4320,15 +4943,25 @@ struct Shown {
     rows: Vec<Vec<String>>,
     /// Each cell's link, if it's in one.
     links: Vec<Vec<Option<u32>>>,
+    /// The footer under the prompt, and its cells' actions.
+    footer: Rect,
+    footer_links: Vec<Vec<Option<u32>>>,
 }
 
 impl Shown {
-    /// The URL of the link at screen position `at`, if one's there.
-    fn link_at(&self, (x, y): (u16, u16)) -> Option<String> {
-        let (x, y) = (x.checked_sub(self.area.x)?, y.checked_sub(self.area.y)?);
-        let id = (*self.links.get(y as usize)?.get(x as usize)?)?;
+    /// The URL of the link at screen position `at`, if one's there, in the
+    /// conversation or in the footer.
+    fn link_at(&self, at: (u16, u16)) -> Option<String> {
+        let id = link_in(self.area, &self.links, at).or_else(|| link_in(self.footer, &self.footer_links, at))?;
         crate::links::url(id)
     }
+}
+
+/// The link number at screen position `at` in `area`, whose cells' links
+/// are `links`.
+fn link_in(area: Rect, links: &[Vec<Option<u32>>], (x, y): (u16, u16)) -> Option<u32> {
+    let (x, y) = (x.checked_sub(area.x)?, y.checked_sub(area.y)?);
+    *links.get(y as usize)?.get(x as usize)?
 }
 
 /// A mouse selection: where the drag started and where it is now.
@@ -4466,7 +5099,7 @@ fn is_document(path: &std::path::Path) -> bool {
 
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
-const COMMANDS: [(&str, &str); 14] = [
+const COMMANDS: [(&str, &str); 16] = [
     ("/help", "shortcuts and commands"),
     ("/login", "sign in in the browser (--token to paste one)"),
     ("/logout", "log out"),
@@ -4477,6 +5110,8 @@ const COMMANDS: [(&str, &str); 14] = [
     ("/sync", "sync this folder's documents to the project"),
     ("/code", "answer prompts here with code: on, off, or how it stands"),
     ("/write", "write the last reply's files left unwritten"),
+    ("/tasks", "the commands still running: pick one to see its output or stop it"),
+    ("/stop", "stop the shell commands still running; /stop <word> those with word in them"),
     ("/usage", "web searches and credits left, tokens and cost saved"),
     ("/upgrade", "Pro plan: 1,000 web searches a month"),
     ("/clear", "clear the chat and start a new session"),
@@ -4573,6 +5208,10 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/clear", "clear the chat and start a new session"),
         ("/<skill> [prompt]", "run one of the project's skills"),
         ("!<command>", "run a shell command; the next prompt shares its output"),
+        ("!<command> &", "run it in the background, as a dev server, listed under the prompt until it ends"),
+        ("/stop [word]", "stop the shell commands still running, or those with word in them"),
+        ("/tasks [ctrl+b]", "the commands still running: [↑] [↓] select, [enter] all it printed, [x] stop"),
+        ("click a command", "running under the prompt, or in its entry: all it printed; its ✕ stop ends it"),
         ("[ctrl+c] /quit", "quit"),
     ];
     rows.iter()
@@ -4704,6 +5343,12 @@ mod tests {
 
     fn app() -> App {
         App::new(Client::new(), None, None, Some("cli-test".to_string()))
+    }
+
+    /// A run's report with nobody listening.
+    fn report() -> Report {
+        let (tx, _) = unbounded_channel();
+        Report { id: 1, tx, stopped: Arc::new(AtomicBool::new(false)) }
     }
 
     #[test]
@@ -4876,16 +5521,16 @@ mod tests {
         assert_eq!(app.history, vec!["!echo hello".to_string()]);
         let Some(Entry::Shell(shell)) = app.entries.last() else { panic!("no shell entry") };
         assert_eq!(shell.command, "echo hello");
-        let (output, code) = run_command("echo hello", None);
-        assert_eq!((output.as_str(), code), ("hello", Some(0)));
-        app.apply(AppEvent::Shell(shell.id, output, code));
+        let (output, ended) = run_command("echo hello", None, false, report());
+        assert_eq!((output.as_str(), ended), ("hello", Some(Ended::Exited(0))));
+        app.apply(AppEvent::Shell(shell.id, output, ended));
         let text = screen(&app, 80, 24);
         assert!(text.contains("! echo hello") && text.contains("  │ hello") && text.contains("  ✓ done"), "{}", text);
         assert_eq!(app.shell_context, vec!["I ran `echo hello` in the shell; it exited with 0:\n```\nhello\n```"]);
         // A /clear drops what wasn't sent, and a result arriving after it.
         app.input = "/clear".into();
         app.submit();
-        app.apply(AppEvent::Shell(1, "late".into(), Some(0)));
+        app.apply(AppEvent::Shell(1, "late".into(), Some(Ended::Exited(0))));
         assert!(app.shell_context.is_empty() && app.entries.is_empty());
     }
 
@@ -4903,19 +5548,236 @@ mod tests {
         app.input = "!ls".into();
         let colors = rule_colors(&app);
         assert!(colors.len() >= 2 && colors.iter().rev().take(2).all(|&c| c == pink()), "{:?}", colors);
+        // As in Claude Code's shell mode: `!` leads the prompt in the `>`'s
+        // place, not twice over, and the footer says what mode this is.
+        let text = screen(&app, 40, 12);
+        assert!(text.contains("! ls") && !text.contains("> !ls") && text.contains("! for shell mode"), "{}", text);
+        app.input = "!".into();
+        app.cursor = 1;
+        assert!(screen(&app, 80, 12).contains("! a command to run in the folder"));
+        app.input.clear();
+        assert!(!screen(&app, 40, 12).contains("shell mode"));
     }
 
     #[test]
     fn a_failed_bang_command_shows_its_exit_code_and_keeps_the_tail() {
-        let (output, code) = run_command("echo oops >&2; exit 3", None);
-        assert_eq!((output.as_str(), code), ("oops", Some(3)));
+        let (output, ended) = run_command("echo oops >&2; exit 3", None, false, report());
+        assert_eq!((output.as_str(), ended), ("oops", Some(Ended::Exited(3))));
         let long = "z".repeat(SHELL_KEPT + 10);
-        let kept = shell_context("cat big", &long, Some(0));
+        let kept = shell_context("cat big", &long, Some(Ended::Exited(0)), false);
         assert!(kept.contains("(earlier output cut)\n") && kept.matches('z').count() == SHELL_KEPT, "{}", kept.len());
         let mut lines = Vec::new();
-        let shell = Shell { id: 1, command: "false".into(), output: Some(("".into(), Some(1))) };
-        shell_lines(&shell, "", &mut lines);
+        let shell =
+            Shell { id: 1, command: "false".into(), output: String::new(), ended: Some(Ended::Exited(1)), background: false, detached: false };
+        shell_lines(&shell, "", SHELL_SHOWN, &mut lines);
         assert!(lines.iter().any(|l| l.to_string() == "  ✗ exited with 1"));
+    }
+
+    #[test]
+    fn a_command_streams_its_output_and_a_stop_or_an_ampersand_frees_the_wait() {
+        // What it prints shows as it comes, ahead of its end.
+        let (tx, mut rx) = unbounded_channel();
+        let listened = Report { id: 7, tx, stopped: Arc::new(AtomicBool::new(false)) };
+        let (output, ended) = run_command("echo one; sleep 0.4; echo two", None, false, listened);
+        assert_eq!((output.as_str(), ended), ("one\ntwo", Some(Ended::Exited(0))));
+        let mut printed = Vec::new();
+        let mut started = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::Started(7, pid) => started = pid > 0,
+                AppEvent::Printed(7, text) => printed.push(text),
+                _ => panic!("another event"),
+            }
+        }
+        assert!(started);
+        assert_eq!(printed.first().map(String::as_str), Some("one"), "{:?}", printed);
+        // Stopped, a run ends as stopped, not failed.
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = stopped.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let (tx, _) = unbounded_channel();
+        let since = Instant::now();
+        let (_, ended) = run_command("sleep 30", None, false, Report { id: 8, tx, stopped });
+        assert_eq!(ended, Some(Ended::Stopped));
+        assert!(since.elapsed() < Duration::from_secs(5));
+        assert!(!Ended::Stopped.failed() && Ended::Killed.failed() && Ended::Exited(2).failed() && !Ended::Exited(0).failed());
+        // `&` at the end marks a command to run in the background.
+        assert_eq!(detached("npm run dev &"), ("npm run dev".to_string(), true));
+        assert_eq!(detached("a && b"), ("a && b".to_string(), false));
+        assert_eq!(detached("npm install\nnpm run dev &\n"), ("npm install\nnpm run dev".to_string(), true));
+        // In the background, a quick failure is still caught...
+        let (_, ended) = run_command("exit 2", None, true, report());
+        assert_eq!(ended, Some(Ended::Exited(2)));
+        // ...and one that keeps going is left to it, its end coming as an
+        // event when it does.
+        let (tx, mut rx) = unbounded_channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (output, ended) = run_command("echo up; sleep 30", None, true, Report { id: 9, tx, stopped: stopped.clone() });
+        assert_eq!((output.as_str(), ended), ("up", None));
+        stopped.store(true, Ordering::Relaxed);
+        let end = loop {
+            match rx.blocking_recv() {
+                Some(AppEvent::Shell(9, output, ended)) => break (output, ended),
+                Some(_) => {}
+                None => panic!("no end"),
+            }
+        };
+        assert_eq!(end, ("up".to_string(), Some(Ended::Stopped)));
+    }
+
+    #[test]
+    fn stop_ends_the_commands_still_running_and_a_background_one_is_told_of_twice() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.input = "/stop".into();
+        app.submit();
+        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "Nothing is running"));
+        let (id, report) = app.shell_entry("npm run dev".into(), true);
+        let (_, other) = app.shell_entry("cargo test".into(), false);
+        app.apply(AppEvent::Started(id, 4242));
+        assert_eq!(app.jobs.iter().map(|j| j.pid).collect::<Vec<_>>(), [Some(4242), None]);
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("… running  ✕ stop"), "{}", text);
+        // In the background, it's listed under the prompt, not in the chat,
+        // until it ends.
+        assert!(!text.contains("running in the background"), "{}", text);
+        assert!(text.lines().any(|r| r.contains("npm run dev (") && r.contains(", background)")), "{}", text);
+        // By a word, only the commands with it; `/stop` alone, all.
+        app.jobs[0].pid = None;
+        app.input = "/stop npm".into();
+        app.submit();
+        assert!(report.stopped.load(Ordering::Relaxed) && !other.stopped.load(Ordering::Relaxed));
+        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "Stopping: npm run dev"));
+        app.apply(AppEvent::Shell(id, "up".into(), Some(Ended::Stopped)));
+        assert_eq!(app.jobs.len(), 1);
+        assert!(screen(&app, 80, 24).contains("  ■ stopped"));
+        assert_eq!(
+            app.shell_context.last().map(String::as_str),
+            Some("I ran `npm run dev` in the shell; it was stopped by me:\n```\nup\n```")
+        );
+        app.input = "/stop nothing".into();
+        app.submit();
+        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n.starts_with("Nothing running has `nothing` in it")));
+        // A background one told of as running has its end told as that
+        // one's; what it prints shows meanwhile.
+        let (id, _) = app.shell_entry("npm start".into(), true);
+        app.apply(AppEvent::Shell(id, "listening".into(), None));
+        assert!(app.shell_context.last().unwrap().starts_with("I started `npm start` in the shell; it's still running"));
+        app.apply(AppEvent::Printed(id, "listening\nGET /".into()));
+        assert!(!screen(&app, 80, 30).contains("GET /"), "a background run's log stays out of the chat");
+        app.overlay = Overlay::Shell(id);
+        assert!(screen(&app, 80, 30).contains("│ GET /"), "but expands under the prompt");
+        app.overlay = Overlay::None;
+        app.apply(AppEvent::Shell(id, "listening\nGET /\ncrash".into(), Some(Ended::Exited(1))));
+        assert!(app.shell_context.last().unwrap().starts_with("The background `npm start` I started in the shell has since exited with 1"));
+        assert_eq!(app.jobs.len(), 1);
+        app.stop_jobs(|_| true);
+        assert!(other.stopped.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_click_expands_a_shell_run_under_the_prompt_and_its_stop_ends_it() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        let (id, report) = app.shell_entry("sleep 30".into(), false);
+        let (other_id, other) = app.shell_entry("npm run dev".into(), true);
+        let mouse = |kind, (column, row): (u16, u16)| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+        let click = |app: &mut App, wanted: &str, nth: usize| {
+            let text = screen(app, 80, 24);
+            let rows: Vec<&str> = text.lines().collect();
+            let y = rows.iter().enumerate().filter(|(_, r)| r.contains(wanted)).nth(nth).map(|(y, _)| y).expect(&text);
+            let x = rows[y][..rows[y].find(wanted).unwrap()].chars().count() as u16;
+            app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), (x, y as u16)));
+            app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), (x, y as u16)));
+        };
+        app.apply(AppEvent::Printed(id, "tick".into()));
+        // Under the prompt, each one still running, with how long it's been.
+        let text = screen(&app, 80, 24);
+        let listed = |text: &str, wanted: &str| text.lines().find(|r| r.contains(wanted) && r.ends_with(')')).map(str::to_string);
+        assert!(listed(&text, "sleep 30 (").is_some(), "{}", text);
+        assert!(listed(&text, "npm run dev (").is_some_and(|r| r.contains(", background)")), "{}", text);
+        // The output is nothing to click.
+        click(&mut app, "│ tick", 0);
+        assert!(!report.stopped.load(Ordering::Relaxed) && app.opened.is_none() && matches!(app.overlay, Overlay::None));
+        // The entry's command line expands it: all it printed, under the
+        // prompt, where its `✕ stop` is too.
+        click(&mut app, "sleep 30", 0);
+        assert!(matches!(app.overlay, Overlay::Shell(i) if i == id));
+        let text = screen(&app, 80, 24);
+        assert!(text.lines().any(|r| r.contains("[esc] close") && r.contains("[x] stop")) && text.contains("│ tick"), "{}", text);
+        app.overlay = Overlay::None;
+        // So does its line under the prompt; the panel's `✕ stop` stops
+        // that one, and that one alone.
+        click(&mut app, "npm run dev (", 0);
+        assert!(matches!(app.overlay, Overlay::Shell(i) if i == other_id));
+        click(&mut app, "[x] stop", 0);
+        assert!(other.stopped.load(Ordering::Relaxed) && !report.stopped.load(Ordering::Relaxed));
+        assert!(app.opened.is_none() && app.copied.is_none());
+        app.apply(AppEvent::Shell(other_id, String::new(), Some(Ended::Stopped)));
+        assert!(screen(&app, 80, 24).contains("  ■ stopped"));
+        // Ended, it's off the list under the prompt, and its command line
+        // still expands it; the entry's `✕ stop` stops the one left.
+        app.overlay = Overlay::None;
+        let text = screen(&app, 80, 24);
+        assert!(listed(&text, "npm run dev (").is_none() && listed(&text, "sleep 30 (").is_some(), "{}", text);
+        click(&mut app, "npm run dev", 0);
+        assert!(matches!(app.overlay, Overlay::Shell(i) if i == other_id));
+        app.overlay = Overlay::None;
+        click(&mut app, "✕ stop", 0);
+        assert!(report.stopped.load(Ordering::Relaxed));
+        app.apply(AppEvent::Shell(id, "tick".into(), Some(Ended::Stopped)));
+        assert!(app.jobs.is_empty() && !screen(&app, 80, 24).contains("✕ stop"));
+    }
+
+    #[test]
+    fn ctrl_b_selects_a_running_command_from_the_keyboard_to_expand_or_stop() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        let press = |app: &mut App, code: KeyCode, modifiers: KeyModifiers| app.key(KeyEvent::new(code, modifiers));
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "Nothing is running"));
+        let (id, report) = app.shell_entry("sleep 30".into(), false);
+        let (other_id, other) = app.shell_entry("npm run dev".into(), true);
+        assert!(screen(&app, 80, 24).contains(&format!("[{}] running", tasks_key())));
+        // `/tasks` opens the list as the key does, as in Claude Code.
+        app.input = "/tasks".into();
+        app.submit();
+        assert!(matches!(app.overlay, Overlay::Jobs { selected: 0 }));
+        app.overlay = Overlay::None;
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(matches!(app.overlay, Overlay::Jobs { selected: 0 }));
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("› ⠋ sleep 30 (") || text.contains("› [-] sleep 30 ("), "{}", text);
+        assert!(text.contains("[x] stop"), "{}", text);
+        // Down, then enter: the second one, expanded; esc back to the prompt.
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert!(matches!(app.overlay, Overlay::Jobs { selected: 1 }));
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(app.overlay, Overlay::Shell(i) if i == other_id));
+        // `x` there stops it, and that one alone.
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(other.stopped.load(Ordering::Relaxed) && !report.stopped.load(Ordering::Relaxed));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(app.overlay, Overlay::None));
+        // Back in the list, a run ending keeps the selection on a row, and
+        // `x` stops the selected one; the last one gone closes the list.
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        app.apply(AppEvent::Shell(other_id, String::new(), Some(Ended::Stopped)));
+        assert!(matches!(app.overlay, Overlay::Jobs { selected: 0 }));
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(report.stopped.load(Ordering::Relaxed));
+        app.apply(AppEvent::Shell(id, String::new(), Some(Ended::Stopped)));
+        assert!(matches!(app.overlay, Overlay::None) && app.jobs.is_empty());
+        // Typing anything else leaves the list for the prompt.
+        let (_, _) = app.shell_entry("cargo test".into(), false);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert!(matches!(app.overlay, Overlay::None) && app.input == "h");
     }
 
     #[test]
@@ -4979,12 +5841,12 @@ mod tests {
         assert_eq!(app.commands.as_ref().map(|(_, c)| c.len()), Some(1));
         assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "cargo check --quiet"));
         let id = check.id;
-        app.apply(AppEvent::Check(id, String::new(), Some(0)));
+        app.apply(AppEvent::Check(id, String::new(), Ended::Exited(0)));
         assert!(matches!(app.entries.last(), Some(Entry::Ask(c)) if c == &["git commit -am \"main\""]));
         assert!(app.commands.is_none());
         key(&mut app, KeyCode::Tab);
         assert!(app.always_run);
-        assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "git commit -am \"main\"" && s.output.is_none()));
+        assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "git commit -am \"main\"" && s.ended.is_none()));
         turn(&mut app, "```sh\ngit push\n```\n");
         assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "git push"));
         assert!(app.ask.is_none());
@@ -5026,7 +5888,7 @@ mod tests {
         // done, to be told of; each for a few rounds only.
         let id = app.shell_runs;
         let ran = |app: &mut App, last: bool, output: &str, code: i32| {
-            app.apply(AppEvent::Ran(id, "p1".into(), last, output.into(), Some(code)));
+            app.apply(AppEvent::Ran(id, "p1".into(), last, output.into(), Some(Ended::Exited(code))));
         };
         ran(&mut app, false, "fatal: no upstream", 128);
         assert_eq!(app.command_round, 1);
@@ -5056,7 +5918,7 @@ mod tests {
         let id = app.check.as_ref().unwrap().id;
         app.fix_round = 10;
         app.last_failure = Some("err".into());
-        app.apply(AppEvent::Check(id, "err".into(), Some(1)));
+        app.apply(AppEvent::Check(id, "err".into(), Ended::Exited(1)));
         assert!(app.commands.is_none());
         assert!(matches!(app.entries.last(), Some(Entry::Warning(w)) if w == "Not run, as the check failed: git push"), "{:?}", app.entries.len());
     }
@@ -5071,13 +5933,13 @@ mod tests {
         app.run_check(dir.path(), &["src/main.rs".to_string()]);
         let check = app.check.as_ref().expect("a check runs");
         assert_eq!(check.command, "cargo check --quiet");
-        assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "cargo check --quiet" && s.output.is_none()));
+        assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "cargo check --quiet" && s.ended.is_none()));
         let id = check.id;
-        app.apply(AppEvent::Check(id, String::new(), Some(0)));
+        app.apply(AppEvent::Check(id, String::new(), Ended::Exited(0)));
         assert!(app.check.is_none());
         assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "cargo check --quiet passed"), "{:?}", app.entries.len());
         // A stale result, from a check since replaced, is dropped.
-        app.apply(AppEvent::Check(id, "late".into(), Some(1)));
+        app.apply(AppEvent::Check(id, "late".into(), Ended::Exited(1)));
         assert!(matches!(app.entries.last(), Some(Entry::Notice(_))));
     }
 
@@ -6059,24 +6921,41 @@ mod tests {
         // Streaming: the block is open, and the old file's end isn't gone yet.
         reply.text = "Here:\n\n`main.rs`\n```rust\nfn main() {\n    new();".into();
         let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
-        let at = |rows: &[String]| rows.iter().position(|r| r == "  @@ main.rs · updated, +1 −1 @@").expect("header");
+        let at = |rows: &[String]| rows.iter().position(|r| r == "← main.rs  +1 −1").unwrap_or_else(|| panic!("{:?}", rows));
         let h = at(&rows);
-        assert_eq!(rows[h + 1..h + 4], ["   fn main() {", "  -    old();", "  +    new();"]);
+        // Each hunk under its header, the lines numbered in the old and
+        // the new file, as opencode shows an edit.
+        assert_eq!(rows[h + 1..h + 5], ["  @@ -1,2 +1,2 @@", "   1  1  fn main() {", "   2    -    old();", "      2 +    new();"]);
         assert!(!rows.iter().any(|r| r.contains("-}")), "{:?}", rows);
         // Closed: the whole change. A new file is all additions.
         reply.text = "Here:\n\n`main.rs`\n```rust\nfn main() {\n    new();\n}\n```\n\n`lib.rs`\n```rust\npub fn l() {}\n```\n".into();
         reply.rendered_at.set(None);
         let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
         let h = at(&rows);
-        assert_eq!(rows[h + 1..h + 5], ["   fn main() {", "  -    old();", "  +    new();", "   }"]);
-        assert!(rows.contains(&"  @@ lib.rs · created, +1 @@".to_string()), "{:?}", rows);
-        assert!(rows.contains(&"  +pub fn l() {}".to_string()), "{:?}", rows);
+        assert_eq!(rows[h + 2..h + 6], ["   1  1  fn main() {", "   2    -    old();", "      2 +    new();", "   3  3  }"]);
+        assert!(rows.contains(&"# lib.rs  +1".to_string()), "{:?}", rows);
+        assert!(rows.contains(&"   1 +pub fn l() {}".to_string()), "{:?}", rows);
         // Written since, the change still reads against the file as it was.
         std::fs::write(dir.path().join("main.rs"), "fn main() {\n    new();\n}\n").unwrap();
         reply.text.push(' ');
         reply.rendered_at.set(None);
         let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
         at(&rows);
+        // A reply holding much less than the file isn't all of it: shown
+        // as it is, not as the rest of the file taken out.
+        let long: String = (1..=30).map(|i| format!("line {}\n", i)).collect();
+        std::fs::write(dir.path().join("big.rs"), &long).unwrap();
+        reply.text = "`big.rs`\n```rust\nline 1\nline 2\n```\n".into();
+        reply.rendered_at.set(None);
+        let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
+        assert!(rows.contains(&"← big.rs · less than the file, so not written over it".to_string()), "{:?}", rows);
+        assert!(rows.contains(&"  line 1".to_string()) && !rows.iter().any(|r| r.contains("-line")), "{:?}", rows);
+        // Shown the file whole, the agent's shorter one is all of it.
+        reply.whole = vec!["big.rs".into()];
+        reply.text.push_str("\nDone.");
+        reply.rendered_at.set(None);
+        let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
+        assert!(rows.contains(&"← big.rs  +0 −28".to_string()), "{:?}", rows);
         // Without a folder, a reply's code shows as it is.
         let plain = Reply { text: "`main.rs`\n```rust\nfn main() {}\n```".into(), ..Default::default() };
         let rows: Vec<String> = plain.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
