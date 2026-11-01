@@ -1089,7 +1089,18 @@ impl App {
         self.stop_sync();
         let Some(project) = self.project.clone() else { return };
         let Some(root) = project_root(&project.0) else { return };
-        if docent::linked(&root).is_some_and(|l| !l.paused) {
+        let Some(link) = docent::linked(&root) else { return };
+        // A folder docent linked is docent's project: one made before
+        // projects carried a client is marked so now, and stays out of
+        // Studio's list. Quietly: an agent that doesn't know the field yet
+        // refuses, and the next run tries again.
+        if link.project == project.0 && !cfg!(test) {
+            let id = project.0.clone();
+            self.spawn(move |client, _| {
+                let _ = crate::try_claim_project(&client, &id);
+            });
+        }
+        if !link.paused {
             self.start_sync(root, project, false);
         }
     }

@@ -142,6 +142,35 @@ pub fn try_fetch_projects(client: &Client) -> Result<Vec<serde_json::Value>, Str
     }
 }
 
+/// Whether `project`, as the agent lists it, is nobody's yet: made before
+/// projects carried a client, or by a client that didn't say. One that is
+/// another client's (Studio's) is left alone.
+pub fn needs_claim(project: &serde_json::Value) -> bool {
+    project["client"].as_str().is_none_or(str::is_empty)
+}
+
+/// Mark project `id` docent's, when it is nobody's yet: a folder linked
+/// before projects carried a client stays out of Studio's list from the
+/// next run on. Returns whether it was claimed now.
+pub fn try_claim_project(client: &Client, id: &str) -> Result<bool, String> {
+    let projects = try_fetch_projects(client)?;
+    let Some(project) = projects.iter().find(|p| p["id"].as_str() == Some(id)) else {
+        return Ok(false);
+    };
+    if !needs_claim(project) {
+        return Ok(false);
+    }
+    let response = client
+        .patch(format!("{}/{}", projects_url(), id))
+        .json(&serde_json::json!({ "client": "docent" }))
+        .send()
+        .map_err(|e| format!("Failed to claim project: {}", e))?;
+    if !response.status().is_success() {
+        return Err(error_message("claim the project", response));
+    }
+    Ok(true)
+}
+
 /// Pick the project a `run` session chats in. The chat request has to name a
 /// project: without one the server's supervisor handles the stream itself and
 /// drops it after the first event. Offers a numbered list on a terminal,
@@ -916,6 +945,15 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn needs_claim_only_for_a_project_nobody_owns() {
+        assert!(super::needs_claim(&serde_json::json!({"id": "p1"})));
+        assert!(super::needs_claim(&serde_json::json!({"id": "p1", "client": null})));
+        assert!(super::needs_claim(&serde_json::json!({"id": "p1", "client": ""})));
+        assert!(!super::needs_claim(&serde_json::json!({"id": "p1", "client": "docent"})));
+        assert!(!super::needs_claim(&serde_json::json!({"id": "p1", "client": "studio"})));
+    }
+
     use super::describe_agent;
     use serde_json::json;
 
