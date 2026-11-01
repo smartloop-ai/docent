@@ -144,9 +144,10 @@ pub fn try_fetch_projects(client: &Client) -> Result<Vec<serde_json::Value>, Str
 
 /// Whether `project`, as the agent lists it, is nobody's yet: made before
 /// projects carried a client, or by a client that didn't say. One that is
-/// another client's (Studio's) is left alone.
+/// another client's (Studio's) is left alone, and so is a system project:
+/// the agent's own, which every client shares.
 pub fn needs_claim(project: &serde_json::Value) -> bool {
-    project["client"].as_str().is_none_or(str::is_empty)
+    !project["system"].as_bool().unwrap_or(false) && project["client"].as_str().is_none_or(str::is_empty)
 }
 
 /// Mark project `id` docent's, when it is nobody's yet: a folder linked
@@ -952,6 +953,8 @@ mod tests {
         assert!(super::needs_claim(&serde_json::json!({"id": "p1", "client": ""})));
         assert!(!super::needs_claim(&serde_json::json!({"id": "p1", "client": "docent"})));
         assert!(!super::needs_claim(&serde_json::json!({"id": "p1", "client": "studio"})));
+        // The agent's own project is every client's, never docent's.
+        assert!(!super::needs_claim(&serde_json::json!({"id": "p1", "system": true})));
     }
 
     use super::describe_agent;
