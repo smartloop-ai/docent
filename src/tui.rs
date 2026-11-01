@@ -370,9 +370,9 @@ impl StepList {
     /// ```text
     /// ╭ Booting up …           ──────────────────────────────────╮
     /// │                                                          │
-    /// │  [x] Start agent          ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰  port 38540   │
-    /// │  [•] Decision model sl-mini   ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱  49%          │
-    /// │  [ ] Default project      ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱               │
+    /// │  ■ Start agent          ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰  port 38540     │
+    /// │  ■ Decision model sl-mini   ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱  49%          │
+    /// │  □ Default project      ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱                 │
     /// │                                                          │
     /// ╰──────────────────────────────── 377 MB of 769 MB · 23s ──╯
     /// ```
@@ -420,11 +420,14 @@ impl StepList {
 
     fn card_row(&self, s: &StepRow, label_width: usize, ticks: usize) -> Line<'static> {
         let label = format!("{:<w$}", truncate(&s.label, label_width), w = label_width);
+        // A square ahead of each step, as the conversation marks its
+        // entries: filled once it's done or while it runs, empty before.
+        let square = |color: Color| Span::styled("■ ", Style::new().fg(color));
         let (mark, label_style) = match s.state {
-            State::Done => (bracket("x", Color::Green), Style::new()),
-            State::Failed => (bracket("✗", Color::Red), Style::new()),
-            State::Active => (bracket("•", pink()), Style::new()),
-            State::Pending => (Span::styled("[ ] ", dim()), dim()),
+            State::Done => (square(Color::Green), Style::new()),
+            State::Failed => (Span::styled("✗ ", Style::new().fg(Color::Red)), Style::new()),
+            State::Active => (square(pink()), Style::new()),
+            State::Pending => (Span::styled("□ ", dim()), dim()),
         };
         let lit = |on: bool, color: Color| {
             if on { Span::styled("▰", Style::new().fg(color)) } else { Span::styled("▱", dim()) }
@@ -459,10 +462,6 @@ impl StepList {
         spans.push(Span::styled(format!("  {:<w$}", detail, w = DETAIL_WIDTH), dim()));
         Line::from(spans)
     }
-}
-
-fn bracket(mark: &str, color: Color) -> Span<'static> {
-    Span::styled(format!("[{}] ", mark), Style::new().fg(color))
 }
 
 /// `██████▋░░░░   49%  377 MB/769 MB`, or the bytes so far when the size
@@ -6873,10 +6872,10 @@ mod tests {
         let text = screen(&app, 80, 30);
         let rows: Vec<&str> = text.lines().collect();
         let top = rows.iter().position(|r| r.starts_with("╭ Booting up…")).expect(&text);
-        assert!(rows[top + 2].contains("[x] Agent 1.2.7") && rows[top + 2].contains("▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰"), "{}", text);
-        assert!(rows[top + 3].contains("[x] Start agent") && rows[top + 3].contains("port 38540"), "{}", text);
-        assert!(rows[top + 4].contains("[•] Decision model sl-mini") && rows[top + 4].contains("▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱  49%"), "{}", text);
-        assert!(rows[top + 5].contains("[ ] Default project") && rows[top + 5].contains("▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱"), "{}", text);
+        assert!(rows[top + 2].contains("■ Agent 1.2.7") && rows[top + 2].contains("▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰"), "{}", text);
+        assert!(rows[top + 3].contains("■ Start agent") && rows[top + 3].contains("port 38540"), "{}", text);
+        assert!(rows[top + 4].contains("■ Decision model sl-mini") && rows[top + 4].contains("▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱  49%"), "{}", text);
+        assert!(rows[top + 5].contains("□ Default project") && rows[top + 5].contains("▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱"), "{}", text);
         assert!(rows[top + 7].starts_with('╰') && rows[top + 7].contains("377 MB of 769 MB"), "{}", text);
     }
 
