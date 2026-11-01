@@ -206,7 +206,7 @@ On exit it prints the session id, to resume with `--session`.
 | --- | --- |
 | `/login`, `/logout` | sign in in the browser (`--token` to paste one) |
 | `/models` | enable, disable and download models |
-| `/models <name> caps <list\|auto>` | set a model's capabilities here, over the catalog's, as in `vision,reasoning`; `auto` goes back to the catalog's |
+| `/models <name> caps <list\|auto>` | set a model's capabilities here, over the catalog's, as in `text,vision,reasoning`; `auto` goes back to the catalog's |
 | `/mcp` | MCP servers; `/mcp add <url>` connects one |
 | `/project` | projects: switch (in a new session), create, import, delete |
 | `/project <name>` | switch to a project by its name or ID |
@@ -377,10 +377,11 @@ code project (or when the prompt is plainly about programming, anywhere).
 Which model answers is the orchestrator's call: it steps up and down through
 the project's enabled models by their size, what they declare and the
 machine's resources, taking the largest that fits. Capabilities are what a
-model has (`vision`, `reasoning`, `thinking`; `/models` shows each model's),
-not what a turn is about, so there is no tag for coding or documents to set.
-A model the catalog doesn't describe can be given a capability here:
-`/models <name> caps vision,reasoning`.
+model has (`text`, `vision`, `reasoning`, `thinking`; `/models` shows each
+model's), not what a turn is about, so there is no tag for coding or
+documents to set; a model declared `vision` alone is the one kind that
+holds no text conversation. A model the catalog doesn't describe can be
+given a capability here: `/models <name> caps text,vision,reasoning`.
 
 A folder is a code project when a manifest sits at its top: `Cargo.toml`,
 `package.json`, `pyproject.toml`, `go.mod`, `pom.xml` and the like. That's

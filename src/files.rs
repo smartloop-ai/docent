@@ -237,8 +237,11 @@ fn git_state(root: &Path) -> Option<String> {
 const GIT_STATUS_LINES: usize = 40;
 
 /// The placeholders in `script`, a command the agent gave with a value
-/// to fill in, as `<your-username>` or `YOUR_TOKEN`: it mustn't run as
-/// it is. A redirect, `< file`, or a heredoc, `<<EOF`, isn't one.
+/// to fill in, as `<your-username>`, `<API KEY>` or `YOUR_TOKEN`: it
+/// mustn't run as it is. A redirect, `< file`, a heredoc, `<<EOF`, or an
+/// HTML tag the command writes, `<h1>`, isn't one: a placeholder names a
+/// thing, in more than one word or in capitals, where a tag is one short
+/// lowercase word.
 pub fn placeholders(script: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     let mut add = |text: String| {
@@ -255,7 +258,11 @@ pub fn placeholders(script: &str) -> Vec<String> {
             && inner.chars().last().is_some_and(|c| c.is_ascii_alphanumeric())
             && inner.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ' | '.'))
             && !inner.contains("  ");
-        if named {
+        let lower = inner.to_lowercase();
+        let names_a_thing = inner.contains(['-', '_', ' '])
+            || lower.starts_with("your")
+            || (inner.len() > 1 && inner.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()));
+        if named && names_a_thing {
             add(format!("<{}>", inner));
         }
     }
@@ -941,7 +948,12 @@ mod tests {
             ["<your-username>"]
         );
         assert_eq!(placeholders("export TOKEN=YOUR_TOKEN_HERE"), ["YOUR_TOKEN_HERE"]);
-        assert_eq!(placeholders("sort < names.txt > out.txt && a <b> c"), ["<b>"]);
+        assert_eq!(placeholders("sort < names.txt > out.txt && a <branch-name> c"), ["<branch-name>"]);
+        assert_eq!(placeholders("export KEY=<API KEY> && cd <PATH>"), ["<API KEY>", "<PATH>"]);
+        assert_eq!(placeholders("ssh <yourhost>"), ["<yourhost>"]);
+        // HTML a command writes isn't a placeholder.
+        assert!(placeholders("echo '<h1>Hello</h1><p>Hi</p><br/>' > index.html").is_empty());
+        assert!(placeholders("cat > index.html <<EOF\n<div class=\"app\"><b>x</b></div>\nEOF").is_empty());
         assert!(placeholders("git push -u origin main").is_empty());
         assert!(placeholders("cat <<EOF > x\nhi\nEOF").is_empty());
     }

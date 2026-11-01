@@ -799,8 +799,9 @@ struct Turn {
     tokens: u64,
     /// The latest `chat.status` message, for the status line.
     activity: Option<String>,
-    /// That message is the agent indexing the folder for this turn, which
-    /// the turn's own line already shows.
+    /// The agent is indexing the folder for this turn: shown on the status
+    /// line's own indexing row, as a background pass is, not repeated on
+    /// the turn's line.
     indexing: bool,
     /// Where the files its reply gives are written: only for a turn asked
     /// to make them.
@@ -2181,8 +2182,13 @@ impl App {
                 if step == "file-write" {
                     turn.agent_wrote.push(message.clone());
                 }
-                turn.activity = Some(message.trim_end_matches(['.', '…']).to_string());
+                // Indexing shows on the status line's own row, where a
+                // background pass shows too; the turn's line keeps what it
+                // was doing.
                 turn.indexing = step == "index";
+                if !turn.indexing {
+                    turn.activity = Some(message.trim_end_matches(['.', '…']).to_string());
+                }
             }
             ChatEvent::Retrying(e) => reply.warnings.push(format!("Connection dropped, retrying: {}", e)),
         }
@@ -2310,8 +2316,8 @@ impl App {
 
     /// `/models <name> caps <list|auto>`: set a model's capabilities here,
     /// over the catalog's, so the planner routes to it: what the model has
-    /// (`vision`, `reasoning`, `thinking`), not what a turn is about; `auto`
-    /// goes back to the catalog's.
+    /// (`text`, `vision`, `reasoning`, `thinking`), not what a turn is
+    /// about; `auto` goes back to the catalog's.
     fn set_capabilities(&mut self, name: String, list: &str) {
         let capabilities = match capability_list(list) {
             Ok(caps) => caps,
@@ -3210,10 +3216,10 @@ impl App {
             }
             _ => {}
         }
-        // Not while the turn's own line is reporting the same indexing.
-        let indexing = (self.agent.as_ref().is_some_and(|a| a.state == "indexing")
-            || self.indexing_until.is_some_and(|until| Instant::now() < until))
-            && !self.turn.as_ref().is_some_and(|turn| turn.indexing);
+        // A turn's own indexing shows here too, on the one row.
+        let indexing = self.agent.as_ref().is_some_and(|a| a.state == "indexing")
+            || self.indexing_until.is_some_and(|until| Instant::now() < until)
+            || self.turn.as_ref().is_some_and(|turn| turn.indexing);
         if matches!(self.phase, Phase::Ready) && (self.syncing > 0 || indexing) {
             // Counts up to what was pushed, as the agent gets through it.
             let left = if self.syncing > 0 { self.syncing } else { self.agent.as_ref().map_or(0, |a| a.pending) };
@@ -4030,7 +4036,7 @@ fn capability_list(list: &str) -> Result<Vec<String>, String> {
     }
     let caps: Vec<String> = list.split(',').map(|c| c.trim().to_lowercase()).filter(|c| !c.is_empty()).collect();
     if caps.is_empty() {
-        return Err("Name the capabilities, as in /models <name> caps vision,reasoning; or auto".to_string());
+        return Err("Name the capabilities, as in /models <name> caps text,vision,reasoning; or auto".to_string());
     }
     Ok(caps)
 }
@@ -4694,7 +4700,7 @@ mod tests {
     }
 
     #[test]
-    fn indexing_for_the_turn_shows_on_the_turns_line_only() {
+    fn indexing_for_the_turn_shows_on_the_status_row_not_the_turns_line() {
         let mut app = app();
         app.phase = Phase::Ready;
         let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 1, pending: 0 };
@@ -4714,13 +4720,26 @@ mod tests {
         });
         app.chat_event(ChatEvent::Status { step: "index".into(), message: "Reading Testamento ejemplo.pdf".into() });
 
+        // The header's row says it; the turn's line doesn't repeat it.
         let shown = screen(&app, 80, 24);
-        assert!(shown.contains("Reading Testamento ejemplo.pdf…"));
-        assert!(!shown.contains("Indexing documents"));
+        assert!(shown.contains("Indexing documents…"), "{}", shown);
+        assert!(!shown.contains("Reading Testamento ejemplo.pdf"), "{}", shown);
+        assert!(shown.contains("Thinking"), "{}", shown);
 
-        // Past indexing, a background pass shows again.
+        // Past indexing, the turn's line follows the agent again.
         app.chat_event(ChatEvent::Status { step: "explore".into(), message: "Searching documents".into() });
+        let shown = screen(&app, 80, 24);
+        assert!(shown.contains("Searching documents…"), "{}", shown);
+        assert!(shown.contains("Indexing documents…"), "{}", shown);
+
+        // With no turn, the agent's own state still shows the row; without
+        // either, nothing does.
+        app.turn = None;
         assert!(screen(&app, 80, 24).contains("Indexing documents…"));
+        let agent = crate::AgentState { state: "ready".into(), memory: None, documents: 1, pending: 0 };
+        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(agent)));
+        app.indexing_until = None;
+        assert!(!screen(&app, 80, 24).contains("Indexing documents…"));
     }
 
     #[test]
