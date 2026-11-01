@@ -196,10 +196,13 @@ fn select_project(client: &Client) -> String {
 
 /// Create an empty project and return it as the agent lists it.
 pub fn try_create_project(client: &Client, name: &str, description: Option<String>) -> Result<serde_json::Value, String> {
+    // Named as docent's: a project made from a folder of code, which the
+    // framework reports so other clients (Studio) can leave it out.
     let mut body = serde_json::json!({
         "name": name,
         "system": false,
         "skills": [],
+        "client": "docent",
     });
 
     if let Some(description) = description {
