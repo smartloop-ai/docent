@@ -102,13 +102,13 @@ checklist on stderr under the Docent banner that redraws in place, with
 the active download's bar in Smartloop pink:
 
 ```
-[✓] Start agent                    port 50578
-[✓] Embeddings (bge-m3)                417 MB
-[•] Decision model sl-mini
-    ██████████████▋░░░░░░░░░░░░░░░   49%  377 MB/769 MB
-[ ] Default project
-[ ] Load model
-[ ] Skills and connections
+■ Start agent                    port 50578
+■ Embeddings (bge-m3)                417 MB
+■ Decision model sl-mini
+  ██████████████▋░░░░░░░░░░░░░░░   49%  377 MB/769 MB
+□ Default project
+□ Load model
+□ Skills and connections
 ```
 
 A step without a bar shows its elapsed time once it runs past a couple of
@@ -206,17 +206,23 @@ On exit it prints the session id, to resume with `--session`.
 | --- | --- |
 | `/login`, `/logout` | sign in in the browser (`--token` to paste one) |
 | `/models` | enable, disable and download models |
+| `/models <name> caps <list\|auto>` | set a model's capabilities here, over the catalog's, as in `text,vision,reasoning`; `auto` goes back to the catalog's |
 | `/mcp` | MCP servers; `/mcp add <url>` connects one |
 | `/project` | projects: switch (in a new session), create, import, delete |
 | `/project <name>` | switch to a project by its name or ID |
 | `/project new <name>` | create a project and switch to it |
 | `/project import <zip>` | import an exported project and switch to it |
 | `/status` | account, model, agent and versions |
-| `/usage` | web searches left, tokens and cost saved |
+| `/usage` | web searches and credits left this month, tokens and cost saved |
 | `/upgrade` | Pro plan: 1,000 web searches a month |
+| `/code [on\|off\|auto]` | whether prompts in this folder are answered with code (see [Coding](#coding)); `on` and `off` mark the folder over what its files say, `auto` unmarks it |
+| `/write [path]` | write the last reply's files that were left unwritten, or one of them |
 | `/clear` | clear the chat and start a new session |
 | `/<skill> [prompt]` | run one of the project's skills; `/` lists them with the commands |
-| `!<command>` | run a shell command in the working directory; its output goes to the agent with your next prompt, so it stays in the session |
+| `!<command>` | run a shell command in the working directory, its output shown as it comes, each command of a script on a `$` line over what it printed; the output goes to the agent with your next prompt, so it stays in the session. The prompt turns pink with `!` ahead as it's typed, and the footer says shell mode, as in Claude Code |
+| `!<command> &` | run it in the background, as a dev server: nothing waits for it, and it's listed under the prompt, out of the chat, until it ends |
+| `/tasks` | the commands still running, as in Claude Code: `↑` `↓` pick one, `Enter` shows all it printed, `x` stops it; `ctrl+b` opens it too (twice under tmux, where it's the prefix) |
+| `/stop [word]` | stop the shell commands still running, or those with the word in their command; a click on a running command's `✕ stop` in its entry stops it too, and a click on its command expands all it printed |
 | `/help`, `/quit` | |
 
 Pass an initial prompt to send immediately:
@@ -260,9 +266,14 @@ then every few seconds pushes only what was added, changed or removed:
 /sync stop       stop syncing this folder (/sync starts it again)
 ```
 
-- Nothing is synced, and no project created, until you run `/sync`. After
-  that, opening `docent` in the folder opens the chat in its project and keeps
-  syncing it, until `/sync stop`.
+- Opening `docent` in a folder that isn't linked to a project yet gives it
+  one of its own, named after the folder (a project by that name with no
+  folder of its own is reused), writes the link to `.docent/manifest.json`,
+  and syncs the folder to it from then on. A folder of more than 200
+  documents or 500 MB is linked but not synced until `/sync --yes`. Opening
+  `docent` in a linked folder, or one under it, opens the chat in its project
+  and keeps syncing it, until `/sync stop`. `--project` opens another project
+  instead, and links nothing.
 - The folder synced is the nearest one up from where `docent` was opened that
   holds a `.docent/`, as git finds its repository, so opening it in a
   subfolder of a synced project syncs the project. With none, it's the folder
@@ -275,8 +286,9 @@ then every few seconds pushes only what was added, changed or removed:
   than 200 documents or 500 MB asks first; `/sync --yes` goes ahead.
 - **Documents** are the folder's PDF, Word, PowerPoint, Excel, CSV, Markdown
   and text files. Hidden folders, `.gitignore` and a `.docentignore` (same
-  syntax) keep files out. A document in a subfolder is stored flat, as
-  `docs__guide.pdf`.
+  syntax) keep files out, and so are build output and dependencies always:
+  `node_modules`, `target`, `dist`, `build`, `vendor`, `venv` and the like.
+  A document in a subfolder is stored flat, as `docs__guide.pdf`.
 - **`.docentignore`** keeps files out of the project without keeping them out
   of git. Put it in the synced folder (or any folder under it, for that
   folder's files) and list paths or patterns, one per line, as in
@@ -309,6 +321,97 @@ then every few seconds pushes only what was added, changed or removed:
 - A document or skill deleted at Smartloop is pushed again on the next pass.
   If the project itself is deleted, syncing stops; `/sync` links the folder to
   the current project instead.
+
+### Coding
+
+The split is this: the framework, the same one behind smartloop-studio,
+takes a prompt and its sources and produces an answer; its orchestrator
+picks the model that answers and decides on its own whether to search the
+web, for coding as for anything else. Docent is the coding harness around
+that: it builds the prompt from the folder, and takes the answer apart into
+files to write, checks to run and commands to run.
+
+In a code project, a prompt is answered with code that fits what's there:
+the agent is sent the project's files, with the contents of those the prompt
+concerns, the folder's git state, and the request last with how to answer
+it, and told to answer from the files, with the web for what they don't
+tell, such as a library's current API. How much is sent follows the widest
+context window among the project's enabled models: 60,000 characters for a
+32k-token local model, up to 400,000 for a cloud model with a million. A
+smaller model that the orchestrator picks still gets a prompt it can take:
+the framework fits it to the model's window, keeping the head and the tail
+and dropping the middle, which is why the file list, the git state and the
+manifests come first, the bulk of the contents after, and the request with
+its instructions closes the message. The files its reply gives, each whole in a
+fenced block with its path above, are written into the folder, and the chat
+lists what each gained and lost by lines. In the reply, a file shows as its
+change against the file in the folder, the way opencode shows an edit: only
+the changed hunks, each under its `@@` header with a few lines of context,
+every line numbered in the old and the new file, lines put in on green and
+lines taken out on red, as it streams in; a new file as additions, folded
+past 40 lines. A file the agent wasn't shown whole isn't replaced by a reply
+shorter than it: the reply's part shows as it is, not as the rest of the
+file taken out, and `/write` puts it down if it's what you want. Once the files are written, the
+project is checked with a quick command for its kind, such as `cargo check`,
+`go build ./...`, the package's `build` script or `tsc --noEmit`, shown like
+a `!` command. A project with no build of its own, or a plain folder of
+scripts, gets each file written checked by what it is: `bash -n` for a shell
+script, `python3 -m py_compile` for Python, `node --check`, `ruby -c`,
+`php -l` and so on. If it fails, the errors go back to the
+agent to fix, and the fixed files are checked again, round after round until
+the check passes; it stops only when a round changes nothing, as when the
+check fails the same way again or the reply writes no file, or when you
+press `Esc`. Work that isn't a file, such as committing and pushing, installing
+a dependency or running the tests, the agent answers with the shell commands
+for it, in a fenced block marked `sh` with no path. Once the reply's files
+are written and checked, docent shows the commands and asks, as opencode
+does before a tool runs: `Enter` runs them in the folder, each block as one
+script in turn, shown like a `!` command; `Tab` runs them and turns
+auto-approve on, so every later reply's run without asking; `Esc` skips
+them. `Tab` on an empty prompt turns auto-approve on or off at any time, and
+the footer says when it's on. A command with a
+placeholder to fill in, like `<your-username>`, is left out and said so. What
+a command prints shows as it comes, so a build or a test run is watched, not
+waited on blind. A command that keeps running, such as a dev server or a
+watcher, the agent gives with `&` at its end, as `npm run dev &`, and so can
+you after `!`: it's started in the background, the next command and the next
+prompt don't wait for it, it stays out of the chat until it ends, and several can
+run at once. Each command still running is listed under the prompt, with
+how long it's been. A click on its line there, or on its command in its
+entry, expands it under the prompt: all it printed, as it comes, and `Esc`
+closes it. From the keyboard, `/tasks` or `ctrl+b` (pressed twice under
+tmux, where it's the prefix) selects among them, as `/tasks` does in Claude
+Code: `↑` `↓` pick one, `Enter` expands it, `x` stops it. A click on its
+`✕ stop`, in its entry or on the expanded one, ends it too, as `x` does
+there; `/stop` ends every command
+still running, `/stop <word>` those with the word in their command, and
+quitting ends them all. To
+keep the agent from guessing, the prompt carries the folder's git state: its
+branch, remotes and changed files. What the commands print goes back to the
+agent, as a tool's result does in opencode: a failed one, to be put right
+with other commands or with files; the last one done, to say what that did
+and give what the task still needs. That stops after three rounds, or at
+`Esc`. So "commit and push the changes" ends in a commit, a push, and a
+line saying so, not in a note that the agent can't run git. The agent takes a turn as coding
+work when the prompt asks for a change or about the code and the folder is a
+code project (or when the prompt is plainly about programming, anywhere).
+Which model answers is the orchestrator's call: it steps up and down through
+the project's enabled models by their size, what they declare and the
+machine's resources, taking the largest that fits. Capabilities are what a
+model has (`text`, `vision`, `reasoning`, `thinking`; `/models` shows each
+model's), not what a turn is about, so there is no tag for coding or
+documents to set; a model declared `vision` alone is the one kind that
+holds no text conversation. A model the catalog doesn't describe can be
+given a capability here: `/models <name> caps text,vision,reasoning`.
+
+A folder is a code project when a manifest sits at its top: `Cargo.toml`,
+`package.json`, `pyproject.toml`, `go.mod`, `pom.xml` and the like. That's
+read off the folder on each prompt, so a project scaffolded after the folder
+was linked counts from then on. `/code` says how the folder stands, `/code on`
+or `/code off` marks it a code or documents project over what its files say,
+in `.docent/manifest.json`, and `/code auto` goes back to its files.
+Elsewhere, a prompt that asks for something to be made (create, generate,
+scaffold, write, add, fix…) is answered with files too.
 
 ## Configuration
 

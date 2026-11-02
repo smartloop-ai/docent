@@ -69,14 +69,15 @@ pub async fn stream_turn(
     message: &str,
     attachments: &[String],
     project_id: &str,
+    cwd: Option<&std::path::Path>,
     session_id: &str,
     on: &mut (dyn FnMut(ChatEvent) + Send),
 ) -> Result<TurnStats, String> {
-    match stream_turn_once(client, message, attachments, project_id, session_id, on).await {
+    match stream_turn_once(client, message, attachments, project_id, cwd, session_id, on).await {
         Ok(stats) => Ok(stats),
         Err((e, tokens)) if tokens == 0 => {
             on(ChatEvent::Retrying(e));
-            stream_turn_once(client, message, attachments, project_id, session_id, on)
+            stream_turn_once(client, message, attachments, project_id, cwd, session_id, on)
                 .await
                 .map_err(|(e, _)| e)
         }
@@ -89,6 +90,7 @@ async fn stream_turn_once(
     message: &str,
     attachments: &[String],
     project_id: &str,
+    cwd: Option<&std::path::Path>,
     session_id: &str,
     on: &mut (dyn FnMut(ChatEvent) + Send),
 ) -> Result<TurnStats, (String, u64)> {
@@ -101,14 +103,7 @@ async fn stream_turn_once(
     if !attachments.is_empty() {
         user["attachments"] = serde_json::json!(attachments);
     }
-    // The folder the turn works in: the agent binds the project to it on
-    // first use, then indexes and explores it. That's the folder the project
-    // syncs from, when it has one, wherever the chat was opened; never one
-    // linked to another project.
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|here| crate::docent::workspace(project_id, &here))
-        .map(|dir| dir.to_string_lossy().into_owned());
+    let cwd = cwd.map(|dir| dir.to_string_lossy().into_owned());
     let body = serde_json::json!({
         "model": "sl-mini",
         "messages": [user],
@@ -158,6 +153,40 @@ async fn stream_turn_once(
     Ok(TurnStats { tokens, elapsed: started.elapsed() })
 }
 
+/// The folder a turn of `project_id` works in: the agent binds the project
+/// to it on first use, then indexes and explores it. That's the folder the
+/// project syncs from, when it has one, wherever the chat was opened; never
+/// one linked to another project.
+pub fn turn_dir(project_id: &str) -> Option<std::path::PathBuf> {
+    std::env::current_dir().ok().and_then(|here| crate::docent::workspace(project_id, &here))
+}
+
+/// The folder a turn that makes files works in: the one the chat was opened
+/// in, so the agent reads the code that's there and the files land next to
+/// it. None when that folder syncs to another project, or this project is
+/// linked to a folder elsewhere: the agent only works in the folder its
+/// project is bound to, and sent any other it falls back to its own state
+/// under `~/.smartloop`, writing and citing files there.
+pub fn making_dir(project_id: &str) -> Option<std::path::PathBuf> {
+    let here = std::env::current_dir().ok()?;
+    making_dir_in(project_id, &here, crate::docent::folder(project_id))
+}
+
+/// `making_dir` for a chat opened in `here`, with `folder` the one the
+/// project is linked to on this machine: that folder when `here` is in it,
+/// else `here` when the project has no folder and `here` isn't linked to
+/// another project.
+pub fn making_dir_in(project_id: &str, here: &std::path::Path, folder: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    let real = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    match folder {
+        Some(folder) => real(here).starts_with(real(&folder)).then_some(folder),
+        None => {
+            let linked = crate::docent::linked(&crate::docent::root(here));
+            linked.is_none_or(|l| l.project == project_id).then(|| here.to_path_buf())
+        }
+    }
+}
+
 /// What to show for one citation, as the studio app labels its reference
 /// pills: a web source by its URL, a document by the path the agent gave or
 /// else its name.
@@ -177,8 +206,24 @@ pub fn citation_label(citation: &serde_json::Value) -> Option<String> {
             Some(format!("{} ({})", name, url))
         }
         (Some(url), _) => Some(url),
-        (None, name) => field(&["file_path", "path", "source_path"]).or(name),
+        (None, name) => {
+            let path = field(&["file_path", "path", "source_path"]);
+            // A document in a hidden folder is the agent's own state, its
+            // copy under `~/.smartloop`, not one of the user's to cite.
+            if path.as_deref().or(name.as_deref()).is_some_and(in_hidden_folder) {
+                return None;
+            }
+            path.or(name)
+        }
     }
+}
+
+/// Whether `path` lies under a folder whose name starts with `.`, as the
+/// agent's own state under `~/.smartloop` does.
+pub fn in_hidden_folder(path: &str) -> bool {
+    let path = path.replace('\\', "/");
+    path.rsplit_once('/')
+        .is_some_and(|(dirs, _)| dirs.split('/').any(|d| d.len() > 1 && d.starts_with('.') && d != ".."))
 }
 
 /// ANSI color for a `chat.status` step name, grouped by what the step is
@@ -264,7 +309,8 @@ async fn print_turn(
             ChatEvent::Retrying(e) => print_status("error", &format!("connection dropped, retrying: {}", e)),
         }
     };
-    let stats = stream_turn(client, message, &[], project_id, session_id, &mut on).await?;
+    let cwd = turn_dir(project_id);
+    let stats = stream_turn(client, message, &[], project_id, cwd.as_deref(), session_id, &mut on).await?;
 
     let mut out = std::io::stdout().lock();
     if !at_line_start {
@@ -325,5 +371,54 @@ pub async fn run_plain(
         }
 
         report(print_turn(client, input, &project_id, &session_id).await);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link(root: &std::path::Path, project: &str) {
+        std::fs::create_dir_all(root.join(".docent")).unwrap();
+        std::fs::write(root.join(".docent/manifest.json"), format!(r#"{{"project":"{}"}}"#, project)).unwrap();
+    }
+
+    #[test]
+    fn files_are_made_in_the_projects_folder_only() {
+        let folder = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        link(folder.path(), "p1");
+        let sub = folder.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Opened in the project's folder, or under it: its root.
+        let own = Some(folder.path().to_path_buf());
+        assert_eq!(making_dir_in("p1", folder.path(), own.clone()), own);
+        assert_eq!(making_dir_in("p1", &sub, own.clone()), own);
+        // Opened elsewhere: the agent wouldn't work there.
+        assert_eq!(making_dir_in("p1", elsewhere.path(), own), None);
+        // A project with no folder works where the chat was opened, unless
+        // that's another project's.
+        assert_eq!(making_dir_in("p2", elsewhere.path(), None), Some(elsewhere.path().to_path_buf()));
+        assert_eq!(making_dir_in("p2", folder.path(), None), None);
+    }
+
+    #[test]
+    fn documents_in_hidden_folders_are_not_cited() {
+        assert!(in_hidden_folder("/Users/me/.smartloop/ws/project/src/main.rs"));
+        assert!(in_hidden_folder("~/.smartloop/x.md"));
+        assert!(in_hidden_folder(".docent/skills/a.md"));
+        assert!(!in_hidden_folder("src/main.rs"));
+        assert!(!in_hidden_folder(".gitignore"));
+        assert!(!in_hidden_folder("../src/main.rs"));
+        assert!(!in_hidden_folder("roadmap.pdf"));
+
+        let hidden = serde_json::json!({"document_name": "main.rs", "file_path": "/Users/me/.smartloop/ws/p/src/main.rs"});
+        assert_eq!(citation_label(&hidden), None);
+        let hidden_name = serde_json::json!({"document_name": "/Users/me/.smartloop/ws/p/notes.md"});
+        assert_eq!(citation_label(&hidden_name), None);
+        let shown = serde_json::json!({"document_name": "roadmap.pdf", "file_path": "docs/roadmap.pdf"});
+        assert_eq!(citation_label(&shown).as_deref(), Some("docs/roadmap.pdf"));
+        let web = serde_json::json!({"url": "https://smartloop.ai/guide"});
+        assert_eq!(citation_label(&web).as_deref(), Some("https://smartloop.ai/guide"));
     }
 }

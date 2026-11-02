@@ -10,6 +10,7 @@ use progress::Steps;
 mod agent;
 mod chat;
 mod docent;
+mod files;
 mod framework;
 mod links;
 mod mcp;
@@ -141,6 +142,47 @@ pub fn try_fetch_projects(client: &Client) -> Result<Vec<serde_json::Value>, Str
     }
 }
 
+/// Whether `project`, as the agent lists it, is nobody's yet: made before
+/// projects carried a client, or by a client that didn't say. One that is
+/// another client's (Studio's) is left alone, and so is a system project:
+/// the agent's own, which every client shares.
+pub fn needs_claim(project: &serde_json::Value) -> bool {
+    !project["system"].as_bool().unwrap_or(false) && project["client"].as_str().is_none_or(str::is_empty)
+}
+
+/// Whether `project` is the agent's own, marked docent's by a docent that
+/// didn't yet know better: to be let go, so every client sees it again.
+pub fn needs_release(project: &serde_json::Value) -> bool {
+    project["system"].as_bool().unwrap_or(false) && project["client"].as_str() == Some("docent")
+}
+
+/// Mark project `id` docent's, when it is nobody's yet: a folder linked
+/// before projects carried a client stays out of Studio's list from the
+/// next run on. A system project marked docent's is let go instead.
+/// Returns whether anything changed now.
+pub fn try_claim_project(client: &Client, id: &str) -> Result<bool, String> {
+    let projects = try_fetch_projects(client)?;
+    let Some(project) = projects.iter().find(|p| p["id"].as_str() == Some(id)) else {
+        return Ok(false);
+    };
+    let client_name = if needs_claim(project) {
+        "docent"
+    } else if needs_release(project) {
+        ""
+    } else {
+        return Ok(false);
+    };
+    let response = client
+        .patch(format!("{}/{}", projects_url(), id))
+        .json(&serde_json::json!({ "client": client_name }))
+        .send()
+        .map_err(|e| format!("Failed to claim project: {}", e))?;
+    if !response.status().is_success() {
+        return Err(error_message("claim the project", response));
+    }
+    Ok(true)
+}
+
 /// Pick the project a `run` session chats in. The chat request has to name a
 /// project: without one the server's supervisor handles the stream itself and
 /// drops it after the first event. Offers a numbered list on a terminal,
@@ -195,10 +237,13 @@ fn select_project(client: &Client) -> String {
 
 /// Create an empty project and return it as the agent lists it.
 pub fn try_create_project(client: &Client, name: &str, description: Option<String>) -> Result<serde_json::Value, String> {
+    // Named as docent's: a project made from a folder of code, which the
+    // framework reports so other clients (Studio) can leave it out.
     let mut body = serde_json::json!({
         "name": name,
         "system": false,
         "skills": [],
+        "client": "docent",
     });
 
     if let Some(description) = description {
@@ -425,6 +470,10 @@ fn project_model_state(
 pub struct ModelRow {
     pub name: String,
     pub capabilities: String,
+    /// Whether the capabilities were set here, over the catalog's.
+    pub overridden: bool,
+    /// The model's context window in tokens, when the catalog says.
+    pub context: Option<u64>,
     pub access: String,
     /// False when the model needs a sign-in first.
     pub accessible: bool,
@@ -451,6 +500,8 @@ pub fn model_rows(client: &Client, project_id: &str) -> Result<Vec<ModelRow>, St
                     .as_array()
                     .map(|c| c.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
                     .unwrap_or_default(),
+                overridden: model["capabilities_overridden"].as_bool().unwrap_or_default(),
+                context: model["context_length"].as_u64().filter(|n| *n > 0),
                 access: model["access_level"].as_str().unwrap_or_default().to_string(),
                 accessible: model["is_accessible"].as_bool() != Some(false),
                 downloaded: flag("downloaded"),
@@ -459,6 +510,22 @@ pub fn model_rows(client: &Client, project_id: &str) -> Result<Vec<ModelRow>, St
             }
         })
         .collect())
+}
+
+/// Set a model's capabilities here, over the catalog's, for routing: an
+/// empty list takes the setting off. The capabilities as they stand after.
+pub fn set_model_capabilities(client: &Client, name: &str, capabilities: &[String]) -> Result<Vec<String>, String> {
+    let action = "set the model's capabilities";
+    let response = client
+        .patch(format!("{}/models/workspace/{}", api_url(), name))
+        .json(&serde_json::json!({ "capabilities": capabilities }))
+        .send()
+        .map_err(|e| format!("Failed to {}: {}", action, e))?;
+    if !response.status().is_success() {
+        return Err(error_message(action, response));
+    }
+    let reply: serde_json::Value = response.json().map_err(|e| format!("Failed to {}: {}", action, e))?;
+    Ok(reply["capabilities"].as_array().map_or_else(Vec::new, |c| c.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()))
 }
 
 /// PATCH a project's model entry; the server canonicalizes the name.
@@ -890,6 +957,21 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn needs_claim_only_for_a_project_nobody_owns() {
+        assert!(super::needs_claim(&serde_json::json!({"id": "p1"})));
+        assert!(super::needs_claim(&serde_json::json!({"id": "p1", "client": null})));
+        assert!(super::needs_claim(&serde_json::json!({"id": "p1", "client": ""})));
+        assert!(!super::needs_claim(&serde_json::json!({"id": "p1", "client": "docent"})));
+        assert!(!super::needs_claim(&serde_json::json!({"id": "p1", "client": "studio"})));
+        // The agent's own project is every client's, never docent's; one
+        // marked so by an older docent is let go.
+        assert!(!super::needs_claim(&serde_json::json!({"id": "p1", "system": true})));
+        assert!(super::needs_release(&serde_json::json!({"id": "p1", "system": true, "client": "docent"})));
+        assert!(!super::needs_release(&serde_json::json!({"id": "p1", "system": true})));
+        assert!(!super::needs_release(&serde_json::json!({"id": "p1", "system": false, "client": "docent"})));
+    }
+
     use super::describe_agent;
     use serde_json::json;
 
