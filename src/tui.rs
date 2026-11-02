@@ -4649,7 +4649,7 @@ fn stream(
         shell.process_group(0);
     }
     let mut child = match shell
-        .arg(command)
+        .arg(traced(command))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -4777,6 +4777,33 @@ fn detached(command: &str) -> (String, bool) {
     }
 }
 
+/// A line of output that is the shell saying which command it runs next:
+/// the trace `set -x` prints ahead of each, with `TRACE` as its prompt.
+const TRACE: &str = "\u{1f}$ ";
+
+/// `command` as the shell runs it: for the POSIX shells, with their
+/// stderr joined to stdout, so the lines keep the order a terminal shows,
+/// and each command traced on a `TRACE` line ahead of what it prints, so
+/// a script of several shows each one over its own output. The user's
+/// shell can be another, as fish, and runs the command as given.
+fn traced(command: &str) -> String {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+    let name = std::path::Path::new(&shell).file_name().and_then(|n| n.to_str()).unwrap_or("sh");
+    if cfg!(unix) && matches!(name, "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh") {
+        format!("exec 2>&1; PS4='{}'; set -x\n{}", TRACE, command)
+    } else {
+        command.to_string()
+    }
+}
+
+/// The command a line of output traces, if it's one: a `TRACE` line, led
+/// by one more marker per nesting, as bash marks a `$(...)`.
+fn trace_of(line: &str) -> Option<&str> {
+    let (marker, prompt) = TRACE.split_at(1);
+    let rest = line.trim_start_matches(marker);
+    (rest.len() < line.len()).then_some(rest)?.strip_prefix(prompt)
+}
+
 /// `text` as a terminal would have shown it: without its escape sequences
 /// (colours, cursor moves, titles), and a line redrawn with a carriage
 /// return keeping only its last version.
@@ -4845,7 +4872,9 @@ fn shell_context(command: &str, output: &str, ended: Option<Ended>, since: bool)
         Some(ended) if since => format!("The background `{}` I started in the shell has since {}", command, ended.describe()),
         Some(ended) => format!("I ran `{}` in the shell; it {}", command, ended.describe()),
     };
-    format!("{}:\n```\n{}{}\n```", what, cut, &output[start..])
+    let shown: Vec<String> =
+        output[start..].lines().map(|l| trace_of(l).map_or_else(|| l.to_string(), |c| format!("$ {}", c))).collect();
+    format!("{}:\n```\n{}{}\n```", what, cut, shown.join("\n"))
 }
 
 /// The entry for a shell run, with the last `shown` lines it printed. Its
@@ -4860,22 +4889,37 @@ fn shell_lines(shell: &Shell, spinner: &str, shown: usize, lines: &mut Vec<Line<
         Some(Ended::Stopped) => Span::styled("! ", show(Style::new().fg(Color::Yellow).bold())),
         Some(_) => Span::styled("! ", show(Style::new().fg(Color::Red).bold())),
     };
-    // A script of several commands shows each on its own line, `$` ahead
-    // of all but the first, which the mark leads; what they printed so far
-    // sits under them behind a bar, and how it ended, or that it runs on,
-    // closes the entry.
+    // The mark leads the script's first line. The shell traces each
+    // command as it runs it, and each shows on a `$` line over what it
+    // printed, behind a bar: the first trace is the first line again, so
+    // it's left out. Until the shell traces, a script of several commands
+    // lists the rest after the first, `$` ahead. How it ended, or that it
+    // runs on, closes the entry.
     let mut command = shell.command.lines();
-    lines.push(Line::from(vec![mark, Span::styled(command.next().unwrap_or_default().to_string(), show(key_style()))]));
-    for more in command {
-        lines.push(Line::from(vec![Span::styled("$ ", dim()), Span::styled(more.to_string(), key_style())]));
-    }
+    let first = command.next().unwrap_or_default();
+    lines.push(Line::from(vec![mark, Span::styled(first.to_string(), show(key_style()))]));
     let all: Vec<&str> = shell.output.lines().collect();
+    if !all.iter().any(|l| trace_of(l).is_some()) {
+        for more in command {
+            lines.push(Line::from(vec![Span::styled("$ ", dim()), Span::styled(more.to_string(), key_style())]));
+        }
+    }
     let skipped = all.len().saturating_sub(shown);
     if skipped > 0 {
         lines.push(Line::from(vec![Span::styled("  │ ", dim()), Span::styled(format!("… {} earlier lines", skipped), dim())]));
     }
-    for line in &all[skipped..] {
-        lines.push(Line::from(vec![Span::styled("  │ ", dim()), Span::styled(expand_tabs(line, 8), dim())]));
+    let mut traces = 0;
+    for (i, line) in all.iter().enumerate() {
+        let Some(traced) = trace_of(line) else {
+            if i >= skipped {
+                lines.push(Line::from(vec![Span::styled("  │ ", dim()), Span::styled(expand_tabs(line, 8), dim())]));
+            }
+            continue;
+        };
+        traces += 1;
+        if i >= skipped && (traces > 1 || traced != first.trim()) {
+            lines.push(Line::from(vec![Span::styled("$ ", dim()), Span::styled(traced.to_string(), key_style())]));
+        }
     }
     let end = match shell.ended {
         None => {
@@ -5521,11 +5565,13 @@ mod tests {
         let Some(Entry::Shell(shell)) = app.entries.last() else { panic!("no shell entry") };
         assert_eq!(shell.command, "echo hello");
         let (output, ended) = run_command("echo hello", None, false, report());
-        assert_eq!((output.as_str(), ended), ("hello", Some(Ended::Exited(0))));
+        assert_eq!((output.as_str(), ended), (format!("{}echo hello\nhello", TRACE).as_str(), Some(Ended::Exited(0))));
         app.apply(AppEvent::Shell(shell.id, output, ended));
         let text = screen(&app, 80, 24);
         assert!(text.contains("! echo hello") && text.contains("  │ hello") && text.contains("  ✓ done"), "{}", text);
-        assert_eq!(app.shell_context, vec!["I ran `echo hello` in the shell; it exited with 0:\n```\nhello\n```"]);
+        // The shell's trace of the one command is the entry's first line again.
+        assert!(!text.contains("$ echo hello"), "{}", text);
+        assert_eq!(app.shell_context, vec!["I ran `echo hello` in the shell; it exited with 0:\n```\n$ echo hello\nhello\n```"]);
         // A /clear drops what wasn't sent, and a result arriving after it.
         app.input = "/clear".into();
         app.submit();
@@ -5561,7 +5607,7 @@ mod tests {
     #[test]
     fn a_failed_bang_command_shows_its_exit_code_and_keeps_the_tail() {
         let (output, ended) = run_command("echo oops >&2; exit 3", None, false, report());
-        assert_eq!((output.as_str(), ended), ("oops", Some(Ended::Exited(3))));
+        assert_eq!((output.as_str(), ended), (format!("{T}echo oops\noops\n{T}exit 3", T = TRACE).as_str(), Some(Ended::Exited(3))));
         let long = "z".repeat(SHELL_KEPT + 10);
         let kept = shell_context("cat big", &long, Some(Ended::Exited(0)), false);
         assert!(kept.contains("(earlier output cut)\n") && kept.matches('z').count() == SHELL_KEPT, "{}", kept.len());
@@ -5573,12 +5619,39 @@ mod tests {
     }
 
     #[test]
+    fn a_script_shows_each_command_over_what_it_printed() {
+        let script = "git fetch --prune\ngit branch -a";
+        let mut shell = Shell { id: 1, command: script.into(), output: String::new(), ended: None, background: false, detached: false };
+        let rows = |shell: &Shell| {
+            let mut lines = Vec::new();
+            shell_lines(shell, "⠋", SHELL_SHOWN, &mut lines);
+            lines.iter().map(|l| l.to_string()).collect::<Vec<_>>()
+        };
+        // Before the shell traces, the script's lines are listed.
+        assert_eq!(rows(&shell), ["⠋ git fetch --prune", "$ git branch -a", "  … running  ✕ stop"]);
+        // Traced, each command sits over its own output; the first is the
+        // head line, so it isn't repeated.
+        shell.output = format!("{T}git fetch --prune\nFrom github.com:x/y\n - [deleted] old\n{T}git branch -a\n* main", T = TRACE);
+        shell.ended = Some(Ended::Exited(0));
+        assert_eq!(
+            rows(&shell),
+            ["! git fetch --prune", "  │ From github.com:x/y", "  │  - [deleted] old", "$ git branch -a", "  │ * main", "  ✓ done"]
+        );
+        // bash marks a nested `$(...)` with one more marker; a `+` or `$`
+        // in the output itself is output.
+        assert_eq!(trace_of("\u{1f}\u{1f}$ echo b"), Some("echo b"));
+        assert_eq!(trace_of("$ not a trace"), None);
+        assert_eq!(trace_of("+ not one either"), None);
+    }
+
+    #[test]
     fn a_command_streams_its_output_and_a_stop_or_an_ampersand_frees_the_wait() {
         // What it prints shows as it comes, ahead of its end.
         let (tx, mut rx) = unbounded_channel();
         let listened = Report { id: 7, tx, stopped: Arc::new(AtomicBool::new(false)) };
         let (output, ended) = run_command("echo one; sleep 0.4; echo two", None, false, listened);
-        assert_eq!((output.as_str(), ended), ("one\ntwo", Some(Ended::Exited(0))));
+        let traced = format!("{T}echo one\none\n{T}sleep 0.4\n{T}echo two\ntwo", T = TRACE);
+        assert_eq!((output.as_str(), ended), (traced.as_str(), Some(Ended::Exited(0))));
         let mut printed = Vec::new();
         let mut started = false;
         while let Ok(event) = rx.try_recv() {
@@ -5589,7 +5662,7 @@ mod tests {
             }
         }
         assert!(started);
-        assert_eq!(printed.first().map(String::as_str), Some("one"), "{:?}", printed);
+        assert!(printed.first().is_some_and(|t| t.contains("\none") && !t.contains("two")), "{:?}", printed);
         // Stopped, a run ends as stopped, not failed.
         let stopped = Arc::new(AtomicBool::new(false));
         let flag = stopped.clone();
@@ -5615,7 +5688,8 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let stopped = Arc::new(AtomicBool::new(false));
         let (output, ended) = run_command("echo up; sleep 30", None, true, Report { id: 9, tx, stopped: stopped.clone() });
-        assert_eq!((output.as_str(), ended), ("up", None));
+        let up = format!("{T}echo up\nup\n{T}sleep 30", T = TRACE);
+        assert_eq!((output.as_str(), ended), (up.as_str(), None));
         stopped.store(true, Ordering::Relaxed);
         let end = loop {
             match rx.blocking_recv() {
@@ -5624,7 +5698,7 @@ mod tests {
                 None => panic!("no end"),
             }
         };
-        assert_eq!(end, ("up".to_string(), Some(Ended::Stopped)));
+        assert_eq!(end, (up, Some(Ended::Stopped)));
     }
 
     #[test]
