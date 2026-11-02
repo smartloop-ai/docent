@@ -636,15 +636,23 @@ impl Reply {
     /// addresses clickable, and its code blocks drawn as blocks: see
     /// `code_lines`.
     fn body(&self, width: u16) -> Vec<Line<'static>> {
+        self.layout(width);
+        self.rendered.borrow().as_ref().map(|(_, _, lines)| lines.clone()).unwrap_or_default()
+    }
+
+    /// Lay `text` out at `width` for `body`, unless it's laid out as it
+    /// is. A frame measures each entry before it draws, so a reply is laid
+    /// out when it's measured, and the frame draws what it measured.
+    fn layout(&self, width: u16) {
         let text = self.text.trim_end();
         let mut rendered = self.rendered.borrow_mut();
         let streaming = self.stats.is_none() && self.ended.is_none();
         let fresh = self.rendered_at.get().is_some_and(|at| at.elapsed() < TICK);
         match &*rendered {
-            Some((len, at, lines)) if *len == text.len() && *at == width => lines.clone(),
+            Some((len, at, _)) if *len == text.len() && *at == width => {}
             // Still coming in, and laid out a moment ago: that will do until
             // the next tick.
-            Some((_, at, lines)) if streaming && fresh && *at == width => lines.clone(),
+            Some((_, at, _)) if streaming && fresh && *at == width => {}
             _ => {
                 self.rendered_at.set(Some(Instant::now()));
                 let blocks = if self.root.is_some() { files::blocks(text) } else { Vec::new() };
@@ -683,8 +691,7 @@ impl Reply {
                     }
                     lines.extend(part);
                 }
-                *rendered = Some((text.len(), width, lines.clone()));
-                lines
+                *rendered = Some((text.len(), width, lines));
             }
         }
     }
@@ -3837,16 +3844,21 @@ impl App {
             .entries
             .iter()
             .enumerate()
-            .map(|(i, entry)| match cache[i] {
-                Some((w, version, rows)) if w == width && version == entry_version(entry) => rows,
-                _ => {
-                    let mut lines = Vec::new();
-                    self.entry_lines(entry, width, &mut lines);
-                    let rows = rows_of(&lines);
-                    // Measured after laying out, as a reply's version is
-                    // what it was laid out from.
-                    cache[i] = Some((width, entry_version(entry), rows));
-                    rows
+            .map(|(i, entry)| {
+                // A reply's version is the text it's laid out from: laid
+                // out now, so the frame measures and draws the same lines.
+                if let Entry::Reply(reply) = entry {
+                    reply.layout(width);
+                }
+                match cache[i] {
+                    Some((w, version, rows)) if w == width && version == entry_version(entry) => rows,
+                    _ => {
+                        let mut lines = Vec::new();
+                        self.entry_lines(entry, width, &mut lines);
+                        let rows = rows_of(&lines);
+                        cache[i] = Some((width, entry_version(entry), rows));
+                        rows
+                    }
                 }
             })
             .collect();
@@ -5616,6 +5628,29 @@ mod tests {
             Shell { id: 1, command: "false".into(), output: String::new(), ended: Some(Ended::Exited(1)), background: false, detached: false };
         shell_lines(&shell, "", SHELL_SHOWN, &mut lines);
         assert!(lines.iter().any(|l| l.to_string() == "  ✗ exited with 1"));
+    }
+
+    #[test]
+    fn a_streaming_reply_is_drawn_whole_on_the_frame_it_is_laid_out_again() {
+        // A reply laid out a moment ago keeps its layout until the next
+        // tick; once it's laid out again, with more lines, the frame
+        // measures it as the new layout, so its tail isn't cut off for a
+        // frame and back the next: that flickers.
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.entries.push(Entry::Reply(Reply { text: "Here:\n```rust\nfn one() {}\n".into(), ..Default::default() }));
+        let text = screen(&app, 60, 20);
+        assert!(text.contains("fn one() {}"), "{}", text);
+        let Some(Entry::Reply(reply)) = app.entries.last_mut() else { panic!("no reply") };
+        for i in 2..6 {
+            reply.text.push_str(&format!("fn f{}() {{}}\n", i));
+        }
+        // The last layout is a tick old, so this frame lays it out again.
+        reply.rendered_at.set(Some(Instant::now() - 2 * TICK));
+        let text = screen(&app, 60, 20);
+        assert!(text.contains("fn one() {}") && text.contains("fn f5() {}"), "{}", text);
+        let text = screen(&app, 60, 20);
+        assert!(text.contains("fn one() {}") && text.contains("fn f5() {}"), "{}", text);
     }
 
     #[test]
