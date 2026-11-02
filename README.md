@@ -324,94 +324,19 @@ then every few seconds pushes only what was added, changed or removed:
 
 ### Coding
 
-The split is this: the framework, the same one behind smartloop-studio,
-takes a prompt and its sources and produces an answer; its orchestrator
-picks the model that answers and decides on its own whether to search the
-web, for coding as for anything else. Docent is the coding harness around
-that: it builds the prompt from the folder, and takes the answer apart into
-files to write, checks to run and commands to run.
+Open `docent` in a code project and ask for a change. The reply's files show
+as diffs and are written into the folder, the project's build is checked and
+errors are fixed until it passes. Commits, installs and test runs come back as
+shell commands you approve with `Enter` (`Tab` to auto-approve).
 
-In a code project, a prompt is answered with code that fits what's there:
-the agent is sent the project's files, with the contents of those the prompt
-concerns, the folder's git state, and the request last with how to answer
-it, and told to answer from the files, with the web for what they don't
-tell, such as a library's current API. How much is sent follows the widest
-context window among the project's enabled models: 60,000 characters for a
-32k-token local model, up to 400,000 for a cloud model with a million. A
-smaller model that the orchestrator picks still gets a prompt it can take:
-the framework fits it to the model's window, keeping the head and the tail
-and dropping the middle, which is why the file list, the git state and the
-manifests come first, the bulk of the contents after, and the request with
-its instructions closes the message. The files its reply gives, each whole in a
-fenced block with its path above, are written into the folder, and the chat
-lists what each gained and lost by lines. In the reply, a file shows as its
-change against the file in the folder, the way opencode shows an edit: only
-the changed hunks, each under its `@@` header with a few lines of context,
-every line numbered in the old and the new file, lines put in on green and
-lines taken out on red, as it streams in; a new file as additions, folded
-past 40 lines. A file the agent wasn't shown whole isn't replaced by a reply
-shorter than it: the reply's part shows as it is, not as the rest of the
-file taken out, and `/write` puts it down if it's what you want. Once the files are written, the
-project is checked with a quick command for its kind, such as `cargo check`,
-`go build ./...`, the package's `build` script or `tsc --noEmit`, shown like
-a `!` command. A project with no build of its own, or a plain folder of
-scripts, gets each file written checked by what it is: `bash -n` for a shell
-script, `python3 -m py_compile` for Python, `node --check`, `ruby -c`,
-`php -l` and so on. If it fails, the errors go back to the
-agent to fix, and the fixed files are checked again, round after round until
-the check passes; it stops only when a round changes nothing, as when the
-check fails the same way again or the reply writes no file, or when you
-press `Esc`. Work that isn't a file, such as committing and pushing, installing
-a dependency or running the tests, the agent answers with the shell commands
-for it, in a fenced block marked `sh` with no path. Once the reply's files
-are written and checked, docent shows the commands and asks, as opencode
-does before a tool runs: `Enter` runs them in the folder, each block as one
-script in turn, shown like a `!` command; `Tab` runs them and turns
-auto-approve on, so every later reply's run without asking; `Esc` skips
-them. `Tab` on an empty prompt turns auto-approve on or off at any time, and
-the footer says when it's on. A command with a
-placeholder to fill in, like `<your-username>`, is left out and said so. What
-a command prints shows as it comes, so a build or a test run is watched, not
-waited on blind. A command that keeps running, such as a dev server or a
-watcher, the agent gives with `&` at its end, as `npm run dev &`, and so can
-you after `!`: it's started in the background, the next command and the next
-prompt don't wait for it, it stays out of the chat until it ends, and several can
-run at once. Each command still running is listed under the prompt, with
-how long it's been. A click on its line there, or on its command in its
-entry, expands it under the prompt: all it printed, as it comes, and `Esc`
-closes it. From the keyboard, `/tasks` or `ctrl+b` (pressed twice under
-tmux, where it's the prefix) selects among them, as `/tasks` does in Claude
-Code: `↑` `↓` pick one, `Enter` expands it, `x` stops it. A click on its
-`✕ stop`, in its entry or on the expanded one, ends it too, as `x` does
-there; `/stop` ends every command
-still running, `/stop <word>` those with the word in their command, and
-quitting ends them all. To
-keep the agent from guessing, the prompt carries the folder's git state: its
-branch, remotes and changed files. What the commands print goes back to the
-agent, as a tool's result does in opencode: a failed one, to be put right
-with other commands or with files; the last one done, to say what that did
-and give what the task still needs. That stops after three rounds, or at
-`Esc`. So "commit and push the changes" ends in a commit, a push, and a
-line saying so, not in a note that the agent can't run git. The agent takes a turn as coding
-work when the prompt asks for a change or about the code and the folder is a
-code project (or when the prompt is plainly about programming, anywhere).
-Which model answers is the orchestrator's call: it steps up and down through
-the project's enabled models by their size, what they declare and the
-machine's resources, taking the largest that fits. Capabilities are what a
-model has (`text`, `vision`, `reasoning`, `thinking`; `/models` shows each
-model's), not what a turn is about, so there is no tag for coding or
-documents to set; a model declared `vision` alone is the one kind that
-holds no text conversation. A model the catalog doesn't describe can be
-given a capability here: `/models <name> caps text,vision,reasoning`.
+| Command | Does |
+| --- | --- |
+| `/code on\|off\|auto` | treat this folder as a code project, or not |
+| `/write [path]` | write files a reply left unwritten |
+| `!<command> [&]` | run a shell command, in the background with `&` |
+| `/tasks`, `/stop` | see or stop running commands |
 
-A folder is a code project when a manifest sits at its top: `Cargo.toml`,
-`package.json`, `pyproject.toml`, `go.mod`, `pom.xml` and the like. That's
-read off the folder on each prompt, so a project scaffolded after the folder
-was linked counts from then on. `/code` says how the folder stands, `/code on`
-or `/code off` marks it a code or documents project over what its files say,
-in `.docent/manifest.json`, and `/code auto` goes back to its files.
-Elsewhere, a prompt that asks for something to be made (create, generate,
-scaffold, write, add, fix…) is answered with files too.
+More in the [coding docs](https://smartloop.ai/docs/coding/).
 
 ## Configuration
 
