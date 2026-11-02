@@ -102,13 +102,13 @@ checklist on stderr under the Docent banner that redraws in place, with
 the active download's bar in Smartloop pink:
 
 ```
-[✓] Start agent                    port 50578
-[✓] Embeddings (bge-m3)                417 MB
-[•] Decision model sl-mini
-    ██████████████▋░░░░░░░░░░░░░░░   49%  377 MB/769 MB
-[ ] Default project
-[ ] Load model
-[ ] Skills and connections
+■ Start agent                    port 50578
+■ Embeddings (bge-m3)                417 MB
+■ Decision model sl-mini
+  ██████████████▋░░░░░░░░░░░░░░░   49%  377 MB/769 MB
+□ Default project
+□ Load model
+□ Skills and connections
 ```
 
 A step without a bar shows its elapsed time once it runs past a couple of

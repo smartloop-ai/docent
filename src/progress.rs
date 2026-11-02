@@ -5,14 +5,14 @@
 //! █   █ █   █ █     █▀▀▀  █ ▀▄█   █
 //! ▀▀▀▀   ▀▀▀   ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀
 //!
-//! [✓] Agent 1.2.7                        667 MB
-//! [✓] Start agent                    port 38540
-//! [✓] Embeddings (bge-m3)                417 MB
-//! [•] Decision model sl-mini
-//!     ██████████████▋░░░░░░░░░░░░░░░   49%  377 MB/769 MB
-//! [ ] Default project
-//! [ ] Load model
-//! [ ] Skills and connections
+//! ■ Agent 1.2.7                        667 MB
+//! ■ Start agent                    port 38540
+//! ■ Embeddings (bge-m3)                417 MB
+//! ■ Decision model sl-mini
+//!   ██████████████▋░░░░░░░░░░░░░░░   49%  377 MB/769 MB
+//! □ Default project
+//! □ Load model
+//! □ Skills and connections
 //!
 //! ✓ Setup complete in 1min 12s
 //! ```
@@ -217,7 +217,7 @@ impl Steps for Checklist {
             s.detail = format_size(size);
         }
         if !self.tty {
-            eprintln!("[✓] {}  {}", s.label, s.detail);
+            eprintln!("■ {}  {}", s.label, s.detail);
         }
         self.redraw(step);
         self.steps[step].bar.finish();
@@ -229,7 +229,7 @@ impl Steps for Checklist {
         s.state = State::Failed;
         s.fetching = false;
         if !self.tty {
-            eprintln!("[✗] {}", s.label);
+            eprintln!("✗ {}", s.label);
         }
         self.redraw(step);
         for s in &self.steps {
@@ -271,10 +271,10 @@ impl Checklist {
             format!(" {}{:>w$}{}", DIM, s.detail, RESET, w = DETAIL_WIDTH)
         };
         let line = match s.state {
-            State::Done => format!("[{}✓{}] {}{}", GREEN, RESET, label, detail),
-            State::Failed => format!("[{}✗{}] {}", RED, RESET, label.trim_end()),
-            State::Pending => format!("{}[ ] {}{}", DIM, label.trim_end(), RESET),
-            State::Active => format!("[{}•{}] {}{}", pink(), RESET, label, detail),
+            State::Done => format!("{}■{} {}{}", GREEN, RESET, label, detail),
+            State::Failed => format!("{}✗{} {}", RED, RESET, label.trim_end()),
+            State::Pending => format!("{}□ {}{}", DIM, label.trim_end(), RESET),
+            State::Active => format!("{}■{} {}{}", pink(), RESET, label, detail),
         };
         // Escape braces so the line can sit in an indicatif template.
         let line = line.replace('{', "{{").replace('}', "}}");
@@ -349,7 +349,7 @@ fn active_style(line: &str, has_detail: bool) -> ProgressStyle {
 
 /// A running download: its line, and the bar indented under it.
 fn download_style(line: &str) -> ProgressStyle {
-    ProgressStyle::with_template(&format!("{}\n    {{fetch}}", line))
+    ProgressStyle::with_template(&format!("{}\n  {{fetch}}", line))
         .expect("valid template")
         .with_key("fetch", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
             let _ = write!(w, "{}", bar_line(state.pos(), state.len().unwrap_or(0)));
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn styles_build() {
-        let line = "[•] {{braced}} label";
+        let line = "■ {{braced}} label";
         plain_style(line);
         active_style(line, true);
         active_style(line, false);
