@@ -5288,9 +5288,9 @@ checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
 
 [[package]]
 name = "smartloop"
-version = "1.2.17"
+version = "1.2.18"
 source = "sparse+https://dl.smartloop.ai/crates/"
-checksum = "c0b0b65ece11cb5fd1865e50199125257fae1f314d23fff42a8457be726a2fb4"
+checksum = "b49289bc05b865f1185e0abd5a370abfda47b870445a0110a32463b4042f96ce"
 dependencies = [
  "anyhow",
  "async-stream",
