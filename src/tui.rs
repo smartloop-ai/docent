@@ -179,6 +179,9 @@ enum AppEvent {
     /// `Shell`, with the project it ran for and whether it was the last
     /// of the reply's.
     Ran(usize, String, bool, String, Option<Ended>),
+    /// A reply's scripts left unrun, as one before them failed or was
+    /// stopped: off the running list, and out of the chat.
+    Unrun(Vec<usize>),
     /// A check of the project after files were written: its shell entry's
     /// id, output and end.
     Check(usize, String, Ended),
@@ -1992,16 +1995,40 @@ impl App {
         }
         self.spawn(move |_, tx| {
             let count = runs.len();
-            for (i, (id, command, background, report)) in runs.into_iter().enumerate() {
+            let mut runs = runs.into_iter().enumerate();
+            while let Some((i, (id, command, background, report))) = runs.next() {
                 let (output, ended) = run_command(&command, Some(&root), background, report);
                 let _ = tx.send(AppEvent::Ran(id, project.clone(), i + 1 == count, output, ended));
                 // The rest would build on what this one didn't do, or on
-                // what the user cut short.
+                // what the user cut short; they're listed as running from
+                // the start, so they go, or they'd wait there forever.
                 if ended.is_some_and(|e| e.failed() || e == Ended::Stopped) {
+                    let _ = tx.send(AppEvent::Unrun(runs.map(|(_, (id, ..))| id).collect()));
                     break;
                 }
             }
         });
+    }
+
+    /// Runs `ids` that never started, as one before them failed or was
+    /// stopped: off the running list, and their entries out of the chat,
+    /// with a note of what wasn't run.
+    fn unrun(&mut self, ids: &[usize]) {
+        if ids.is_empty() {
+            return;
+        }
+        let commands: Vec<String> = ids.iter().filter_map(|id| self.shell_of(*id).map(|s| s.command.clone())).collect();
+        self.jobs.retain(|j| !ids.contains(&j.id));
+        if let Overlay::Jobs { selected } = &mut self.overlay {
+            match self.jobs.len() {
+                0 => self.overlay = Overlay::None,
+                n => *selected = (*selected).min(n - 1),
+            }
+        }
+        self.entries.retain(|e| !matches!(e, Entry::Shell(s) if ids.contains(&s.id)));
+        if !commands.is_empty() {
+            self.entries.push(Entry::Notice(format!("Not run: {}", commands.join("; ").replace('\n', "; "))));
+        }
     }
 
     /// A reply's script ended, and the agent hears of it, as a tool's
@@ -2181,6 +2208,7 @@ impl App {
             AppEvent::Error(text) => self.entries.push(Entry::Error(text)),
             AppEvent::Check(id, output, code) => self.check_ended(id, output, code),
             AppEvent::Ran(id, project, last, output, code) => self.ran(id, project, last, output, code),
+            AppEvent::Unrun(ids) => self.unrun(&ids),
             AppEvent::Started(id, pid) => {
                 if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
                     job.pid = Some(pid);
@@ -5735,6 +5763,22 @@ mod tests {
             }
         };
         assert_eq!(end, (up, Some(Ended::Stopped)));
+    }
+
+    #[test]
+    fn scripts_left_unrun_after_one_fails_leave_the_running_list() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        let (first, _) = app.shell_entry("git pull".into(), false);
+        let (second, _) = app.shell_entry("cd app\ngit branch -d old".into(), false);
+        let (third, _) = app.shell_entry("git push".into(), false);
+        app.apply(AppEvent::Shell(first, "fatal".into(), Some(Ended::Exited(1))));
+        // Never started, so nothing would end them: they'd be listed
+        // under the prompt forever, and `/stop` would have nothing to end.
+        app.apply(AppEvent::Unrun(vec![second, third]));
+        assert!(app.jobs.is_empty());
+        assert!(!app.entries.iter().any(|e| matches!(e, Entry::Shell(s) if s.id != first)));
+        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "Not run: cd app; git branch -d old; git push"));
     }
 
     #[test]
