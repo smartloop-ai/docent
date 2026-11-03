@@ -324,17 +324,59 @@ then every few seconds pushes only what was added, changed or removed:
 
 ### Coding
 
-Open `docent` in a code project and ask for a change. The reply's files show
-as diffs and are written into the folder, the project's build is checked and
-errors are fixed until it passes. Commits, installs and test runs come back as
-shell commands you approve with `Enter` (`Tab` to auto-approve).
+Open `docent` in a code project and just ask for a change. It reads the
+folder, writes the code, builds it, fixes what breaks, and then asks before it
+touches anything outside your files:
+
+```
+› make greet take a name and commit it
+
+← src/main.rs  +2 −2
+  @@ -1,4 +1,4 @@
+   1  1  fn main() {
+   2    -    greet();
+      2 +    greet("docent");
+   3  3  }
+   4    -fn greet() { println!("hello"); }
+      4 +fn greet(name: &str) { println!("hello, {name}"); }
+
+! cargo check --quiet
+  ✓ done
+
+? Run these in the folder?
+  $ git commit -am "greet takes a name"
+  [enter] run   [tab] always this session   [esc] skip
+```
+
+What happens on each prompt:
+
+1. **It reads the project.** The agent gets the file tree, the contents of
+   the files the prompt is about, and the git state (branch, remotes, what's
+   changed), so it answers from your code, and goes to the web only for what
+   the code can't tell it, like a library's current API. It's also told about
+   the machine (OS and version, shell, the package managers and toolchains on
+   `PATH`, active virtualenvs), so commands use `apt-get` on Ubuntu and `brew`
+   on a Mac.
+2. **You see diffs as they stream in.** Each file shows as numbered hunks,
+   additions in green and removals in red. Then it's written into the folder.
+3. **It checks the build and fixes it.** It runs a fast check for the kind of
+   project: `cargo check`, `go build`, `tsc --noEmit`, or `bash -n` and
+   `py_compile` for loose scripts. Errors go back to the agent, round after
+   round, until the check passes or a round changes nothing. `Esc` stops it.
+4. **Commands wait for your OK.** Commits, installs and test runs come back
+   as shell commands. `Enter` runs them, `Tab` runs them and approves every
+   later one too, and `Esc` skips them. Their output streams into the chat and
+   goes back to the agent, so a failing test gets fixed next.
+5. **Long runs go to the background.** Dev servers and watchers (`npm run dev
+   &`) keep running under the prompt while you go on chatting.
 
 | Command | Does |
 | --- | --- |
 | `/code on\|off\|auto` | treat this folder as a code project, or not |
 | `/write [path]` | write files a reply left unwritten |
-| `!<command> [&]` | run a shell command, in the background with `&` |
-| `/tasks`, `/stop` | see or stop running commands |
+| `!<command> [&]` | run a shell command yourself, in the background with `&` |
+| `/tasks` or `ctrl+b`, `/stop` | see, expand or stop running commands |
+| `Tab` on an empty prompt | turn auto-approve on or off |
 
 More in the [coding docs](https://smartloop.ai/docs/coding/).
 

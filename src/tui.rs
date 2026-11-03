@@ -1529,7 +1529,8 @@ impl App {
                 whole = c.whole;
                 format!("{}\n\n", c.text)
             });
-            message = format!("{}{}\n\n{}", context, message, files::HINT);
+            // The machine first: a prompt cut to a model's window keeps its head.
+            message = format!("{}\n{}{}\n\n{}", files::system_context(), context, message, files::HINT);
         }
         // The framework takes it from here: its orchestrator picks the
         // model and decides whether to search the web, for coding as for

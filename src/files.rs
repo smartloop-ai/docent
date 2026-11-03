@@ -238,6 +238,81 @@ fn git_state(root: &Path) -> Option<String> {
 /// Changed files the git state lists, at most.
 const GIT_STATUS_LINES: usize = 40;
 
+/// Tools looked for on `PATH`, so commands use the ones the machine has:
+/// its package manager above all (`apt-get` or `brew`, `dnf` or `pacman`).
+const TOOLS: [&str; 34] = [
+    "git", "gh", "apt-get", "dnf", "yum", "pacman", "zypper", "apk", "brew", "port", "nix", "winget", "choco",
+    "scoop", "cargo", "rustup", "node", "npm", "pnpm", "yarn", "bun", "deno", "python3", "python", "pip3", "uv",
+    "go", "java", "mvn", "gradle", "make", "cmake", "docker", "podman",
+];
+
+/// Environment variables worth knowing for commands: the locale, the
+/// active toolchains and virtual environments, and whether it's CI or WSL.
+/// A fixed list, never the whole environment, which holds tokens and keys.
+const ENV_VARS: [&str; 18] = [
+    "LANG", "LC_ALL", "TERM", "VIRTUAL_ENV", "CONDA_DEFAULT_ENV", "PYENV_VERSION", "NVM_BIN", "NODE_ENV",
+    "GOPATH", "GOROOT", "CARGO_HOME", "RUSTUP_TOOLCHAIN", "JAVA_HOME", "ANDROID_HOME", "CI", "WSL_DISTRO_NAME",
+    "container", "XDG_SESSION_TYPE",
+];
+
+/// The machine the reply's commands run on, told to the agent ahead of a
+/// prompt that works in a folder, so its commands fit it: the OS and its
+/// version, the architecture, the shell they run with, the user, the tools
+/// on `PATH` and a few environment variables. Worked out once.
+pub fn system_context() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        let os = sysinfo::System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string());
+        let kernel = sysinfo::System::kernel_version().map(|k| format!(", kernel {}", k)).unwrap_or_default();
+        let shell = if cfg!(windows) {
+            "cmd /C".to_string()
+        } else {
+            format!("{} -c", std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()))
+        };
+        let mut text = format!(
+            "The machine my commands run on:\n- OS: {} ({}{})\n- Shell: commands run with `{}`\n",
+            os,
+            std::env::consts::ARCH,
+            kernel,
+            shell
+        );
+        let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok();
+        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
+        match (user, home) {
+            (Some(u), Some(h)) => text.push_str(&format!("- User: {}, home {}\n", u, h)),
+            (Some(u), None) => text.push_str(&format!("- User: {}\n", u)),
+            (None, Some(h)) => text.push_str(&format!("- Home: {}\n", h)),
+            (None, None) => {}
+        }
+        let found: Vec<&str> = TOOLS.iter().copied().filter(|t| on_path(t)).collect();
+        if !found.is_empty() {
+            text.push_str(&format!("- On PATH: {}\n", found.join(", ")));
+        }
+        let vars: Vec<String> = ENV_VARS
+            .iter()
+            .filter_map(|v| std::env::var(v).ok().filter(|x| !x.is_empty()).map(|x| format!("{}={}", v, x)))
+            .collect();
+        if !vars.is_empty() {
+            text.push_str(&format!("- Environment: {}\n", vars.join(", ")));
+        }
+        text.push_str(
+            "Give commands for this machine: its shell, and its package manager rather than another OS's.\n",
+        );
+        text
+    })
+}
+
+/// Whether `tool` is a program in a `PATH` directory.
+fn on_path(tool: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else { return false };
+    let names: Vec<String> = if cfg!(windows) {
+        ["exe", "cmd", "bat"].iter().map(|ext| format!("{}.{}", tool, ext)).collect()
+    } else {
+        vec![tool.to_string()]
+    };
+    std::env::split_paths(&path).any(|dir| names.iter().any(|n| dir.join(n).is_file()))
+}
+
 /// The placeholders in `script`, a command the agent gave with a value
 /// to fill in, as `<your-username>`, `<API KEY>` or `YOUR_TOKEN`: it
 /// mustn't run as it is. A redirect, `< file`, a heredoc, `<<EOF`, or an
@@ -1057,6 +1132,20 @@ mod tests {
         assert!(extract("File: a.rs\nnot code\n    nor this\n").is_empty());
         // A fence left open runs to the end.
         assert_eq!(extract("`a.rs`\n```rust\nfn f() {}\n")[0].content, "fn f() {}\n");
+    }
+
+    #[test]
+    fn the_system_context_names_the_os_shell_and_tools_but_no_secrets() {
+        let text = system_context();
+        assert!(text.starts_with("The machine my commands run on:\n- OS: "), "{}", text);
+        assert!(text.contains(std::env::consts::ARCH) && text.contains("- Shell: commands run with `"), "{}", text);
+        // Only the listed variables: never a token from the environment.
+        for (key, _) in std::env::vars() {
+            if !ENV_VARS.contains(&key.as_str()) {
+                let leaked = [": ", ", "].iter().any(|at| text.contains(&format!("{}{}=", at, key)));
+                assert!(!leaked, "{} leaked: {}", key, text);
+            }
+        }
     }
 
     #[test]
