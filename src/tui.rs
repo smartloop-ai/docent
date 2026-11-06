@@ -2141,6 +2141,9 @@ impl App {
             AppEvent::TurnDone(result) => {
                 let Some(turn) = self.turn.take() else { return };
                 self.busy.store(false, Ordering::Relaxed);
+                // A turn can add a skill ("save this as a skill"); read the
+                // list again so `/` hints it without reopening the project.
+                self.load_skills();
                     if let Some(Entry::Reply(reply)) = self.entries.get_mut(turn.entry) {
                     match result {
                         Ok(stats) => {
