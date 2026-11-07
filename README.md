@@ -188,7 +188,7 @@ that answered:
 ```
 
 It chats in the server's current project, or the one given with `--project`.
-On exit it prints the session id, to resume with `--session`.
+On exit it prints the session id, to resume with `docent -s <session-id>` (or `--session`).
 
 | Key | Does |
 | --- | --- |
