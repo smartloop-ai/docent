@@ -618,6 +618,10 @@ struct Piece {
     lines: Vec<Line<'static>>,
 }
 
+/// A reply as laid out: its text's length, the width, whether it was
+/// still coming in, and its lines.
+type Laid = (usize, u16, bool, Vec<Line<'static>>);
+
 /// One answer as it streams in. The agent's steps show on the status line
 /// while it runs; only the model that answered stays with the reply.
 #[derive(Default)]
@@ -633,7 +637,7 @@ struct Reply {
     /// `text` as last drawn, with its length and width and whether it was
     /// still coming in: the conversation redraws every tick, and only a
     /// reply still streaming changes, or one that's just ended.
-    rendered: std::cell::RefCell<Option<(usize, u16, bool, Vec<Line<'static>>)>>,
+    rendered: std::cell::RefCell<Option<Laid>>,
     /// When it was last laid out: a reply streaming in is laid out again
     /// at most once a tick, not once a chunk.
     rendered_at: std::cell::Cell<Option<Instant>>,
