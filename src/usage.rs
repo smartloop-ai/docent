@@ -1,13 +1,12 @@
 //! Usage for `/usage`: web search and credits, read from the platform
-//! (api.smartloop.ai), and tokens, read from the agent's own log of every
-//! turn.
+//! (api.smartloop.ai).
 //!
 //! Web search usage is read from the platform (api.smartloop.ai) rather than
 //! the agent: `GET /v1/websearch/status` carries the month's allowance and
 //! what has been spent of it, which the agent's own gate reduces to a yes/no.
-//! Credits, what cloud models cost at each model's rate for the tokens a
-//! call took, come the same way from `GET /v1/chat/status`: the share spent
-//! for every account, the amounts for admins only.
+//! Credits, one monthly pool for cloud models and web searches, come from
+//! the agent's `GET /v1/chat/quota`, which relays the platform's answer: the
+//! same reading Studio's "Plan & usage" card takes.
 //!
 //! The CLI holds no token of its own. The agent keeps the signed-in one in
 //! `SLP_HOME/.credentials`, Fernet-encrypted under `SLP_HOME/.key`, so it is
@@ -75,94 +74,142 @@ impl SearchUsage {
         self.limit.is_some_and(|limit| self.used >= limit)
     }
 
-    /// Under `/usage`'s bar: `12 used · free plan · resets 2026-11-01`.
-    pub fn detail(&self) -> String {
-        let mut parts = vec![format!("{} used", self.used), format!("{} plan", self.plan)];
-        match (self.limit, &self.resets_on) {
-            (Some(_), Some(on)) => parts.push(format!("resets {}", on)),
-            (None, _) => parts.push("unmetered".to_string()),
-            _ => {}
-        }
-        parts.join(" · ")
-    }
 }
 
-/// The account's cloud model credits this month, as `/chat/status` reports
-/// them: the share spent for every account, the amounts for admins only.
+/// The account's credits this month, as the agent's `/v1/chat/quota` relays
+/// them from the platform, the same reading Studio's "Plan & usage" card
+/// takes. One pool covers cloud models and web searches. Every account gets
+/// the share spent; the amounts come only to accounts allowed to see them,
+/// and an unmetered one has amounts but no share.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreditUsage {
-    /// Of the allowance, spent, 0 to 100; `None` when unmetered (admins).
+    /// Of the allowance, spent, 0 to 100; `None` when unmetered.
     pub percent_used: Option<f64>,
-    /// Credits spent and allowed, for an account the platform gives them to.
-    pub used: Option<u64>,
-    pub limit: Option<u64>,
+    /// Credits spent and allowed, when the platform gives them.
+    pub used: Option<f64>,
+    pub limit: Option<f64>,
     /// `free`, `paid`, `plus` or `admin`.
     pub plan: String,
-    /// When the count goes back to zero, as `YYYY-MM-DD`.
-    pub resets_on: Option<String>,
+    /// When the count goes back to zero, as the platform's ISO timestamp.
+    pub resets_at: Option<String>,
     /// Cloud calls this month, and the tokens they read and wrote.
     pub requests: u64,
     pub tokens: u64,
-    /// Why cloud models are off, when they are: `plan_required`,
-    /// `unconfigured`, `quota_exceeded` or `quota_low`.
-    pub reason: Option<String>,
 }
 
 impl CreditUsage {
-    fn from_status(status: &serde_json::Value) -> Option<Self> {
-        let quota = &status["quota"];
-        if !quota.is_object() {
+    fn from_quota(quota: &serde_json::Value) -> Option<Self> {
+        if !quota.is_object() || quota.get("plan").is_none() {
             return None;
         }
-        let whole = |v: &serde_json::Value| v.as_f64().map(|n| n.round() as u64);
         Some(CreditUsage {
             percent_used: quota["percent_used"].as_f64(),
-            used: whole(&quota["used"]),
-            limit: whole(&quota["limit"]),
+            used: quota["used"].as_f64(),
+            limit: quota["limit"].as_f64(),
             plan: quota["plan"].as_str().unwrap_or("free").to_string(),
-            resets_on: quota["resets_at"].as_str().and_then(|at| at.get(..10)).map(str::to_string),
+            resets_at: quota["resets_at"].as_str().map(str::to_string),
             requests: quota["requests"].as_u64().unwrap_or_default(),
             tokens: quota["prompt_tokens"].as_u64().unwrap_or_default()
                 + quota["completion_tokens"].as_u64().unwrap_or_default(),
-            reason: status["reason"].as_str().map(str::to_string).filter(|_| !status["enabled"].as_bool().unwrap_or(true)),
         })
     }
 
-    /// Share of the allowance left, 0 to 1; `None` when unmetered.
-    pub fn fraction_left(&self) -> Option<f64> {
-        self.percent_used.map(|p| (1.0 - p / 100.0).clamp(0.0, 1.0))
+    pub fn unmetered(&self) -> bool {
+        self.percent_used.is_none()
     }
 
-    /// Credits left this month, for an account shown the amounts.
-    pub fn remaining(&self) -> Option<u64> {
-        Some(self.limit?.saturating_sub(self.used?))
+    /// Share spent, 0 to 1; `None` when unmetered.
+    pub fn fraction_used(&self) -> Option<f64> {
+        self.percent_used.map(|p| (p / 100.0).clamp(0.0, 1.0))
     }
 
-    /// Under `/usage`'s bar: `3 calls · 12,000 tokens · paid plan · resets 2026-11-01`.
+    /// All of this month's credits spent.
+    pub fn exhausted(&self) -> bool {
+        self.percent_used.is_some_and(|p| p >= 100.0)
+    }
+
+    /// 80% or more spent, short of all of it.
+    pub fn low(&self) -> bool {
+        !self.exhausted() && self.percent_used.is_some_and(|p| p >= 80.0)
+    }
+
+    /// `24%`, never `0%` once anything is spent.
+    pub fn percent(&self) -> String {
+        match self.percent_used {
+            Some(p) if p > 0.0 && p < 1.0 => "<1%".to_string(),
+            Some(p) => format!("{}%", p.round() as u64),
+            None => String::new(),
+        }
+    }
+
+    /// The plan as Studio names it.
+    pub fn plan_label(&self) -> &'static str {
+        match self.plan.as_str() {
+            "paid" => "Pro",
+            "plus" => "Plus",
+            "admin" => "Admin",
+            _ => "Free",
+        }
+    }
+
+    /// `resets in 5h` within the last day, else `resets Dec 1`.
+    pub fn reset_label(&self) -> Option<String> {
+        self.reset_label_at(now_secs())
+    }
+
+    fn reset_label_at(&self, now: i64) -> Option<String> {
+        let at = self.resets_at.as_deref()?;
+        let day = day_number(at)?;
+        let hour = at.get(11..13).and_then(|h| h.parse::<i64>().ok()).unwrap_or(0);
+        let hours = (day * 86_400 + hour * 3_600 - now + 3_599).div_euclid(3_600);
+        if hours <= 24 {
+            return Some(format!("resets in {}h", hours.max(1)));
+        }
+        const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        let month = at.get(5..7)?.parse::<usize>().ok().filter(|m| (1..=12).contains(m))?;
+        let date = at.get(8..10)?.parse::<u32>().ok()?;
+        Some(format!("resets {} {}", MONTHS[month - 1], date))
+    }
+
+    /// The amounts: `480 of 2,000 credits used`, or `566 credits used`
+    /// unmetered; `None` when the platform keeps them back.
+    pub fn amounts(&self) -> Option<String> {
+        let used = thousands(self.used?.round() as u64);
+        Some(match self.limit {
+            Some(limit) => format!("{} of {} credits used", used, thousands(limit.round() as u64)),
+            None => format!("{} credits used", used),
+        })
+    }
+
+    /// Under `/usage`'s bar: `316 calls · 11,848,606 tokens · Admin · resets Dec 1`.
     pub fn detail(&self) -> String {
         let mut parts = vec![
-            format!("{} call{}", self.requests, if self.requests == 1 { "" } else { "s" }),
+            format!("{} call{}", thousands(self.requests), if self.requests == 1 { "" } else { "s" }),
             format!("{} tokens", thousands(self.tokens)),
-            format!("{} plan", self.plan),
+            self.plan_label().to_string(),
         ];
-        match (self.percent_used, &self.resets_on) {
-            (Some(_), Some(on)) => parts.push(format!("resets {}", on)),
-            (None, _) => parts.push("unmetered".to_string()),
-            _ => {}
-        }
+        parts.extend(self.reset_label());
         parts.join(" · ")
     }
 
-    /// Why cloud models are off, for the line under the bar.
-    pub fn why_off(&self) -> Option<&'static str> {
-        Some(match self.reason.as_deref()? {
-            "plan_required" => "cloud models need a paid plan; answers come from local models",
-            "unconfigured" => "no cloud model is available right now",
-            "quota_exceeded" => "this month's credits are spent; answers come from local models",
-            "quota_low" => "too little is left for another cloud call; answers come from local models",
-            _ => "cloud models are off right now",
-        })
+    /// What the credits are for, or that they're gone, as Studio says it.
+    pub fn note(&self) -> &'static str {
+        if self.exhausted() {
+            "this month's credits are used: cloud models and web search pause until the reset; local models keep working"
+        } else if self.unmetered() {
+            "unlimited credits for cloud models and web searches; local models are always free"
+        } else if self.plan == "free" {
+            "credits cover web searches, one per search; local models are always free"
+        } else {
+            "credits cover cloud models and web searches; local models are always free"
+        }
     }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// The signed-in account's web search usage, or `None` when nobody is
@@ -172,10 +219,15 @@ pub fn fetch(client: &Client) -> Option<SearchUsage> {
     SearchUsage::from_status(&platform_status(client, "/v1/websearch/status")?)
 }
 
-/// The signed-in account's credits, as `fetch` gives the searches; `None`
-/// too while cloud models aren't open to the account (a 403).
+/// The signed-in account's credits, read through the agent as Studio reads
+/// them; `None` while signed out (401), without cloud access (403) or with
+/// the platform out of reach.
 pub fn fetch_credits(client: &Client) -> Option<CreditUsage> {
-    CreditUsage::from_status(&platform_status(client, "/v1/chat/status")?)
+    let response = client.get(format!("{}/chat/quota", crate::api_url())).timeout(TIMEOUT).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    CreditUsage::from_quota(&response.json().ok()?)
 }
 
 /// A status reply from the platform under the agent's token, had again
@@ -218,83 +270,6 @@ fn stored_token() -> Option<String> {
         .find_map(|k| creds[k].as_str().filter(|t| !t.is_empty()))
         .map(str::to_string)
         .or_else(|| std::env::var("SLP_DEVELOPER_TOKEN").ok().filter(|t| !t.is_empty()))
-}
-
-/// What the same traffic would have cost on a typical hosted frontier
-/// model, per token: the saving running locally represents. The web app's
-/// dashboard prices it the same way.
-const COST_INPUT: f64 = 2.5 / 1_000_000.0;
-const COST_OUTPUT: f64 = 10.0 / 1_000_000.0;
-
-/// Days the token figures cover, as on the web app's dashboard.
-pub const TOKEN_DAYS: usize = 7;
-
-/// Tokens the agent processed on this machine, one entry per day (UTC),
-/// oldest first, today last.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct TokenStats {
-    /// `(prompt, completion)` tokens per day.
-    pub days: Vec<(u64, u64)>,
-}
-
-impl TokenStats {
-    /// The last `TOKEN_DAYS` days of `SLP_HOME/token_usage.jsonl`, where the
-    /// agent appends a line per turn (and from which it pushes to the
-    /// platform's `/v1/usage/tokens`, which the dashboard charts).
-    pub fn load() -> Self {
-        let log = std::fs::read_to_string(crate::framework::install_dir().join("token_usage.jsonl")).unwrap_or_default();
-        Self::from_log(&log, today())
-    }
-
-    fn from_log(log: &str, today: i64) -> Self {
-        let mut days = vec![(0, 0); TOKEN_DAYS];
-        for record in log.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
-            let Some(day) = record["timestamp"].as_str().and_then(day_number) else { continue };
-            let ago = today - day;
-            if !(0..TOKEN_DAYS as i64).contains(&ago) {
-                continue;
-            }
-            let slot = &mut days[TOKEN_DAYS - 1 - ago as usize];
-            slot.0 += record["prompt_tokens"].as_u64().unwrap_or_default();
-            slot.1 += record["completion_tokens"].as_u64().unwrap_or_default();
-        }
-        TokenStats { days }
-    }
-
-    pub fn prompt(&self) -> u64 {
-        self.days.iter().map(|d| d.0).sum()
-    }
-
-    pub fn completion(&self) -> u64 {
-        self.days.iter().map(|d| d.1).sum()
-    }
-
-    pub fn total(&self) -> u64 {
-        self.prompt() + self.completion()
-    }
-
-    /// Estimated dollars saved over the days covered.
-    pub fn saved(&self) -> f64 {
-        self.prompt() as f64 * COST_INPUT + self.completion() as f64 * COST_OUTPUT
-    }
-
-    /// The days as a sparkline, one cell each: `▁▁▃▂█▅▁`.
-    pub fn sparkline(&self) -> String {
-        const CELLS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-        let max = self.days.iter().map(|d| d.0 + d.1).max().unwrap_or(0).max(1);
-        self.days
-            .iter()
-            .map(|d| CELLS[((d.0 + d.1) * 7).div_ceil(max) as usize])
-            .collect()
-    }
-}
-
-/// Today as days since 1970-01-01, UTC.
-fn today() -> i64 {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    (secs / 86_400) as i64
 }
 
 /// The day of an ISO timestamp (`2026-10-01T…`), as days since 1970-01-01.
@@ -341,49 +316,48 @@ mod tests {
         });
         assert_eq!(SearchUsage::from_status(&status), Some(usage(12, Some(50))));
         assert_eq!(SearchUsage::from_status(&serde_json::json!({"enabled": false})), None);
-        // An admin sees the amounts; a regular account the share spent.
-        let admin = serde_json::json!({
-            "enabled": true, "reason": null,
-            "quota": {"limit": 500.0, "used": 120.0, "remaining": 380.0, "percent_used": 24.0, "reserved": 0.0,
-                      "in_flight": 0, "prompt_tokens": 10000, "completion_tokens": 2000, "requests": 3,
-                      "period": "2026-10", "resets_at": "2026-11-01T00:00:00Z", "plan": "paid"}
-        });
-        let credits = CreditUsage::from_status(&admin).unwrap();
-        assert_eq!(credits.remaining(), Some(380));
-        assert_eq!(credits.fraction_left(), Some(0.76));
-        assert_eq!(credits.detail(), "3 calls · 12,000 tokens · paid plan · resets 2026-11-01");
-        assert_eq!(credits.why_off(), None);
-        let spent = serde_json::json!({
-            "enabled": false, "reason": "quota_exceeded",
-            "quota": {"limit": null, "used": null, "remaining": null, "percent_used": 100.0,
-                      "prompt_tokens": 0, "completion_tokens": 0, "requests": 40,
-                      "period": "2026-10", "resets_at": "2026-11-01T00:00:00Z", "plan": "paid"}
-        });
-        let credits = CreditUsage::from_status(&spent).unwrap();
-        assert_eq!(credits.remaining(), None);
-        assert_eq!(credits.fraction_left(), Some(0.0));
-        assert!(credits.why_off().unwrap().starts_with("this month's credits are spent"));
-        assert_eq!(CreditUsage::from_status(&serde_json::json!({"detail": "no"})), None);
     }
 
     #[test]
-    fn totals_the_last_seven_days_of_tokens() {
-        let today = day_number("2026-10-01T00:00:00Z").unwrap();
-        let log = [
-            r#"{"timestamp": "2026-10-01T19:20:49+00:00", "prompt_tokens": 1000000, "completion_tokens": 100000}"#,
-            r#"{"timestamp": "2026-09-29T08:00:00+00:00", "prompt_tokens": 500, "completion_tokens": 50}"#,
-            r#"{"timestamp": "2026-09-20T08:00:00+00:00", "prompt_tokens": 9999, "completion_tokens": 9999}"#,
-            "not json",
-        ]
-        .join("\n");
-        let stats = TokenStats::from_log(&log, today);
-        assert_eq!(stats.days.len(), TOKEN_DAYS);
-        assert_eq!(stats.days[6], (1_000_000, 100_000));
-        assert_eq!(stats.days[4], (500, 50));
-        assert_eq!(stats.total(), 1_100_550);
-        // $2.50 for the million in, $1.00 for the hundred thousand out.
-        assert!((stats.saved() - 3.5).abs() < 0.01);
-        assert_eq!(stats.sparkline(), "▁▁▁▁▂▁█");
+    fn reads_credits_as_the_agent_relays_them() {
+        // Unmetered: amounts, no share.
+        let admin = serde_json::json!({
+            "limit": null, "used": 565.66, "remaining": null, "percent_used": null, "reserved": 0,
+            "percent_available": null, "in_flight": 0, "prompt_tokens": 11213282, "completion_tokens": 635324,
+            "requests": 316, "period": "2026-11", "resets_at": "2026-12-01T00:00:00+00:00", "plan": "admin"
+        });
+        let credits = CreditUsage::from_quota(&admin).unwrap();
+        assert!(credits.unmetered() && !credits.exhausted());
+        assert_eq!(credits.amounts().as_deref(), Some("566 credits used"));
+        let nov_6 = day_number("2026-11-06").unwrap() * 86_400;
+        assert_eq!(credits.reset_label_at(nov_6).as_deref(), Some("resets Dec 1"));
+        assert_eq!(credits.reset_label_at(nov_6 + 24 * 86_400 + 19 * 3_600).as_deref(), Some("resets in 5h"));
+        assert!(credits.note().starts_with("unlimited credits"));
+
+        // Metered, amounts kept back: the share alone.
+        let paid = serde_json::json!({
+            "limit": null, "used": null, "remaining": null, "percent_used": 84.4, "requests": 3,
+            "prompt_tokens": 10000, "completion_tokens": 2000, "resets_at": "2026-12-01T00:00:00+00:00", "plan": "paid"
+        });
+        let credits = CreditUsage::from_quota(&paid).unwrap();
+        assert_eq!((credits.percent(), credits.low(), credits.amounts()), ("84%".to_string(), true, None));
+        assert!((credits.fraction_used().unwrap() - 0.844).abs() < 1e-9);
+        assert_eq!(credits.plan_label(), "Pro");
+        assert!(credits.detail().starts_with("3 calls · 12,000 tokens · Pro · resets "));
+
+        // Metered with amounts, and spent.
+        let spent = serde_json::json!({"limit": 500.0, "used": 500.0, "percent_used": 100.0, "plan": "plus"});
+        let credits = CreditUsage::from_quota(&spent).unwrap();
+        assert_eq!(credits.amounts().as_deref(), Some("500 of 500 credits used"));
+        assert!(credits.exhausted() && !credits.low());
+        assert!(credits.note().starts_with("this month's credits are used"));
+        assert_eq!(CreditUsage::from_quota(&serde_json::json!({"detail": "no"})), None);
+        assert_eq!(CreditUsage::from_quota(&serde_json::json!({"percent_used": 1.0, "used": 0.4, "plan": "free"})).unwrap().percent(), "1%");
+
+    }
+
+    #[test]
+    fn groups_thousands() {
         assert_eq!(thousands(1_100_550), "1,100,550");
         assert_eq!(thousands(999), "999");
     }

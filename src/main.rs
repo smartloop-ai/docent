@@ -32,12 +32,34 @@ pub const BANNER: [&str; 3] = [
     version, 
     author,
     about=format!("\n{}\n\nDocent by Smartloop: frontier quality, local first", BANNER.join("\n")),
+    args_conflicts_with_subcommands = true,
 )]
 
 struct Args {
-    /// Without one, `docent` opens the chat, as `docent run` does.
+    /// Without one, `docent` opens the chat, as `docent run` does, and
+    /// takes the same options: `docent -s <id>` resumes a session.
     #[command(subcommand)]
     command: Option<Commands>,
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+/// The chat's options, the same on `docent` and `docent run`.
+#[derive(clap::Args, Default)]
+struct RunArgs {
+    /// First message to send; the conversation continues interactively
+    #[arg(value_name = "PROMPT")]
+    prompt: Option<String>,
+    /// Project ID to use; prompts for one when omitted
+    #[arg(long, short)]
+    project: Option<String>,
+    /// Session ID to resume; a fresh one is created when omitted
+    #[arg(long, short)]
+    session: Option<String>,
+    /// Chat line by line instead of in the full-screen app; the default
+    /// when stdin or stdout isn't a terminal
+    #[arg(long)]
+    plain: bool,
 }
 
 #[derive(Subcommand)]
@@ -48,21 +70,7 @@ enum Commands {
         command: AgentCommands,
     },
     /// Stream an interactive chat with the local agent
-    Run {
-        /// First message to send; the conversation continues interactively
-        #[arg(value_name = "PROMPT")]
-        prompt: Option<String>,
-        /// Project ID to use; prompts for one when omitted
-        #[arg(long, short)]
-        project: Option<String>,
-        /// Session ID to resume; a fresh one is created when omitted
-        #[arg(long, short)]
-        session: Option<String>,
-        /// Chat line by line instead of in the full-screen app; the default
-        /// when stdin or stdout isn't a terminal
-        #[arg(long)]
-        plain: bool,
-    },
+    Run(RunArgs),
 }
 
 #[derive(Subcommand)]
@@ -479,6 +487,8 @@ pub struct ModelRow {
     pub accessible: bool,
     pub downloaded: bool,
     pub enabled: bool,
+    /// A cloud (remote) model: nothing to download, only on or off.
+    pub cloud: bool,
 }
 
 /// The catalog (`/v1/models`) joined with the project's state. A model the
@@ -506,6 +516,7 @@ pub fn model_rows(client: &Client, project_id: &str) -> Result<Vec<ModelRow>, St
                 accessible: model["is_accessible"].as_bool() != Some(false),
                 downloaded: flag("downloaded"),
                 enabled: flag("enabled"),
+                cloud: model["type"].as_str() == Some("remote"),
                 name,
             }
         })
@@ -922,8 +933,8 @@ fn main() {
     let args = Args::from_arg_matches(&Args::command().name(name).bin_name(name).get_matches())
         .unwrap_or_else(|e| e.exit());
 
-    // Bare `docent` is `docent run`.
-    let command = args.command.unwrap_or(Commands::Run { prompt: None, project: None, session: None, plain: false });
+    // Bare `docent` is `docent run`, options and all.
+    let command = args.command.unwrap_or(Commands::Run(args.run));
     match command {
         Commands::Agent { command } => match command {
             AgentCommands::Status => agent_status(&Client::new()),
@@ -935,7 +946,7 @@ fn main() {
             }
             AgentCommands::Stop => framework::stop(),
         },
-        Commands::Run { prompt, project, session, plain } => {
+        Commands::Run(RunArgs { prompt, project, session, plain }) => {
             let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
             if terminal && !plain {
                 // The app shows setup itself, so the agent may still be down.
@@ -957,6 +968,28 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn parse(argv: &[&str]) -> Args {
+        Args::try_parse_from(std::iter::once("docent").chain(argv.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn bare_docent_takes_the_chat_options() {
+        let args = parse(&["-s", "cli-1794030663371002000-34134", "-p", "p1", "hello"]);
+        assert!(args.command.is_none());
+        assert_eq!(args.run.session.as_deref(), Some("cli-1794030663371002000-34134"));
+        assert_eq!(args.run.project.as_deref(), Some("p1"));
+        assert_eq!(args.run.prompt.as_deref(), Some("hello"));
+        let Some(Commands::Run(run)) = parse(&["run", "--session", "abc", "--plain"]).command else {
+            panic!("run");
+        };
+        assert_eq!((run.session.as_deref(), run.plain), (Some("abc"), true));
+        assert!(matches!(parse(&["agent", "status"]).command, Some(Commands::Agent { .. })));
+        // Options before a subcommand belong to the chat, not to `agent`.
+        assert!(Args::try_parse_from(["docent", "-s", "abc", "agent", "status"]).is_err());
+    }
+
     #[test]
     fn needs_claim_only_for_a_project_nobody_owns() {
         assert!(super::needs_claim(&serde_json::json!({"id": "p1"})));
