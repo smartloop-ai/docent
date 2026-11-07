@@ -73,8 +73,6 @@ const DOUBLE_ESC: Duration = Duration::from_secs(2);
 const USAGE_BAR: usize = 30;
 /// Seconds between checks of the working directory's `.docent/` sync.
 const SYNC_INTERVAL: u64 = 5;
-/// How long after a push the status line keeps saying documents are indexing.
-const INDEXING_HINT: Duration = Duration::from_secs(10);
 /// A bar turning in brackets.
 const SPINNER: [&str; 4] = ["[-]", "[\\]", "[|]", "[/]"];
 
@@ -176,9 +174,8 @@ enum AppEvent {
     /// later as another `Shell`.
     Shell(usize, String, Option<Ended>),
     /// A reply's script finished, or went on in the background: as
-    /// `Shell`, with the project it ran for and whether it was the last
-    /// of the reply's.
-    Ran(usize, String, bool, String, Option<Ended>),
+    /// `Shell`, with the project it ran for.
+    Ran(usize, String, String, Option<Ended>),
     /// A reply's scripts left unrun, as one before them failed or was
     /// stopped: off the running list, and out of the chat.
     Unrun(Vec<usize>),
@@ -604,6 +601,18 @@ struct Report {
     stopped: Arc<AtomicBool>,
 }
 
+/// A piece of a reply as it was laid out, and what it was laid out from:
+/// where it starts, the width, the file it gives (if any) and whether the
+/// agent was shown that file whole, and its text.
+struct Piece {
+    start: usize,
+    width: u16,
+    path: Option<String>,
+    whole: bool,
+    key: String,
+    lines: Vec<Line<'static>>,
+}
+
 /// One answer as it streams in. The agent's steps show on the status line
 /// while it runs; only the model that answered stays with the reply.
 #[derive(Default)]
@@ -622,6 +631,10 @@ struct Reply {
     /// When it was last laid out: a reply streaming in is laid out again
     /// at most once a tick, not once a chunk.
     rendered_at: std::cell::Cell<Option<Instant>>,
+    /// Each piece of `text` (a run of prose or a code block) as last laid
+    /// out: as a reply streams in only its last piece changes, so the ones
+    /// before it, a file's diff above all, aren't laid out again.
+    pieces: std::cell::RefCell<Vec<Piece>>,
     /// The folder the reply's files are written into, when it was asked to
     /// make them: a file block shows as its change against the file there.
     root: Option<std::path::PathBuf>,
@@ -652,7 +665,8 @@ impl Reply {
         let streaming = self.stats.is_none() && self.ended.is_none();
         let fresh = self.rendered_at.get().is_some_and(|at| at.elapsed() < TICK);
         match &*rendered {
-            Some((len, at, _)) if *len == text.len() && *at == width => {}
+            // By the length as it came, so a line just ended counts.
+            Some((len, at, _)) if *len == self.text.len() && *at == width => {}
             // Still coming in, and laid out a moment ago: that will do until
             // the next tick.
             Some((_, at, _)) if streaming && fresh && *at == width => {}
@@ -660,32 +674,51 @@ impl Reply {
                 self.rendered_at.set(Some(Instant::now()));
                 let blocks = if self.root.is_some() { files::blocks(text) } else { Vec::new() };
                 let mut lines: Vec<Line<'static>> = Vec::new();
-                for (code, segment, start) in segments(text) {
+                let mut pieces = self.pieces.borrow_mut();
+                let mut laid: Vec<Piece> = Vec::new();
+                for (i, (code, segment, start)) in segments(text).into_iter().enumerate() {
                     let file = blocks.iter().find(|b| b.fence == start).map(|b| &b.file);
-                    let part = match (code, file) {
-                        (true, Some(file)) => {
-                            let streaming = !files::block_closed(&segment);
-                            let old = self.old(&file.path);
-                            match old.as_deref() {
-                                // Holding less than the file, it isn't all
-                                // of it: shown as it is, since as a change
-                                // the rest of the file would read as taken
-                                // out; and not written, see `reply_files`.
-                                Some(old) if !streaming && !self.whole.contains(&file.path) && files::partial(old, &file.content) => {
-                                    let mut part = vec![Line::from(vec![
-                                        Span::styled("← ", dim()),
-                                        Span::styled(file.path.clone(), Style::new().bold()),
-                                        Span::styled(" · less than the file, so not written over it", dim()),
-                                    ])];
-                                    part.extend(code_lines(&segment, width));
-                                    part
-                                }
-                                _ => diff_lines(&files::diff(&file.path, old.as_deref(), &file.content, streaming), width),
-                            }
-                        }
-                        (true, None) => code_lines(&segment, width),
-                        (false, _) => prose_lines(&segment, width),
+                    let streaming = code && file.is_some() && !files::block_closed(&segment);
+                    // A file still coming in is laid out again only once
+                    // another of its lines is done, not on every chunk: its
+                    // diff against the file there is the costly part.
+                    // An open block is the reply's last piece, so its last
+                    // line is done when the reply ends in a newline.
+                    let key = match segment.rfind('\n') {
+                        Some(end) if streaming && !self.text.ends_with('\n') => segment[..end].to_string(),
+                        _ => segment.clone(),
                     };
+                    let path = file.map(|f| f.path.clone());
+                    let whole = path.as_ref().is_some_and(|p| self.whole.contains(p));
+                    let part = match pieces.get(i) {
+                        Some(p) if p.start == start && p.width == width && p.path == path && p.whole == whole && p.key == key => {
+                            p.lines.clone()
+                        }
+                        _ => match (code, file) {
+                            (true, Some(file)) => {
+                                let old = self.old(&file.path);
+                                match old.as_deref() {
+                                    // Holding less than the file, it isn't all
+                                    // of it: shown as it is, since as a change
+                                    // the rest of the file would read as taken
+                                    // out; and not written, see `reply_files`.
+                                    Some(old) if !streaming && !self.whole.contains(&file.path) && files::partial(old, &file.content) => {
+                                        let mut part = vec![Line::from(vec![
+                                            Span::styled("← ", dim()),
+                                            Span::styled(file.path.clone(), Style::new().bold()),
+                                            Span::styled(" · less than the file, so not written over it", dim()),
+                                        ])];
+                                        part.extend(code_lines(&segment, width));
+                                        part
+                                    }
+                                    _ => diff_lines(&files::diff(&file.path, old.as_deref(), &file.content, streaming), width),
+                                }
+                            }
+                            (true, None) => code_lines(&segment, width),
+                            (false, _) => prose_lines(&segment, width),
+                        },
+                    };
+                    laid.push(Piece { start, width, path, whole, key, lines: part.clone() });
                     if part.is_empty() {
                         continue;
                     }
@@ -694,7 +727,8 @@ impl Reply {
                     }
                     lines.extend(part);
                 }
-                *rendered = Some((text.len(), width, lines));
+                *pieces = laid;
+                *rendered = Some((self.text.len(), width, lines));
             }
         }
     }
@@ -1149,14 +1183,6 @@ struct App {
     agent_asked: Option<Instant>,
     /// The working directory's sync, while it runs.
     sync: Option<Sync>,
-    /// How many changes a sync is pushing to the project, 0 when none.
-    syncing: usize,
-    /// The most documents seen on their way in since indexing started, so
-    /// the status line counts up to it; 0 when nothing's being indexed.
-    indexing_total: usize,
-    /// Until when to say "Indexing" after a push, as the agent takes a few
-    /// seconds to notice what it was sent.
-    indexing_until: Option<Instant>,
     /// This month's web search usage, shown in the footer once known.
     search: Option<SearchUsage>,
     /// This month's credits, read with `search`.
@@ -1220,9 +1246,6 @@ impl App {
             connections: None,
             agent_asked: Some(Instant::now() - AGENT_EVERY),
             sync: None,
-            syncing: 0,
-            indexing_total: 0,
-            indexing_until: None,
             search: None,
             credits: None,
             web_search: None,
@@ -1359,7 +1382,6 @@ impl App {
     fn stop_sync(&mut self) {
         if let Some(sync) = self.sync.take() {
             sync.stop.store(true, Ordering::Relaxed);
-            self.syncing = 0;
         }
     }
 
@@ -1989,16 +2011,15 @@ impl App {
             return;
         }
         self.spawn(move |_, tx| {
-            let count = runs.len();
-            let mut runs = runs.into_iter().enumerate();
-            while let Some((i, (id, command, background, report))) = runs.next() {
+            let mut runs = runs.into_iter();
+            while let Some((id, command, background, report)) = runs.next() {
                 let (output, ended) = run_command(&command, Some(&root), background, report);
-                let _ = tx.send(AppEvent::Ran(id, project.clone(), i + 1 == count, output, ended));
+                let _ = tx.send(AppEvent::Ran(id, project.clone(), output, ended));
                 // The rest would build on what this one didn't do, or on
                 // what the user cut short; they're listed as running from
                 // the start, so they go, or they'd wait there forever.
                 if ended.is_some_and(|e| e.failed() || e == Ended::Stopped) {
-                    let _ = tx.send(AppEvent::Unrun(runs.map(|(_, (id, ..))| id).collect()));
+                    let _ = tx.send(AppEvent::Unrun(runs.map(|(id, ..)| id).collect()));
                     break;
                 }
             }
@@ -2026,19 +2047,17 @@ impl App {
         }
     }
 
-    /// A reply's script ended, and the agent hears of it, as a tool's
-    /// result goes back in opencode: failed, it's asked to put it right,
-    /// with other commands or with files; the last one done, to say what
-    /// that did and give what the task still needs. Either way for a few
-    /// rounds only, and what was printed rides with the next prompt too.
-    fn ran(&mut self, id: usize, project: String, last: bool, output: String, ended: Option<Ended>) {
+    /// A reply's script ended. Failed, the agent is asked to put it right,
+    /// with other commands or with files, for a few rounds only. Done, it
+    /// isn't asked anything: what was printed rides with the next prompt.
+    fn ran(&mut self, id: usize, project: String, output: String, ended: Option<Ended>) {
         let Some(context) = self.shell_reported(id, &output, ended) else { return };
         let command = self.shell_mut(id).map(|s| s.command.clone()).unwrap_or_default();
         self.shell_context.push(context);
         let failed = ended.is_some_and(Ended::failed);
         // Stopped by the user, the rest is theirs to say.
         if ended == Some(Ended::Stopped)
-            || (!failed && !last)
+            || !failed
             || self.turn.is_some()
             || self.project.as_ref().is_none_or(|(p, _)| *p != project)
         {
@@ -2055,28 +2074,14 @@ impl App {
         }
         self.command_round += 1;
         let ran = std::mem::take(&mut self.shell_context).join("\n\n");
-        let (shown, message) = if failed {
-            self.entries.push(Entry::Notice(format!("Asking the agent to fix it (round {}; esc stops)", self.command_round)));
-            (
-                format!("Fix the failed command: {}", command.lines().next().unwrap_or_default()),
-                format!(
-                    "{}\n\nThat was a command you gave me, run in the project folder, and it failed. Put it right: give \
-                     the commands to run instead, in a fenced `sh` block, or the files to change, whole, as before. \
-                     Don't repeat a command that already did its part.",
-                    ran
-                ),
-            )
-        } else {
-            (
-                "What the commands did".to_string(),
-                format!(
-                    "{}\n\nThose were the commands you gave me, run in the project folder. Say in a line or two what \
-                     that did. If the task still needs commands, give them in a fenced `sh` block; if it's done, \
-                     give none.",
-                    ran
-                ),
-            )
-        };
+        self.entries.push(Entry::Notice(format!("Asking the agent to fix it (round {}; esc stops)", self.command_round)));
+        let shown = format!("Fix the failed command: {}", command.lines().next().unwrap_or_default());
+        let message = format!(
+            "{}\n\nThat was a command you gave me, run in the project folder, and it failed. Put it right: give \
+             the commands to run instead, in a fenced `sh` block, or the files to change, whole, as before. \
+             Don't repeat a command that already did its part.",
+            ran
+        );
         self.send_turn(shown, message, Vec::new(), true);
     }
 
@@ -2205,7 +2210,7 @@ impl App {
             }
             AppEvent::Error(text) => self.entries.push(Entry::Error(text)),
             AppEvent::Check(id, output, code) => self.check_ended(id, output, code),
-            AppEvent::Ran(id, project, last, output, code) => self.ran(id, project, last, output, code),
+            AppEvent::Ran(id, project, output, code) => self.ran(id, project, output, code),
             AppEvent::Unrun(ids) => self.unrun(&ids),
             AppEvent::Started(id, pid) => {
                 if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
@@ -2236,11 +2241,10 @@ impl App {
                     self.connections = Some(connection_counts(&servers));
                 }
             }
+            // Indexing runs in the background, unannounced; a push done only
+            // has the card's document count refreshed.
             AppEvent::Syncing(count) => {
-                self.syncing = count;
-                self.indexing_total = self.indexing_total.max(count);
                 if count == 0 {
-                    self.indexing_until = Some(Instant::now() + INDEXING_HINT);
                     // Ask the agent now, rather than at the next poll.
                     self.agent_asked = Some(Instant::now() - AGENT_EVERY);
                 }
@@ -2249,7 +2253,6 @@ impl App {
             AppEvent::SyncEnded(stop) => {
                 if self.sync.as_ref().is_some_and(|s| Arc::ptr_eq(&s.stop, &stop)) {
                     self.sync = None;
-                    self.syncing = 0;
                 }
             }
             AppEvent::Agent(project, state) => {
@@ -2261,12 +2264,6 @@ impl App {
                 }
                 let down = || crate::AgentState { state: "not responding".to_string(), memory: None, documents: 0, pending: 0 };
                 let state = state.unwrap_or_else(down);
-                let hinting = self.indexing_until.is_some_and(|until| Instant::now() < until);
-                if state.pending > 0 {
-                    self.indexing_total = self.indexing_total.max(state.pending);
-                } else if state.state != "indexing" && self.syncing == 0 && !hinting {
-                    self.indexing_total = 0;
-                }
                 self.agent = Some(state);
             }
             // Only for the project still chatted in.
@@ -2448,8 +2445,6 @@ impl App {
         self.connections = None;
         // What the last project's documents were doing isn't this one's.
         self.agent = None;
-        self.indexing_total = 0;
-        self.indexing_until = None;
         if self.agent_asked.is_some() {
             self.agent_asked = Some(Instant::now() - AGENT_EVERY);
         }
@@ -3588,21 +3583,7 @@ impl App {
                 Span::styled(format!(" ({})", detail), dim()),
             ])
         };
-        // Indexing has a row only between turns: during one, the row says
-        // what the turn is doing, and the folder's sync holds off.
-        let indexing_now = self.agent.as_ref().is_some_and(|a| a.state == "indexing")
-            || self.indexing_until.is_some_and(|until| Instant::now() < until);
-        let between_turns = matches!(self.phase, Phase::Ready) && self.turn.is_none();
-        let indexing = (between_turns && (self.syncing > 0 || indexing_now)).then(|| {
-            // Counts up to what was pushed, as the agent gets through it.
-            let left = if self.syncing > 0 { self.syncing } else { self.agent.as_ref().map_or(0, |a| a.pending) };
-            let total = self.indexing_total.max(left);
-            match (left, total) {
-                (0, _) => "Indexing documents".to_string(),
-                (_, 1) => "Indexing 1 document".to_string(),
-                (left, total) => format!("Indexing {} of {} documents", total - left, total),
-            }
-        });
+        // Indexing isn't shown: it runs in the background.
         match (&self.phase, &self.turn) {
             (Phase::Setup, _) if self.setup.failure.is_none() => {
                 let (what, took) = match self.setup.active() {
@@ -3624,9 +3605,6 @@ impl App {
                 lines.push(working(what, detail));
             }
             _ => {}
-        }
-        if let Some(what) = indexing {
-            lines.push(Line::from(vec![spinner.clone(), Span::styled(format!("{}…", what), dim())]));
         }
         for d in self.downloads.iter().filter(|d| !d.finished) {
             let mut spans = vec![
@@ -5427,14 +5405,9 @@ mod tests {
         assert!(shown.contains("Answering with minimax-m3…"), "{}", shown);
         assert!(!shown.contains("Generating response"), "{}", shown);
 
-        // With no turn, the agent's own state still shows the row; without
-        // either, nothing does.
+        // Nor once the turn is over.
         app.turn = None;
-        assert!(screen(&app, 80, 24).contains("Indexing documents…"));
-        let agent = crate::AgentState { state: "ready".into(), memory: None, documents: 1, pending: 0 };
-        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(agent)));
-        app.indexing_until = None;
-        assert!(!screen(&app, 80, 24).contains("Indexing documents…"));
+        assert!(!screen(&app, 80, 24).contains("Indexing"));
     }
 
     #[test]
@@ -5452,32 +5425,15 @@ mod tests {
     }
 
     #[test]
-    fn the_status_line_says_when_documents_are_syncing_or_indexing() {
+    fn indexing_never_takes_the_status_line() {
         let mut app = app();
         app.phase = Phase::Ready;
-        let said = |app: &App, what: &str| screen(app, 80, 24).contains(what);
-        assert!(!said(&app, "Indexing documents"));
         app.apply(AppEvent::Syncing(3));
-        assert!(said(&app, "Indexing 0 of 3 documents…"));
-        // Pushed; the agent hasn't picked it up yet.
+        assert!(!screen(&app, 80, 24).contains("Indexing"));
         app.apply(AppEvent::Syncing(0));
-        assert!(said(&app, "Indexing documents…"));
-        app.indexing_until = None;
-        assert!(!said(&app, "Indexing documents"));
-        let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 1, pending: 0 };
-        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(agent)));
-        assert!(said(&app, "Indexing documents…"));
-        // The count goes up as the agent gets through them.
-        let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 1, pending: 7 };
-        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(agent)));
-        assert!(said(&app, "Indexing 0 of 7 documents…"));
         let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 5, pending: 3 };
         app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(agent)));
-        assert!(said(&app, "Indexing 4 of 7 documents…"));
-        let agent = crate::AgentState { state: "healthy".into(), memory: None, documents: 8, pending: 0 };
-        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(agent)));
-        assert!(!said(&app, "Indexing"));
-        assert_eq!(app.indexing_total, 0);
+        assert!(!screen(&app, 80, 24).contains("Indexing"));
     }
 
     #[test]
@@ -5987,35 +5943,30 @@ mod tests {
         assert_eq!(last.last().map(String::as_str), Some("git push"));
         assert!(!last.iter().any(|c| c.contains("remote add")));
         assert!(app.entries.iter().any(|e| matches!(e, Entry::Warning(w) if w == "Not run, as it has a placeholder to fill in: <your-username>")));
-        // A script that fails goes back to the agent to fix; the last one
-        // done, to be told of; each for a few rounds only.
+        // A script that fails goes back to the agent to fix, for a few
+        // rounds only; one that's done isn't followed up.
         let id = app.shell_runs;
-        let ran = |app: &mut App, last: bool, output: &str, code: i32| {
-            app.apply(AppEvent::Ran(id, "p1".into(), last, output.into(), Some(Ended::Exited(code))));
+        let ran = |app: &mut App, output: &str, code: i32| {
+            app.apply(AppEvent::Ran(id, "p1".into(), output.into(), Some(Ended::Exited(code))));
         };
-        ran(&mut app, false, "fatal: no upstream", 128);
+        ran(&mut app, "fatal: no upstream", 128);
         assert_eq!(app.command_round, 1);
         assert!(app.turn.is_some(), "a fix turn was sent");
         assert!(app.shell_context.is_empty(), "the output went with it");
         assert!(matches!(app.entries.last(), Some(Entry::Reply(_))));
         assert!(app.entries.iter().any(|e| matches!(e, Entry::User(u) if u == "Fix the failed command: git push")));
         app.stop_turn();
-        ran(&mut app, false, "Everything up-to-date", 0);
+        ran(&mut app, "Everything up-to-date", 0);
         assert!(app.turn.is_none(), "one in the middle just rides along");
         assert_eq!(app.shell_context.len(), 1);
-        ran(&mut app, true, "Everything up-to-date", 0);
-        assert_eq!(app.command_round, 2);
-        assert!(app.turn.is_some(), "the last one is told of");
-        assert!(app.entries.iter().any(|e| matches!(e, Entry::User(u) if u == "What the commands did")));
-        app.stop_turn();
+        ran(&mut app, "Everything up-to-date", 0);
+        assert_eq!(app.command_round, 1);
+        assert!(app.turn.is_none(), "done, the agent isn't asked what it did");
+        assert_eq!(app.shell_context.len(), 2, "the output rides with the next prompt");
         app.command_round = COMMAND_ROUNDS;
-        ran(&mut app, true, "fatal: no upstream", 128);
+        ran(&mut app, "fatal: no upstream", 128);
         assert!(app.turn.is_none());
         assert!(matches!(app.entries.last(), Some(Entry::Warning(w)) if w.starts_with("Still failing after 3 round(s)")));
-        app.shell_context.clear();
-        ran(&mut app, true, "ok", 0);
-        assert!(app.turn.is_none(), "past the rounds, done is quiet");
-        assert_eq!(app.shell_context.len(), 1);
         // A check that fails for good drops them, and says so.
         turn(&mut app, "`src/main.rs`\n```rust\nfn main() { 1 }\n```\n\n```sh\ngit push\n```\n");
         let id = app.check.as_ref().unwrap().id;
@@ -7053,6 +7004,26 @@ mod tests {
             segments("```\nb\n```\n```\nc\n```\nd"),
             [(true, "```\nb\n```".to_string(), 0), (true, "```\nc\n```".to_string(), 3), (false, "d".to_string(), 6)]
         );
+    }
+
+    #[test]
+    fn a_file_streaming_in_is_laid_out_again_once_a_line_is_done() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {\n    old();\n}\n").unwrap();
+        let mut reply = Reply { root: Some(dir.path().to_path_buf()), ..Default::default() };
+        let shown = |reply: &Reply| reply.body(40).iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        reply.text = "Here:\n\n`main.rs`\n```rust\nfn main() {\n    ne".into();
+        assert!(shown(&reply).contains("    ne"));
+        // More of the same line: the diff isn't redone.
+        reply.text.push_str("w();");
+        reply.rendered_at.set(None);
+        assert!(!shown(&reply).contains("new();"));
+        // The line done, it is.
+        reply.text.push('\n');
+        reply.rendered_at.set(None);
+        assert!(shown(&reply).contains("new();"));
+        // The prose before it is kept as it was laid out.
+        assert_eq!(reply.pieces.borrow()[0].key, "Here:\n\n`main.rs`");
     }
 
     #[test]
