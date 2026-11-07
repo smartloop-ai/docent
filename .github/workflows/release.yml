@@ -105,7 +105,7 @@ jobs:
             archive: tar.gz
             target_dir: target
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             features: metal
             archive: tar.gz
             target_dir: target
