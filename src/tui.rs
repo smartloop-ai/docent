@@ -523,6 +523,9 @@ enum Entry {
     Shell(Shell),
     /// The last reply's shell commands, waiting to be allowed or skipped.
     Ask(Vec<String>),
+    /// The files there the last reply changes, with lines added and
+    /// removed, waiting to be allowed or skipped.
+    AskWrite(Vec<(String, usize, usize)>),
     Notice(String),
     Warning(String),
     Error(String),
@@ -610,7 +613,7 @@ struct Piece {
     path: Option<String>,
     whole: bool,
     key: String,
-    /// Laid out while the reply was coming in, its files only named.
+    /// Laid out while its file was still coming in, only named.
     pending: bool,
     lines: Vec<Line<'static>>,
 }
@@ -675,10 +678,10 @@ impl Reply {
             Some((_, at, true, _)) if streaming && fresh && *at == width => {}
             _ => {
                 self.rendered_at.set(Some(Instant::now()));
-                // While the reply comes in, its files are only named: their
-                // changes show once it's all in, as a coding harness shows
-                // an edit once it's made.
-                let pending = streaming;
+                // While the reply comes in, a file still being given is only
+                // named: its change shows once its block is done, as a
+                // coding harness shows an edit once it's made.
+                let replying = streaming;
                 let blocks = if self.root.is_some() { files::blocks(text) } else { Vec::new() };
                 let mut lines: Vec<Line<'static>> = Vec::new();
                 let mut pieces = self.pieces.borrow_mut();
@@ -693,6 +696,7 @@ impl Reply {
                         _ => Vec::new(),
                     };
                     let streaming = code && (file.is_some() || !docs.is_empty()) && !files::block_closed(&segment);
+                    let pending = replying && streaming;
                     // A file still coming in is laid out again only once
                     // another of its lines is done, not on every chunk: its
                     // diff against the file there is the costly part.
@@ -720,7 +724,7 @@ impl Reply {
                         _ => match (code, file) {
                             (true, Some(file)) if pending => vec![writing_line(&file.path, &file.content, false)],
                             (true, Some(file)) => self.file_part(&file.path, &file.content, false, streaming, &segment, width),
-                            (true, None) if !docs.is_empty() => self.heredoc_part(&segment, start, &docs, pending, width),
+                            (true, None) if !docs.is_empty() => self.heredoc_part(&segment, start, &docs, replying, width),
                             (true, None) => code_lines(&segment, width),
                             (false, _) => prose_lines(&segment, width),
                         },
@@ -769,7 +773,7 @@ impl Reply {
     /// A shell block, `segment` from line `start` of the reply, whose
     /// heredocs `docs` write files: each heredoc as its file's change, the
     /// commands around them as code.
-    fn heredoc_part(&self, segment: &str, start: usize, docs: &[&files::Block], pending: bool, width: u16) -> Vec<Line<'static>> {
+    fn heredoc_part(&self, segment: &str, start: usize, docs: &[&files::Block], replying: bool, width: u16) -> Vec<Line<'static>> {
         let lines: Vec<&str> = segment.lines().collect();
         let opener = lines.first().copied().unwrap_or("```");
         let fence = files::opening_fence(opener).map_or_else(|| "```".to_string(), |(f, _)| f);
@@ -797,7 +801,7 @@ impl Reply {
             let to = (doc.end - start).clamp(from, body_end);
             push(&mut out, shell(at, from));
             let code = format!("{}\n{}\n{}", opener, lines[from..to].join("\n"), fence);
-            let part = if pending {
+            let part = if replying && !doc.closed {
                 vec![writing_line(&doc.file.path, &doc.file.content, doc.append)]
             } else {
                 self.file_part(&doc.file.path, &doc.file.content, doc.append, !doc.closed, &code, width)
@@ -817,8 +821,8 @@ impl Reply {
     }
 }
 
-/// A file a reply still coming in gives, named with its lines so far:
-/// its change shows once the reply is in.
+/// A file a reply is still giving, named with its lines so far: its
+/// change shows once its block is done.
 fn writing_line(path: &str, content: &str, append: bool) -> Line<'static> {
     let lines = content.lines().count();
     Line::from(vec![
@@ -1105,6 +1109,17 @@ enum Phase {
     Ready,
 }
 
+/// A reply's files and commands, held while it's asked whether to write
+/// over the files that are there.
+struct WriteAsk {
+    root: std::path::PathBuf,
+    found: Vec<files::File>,
+    whole: Vec<String>,
+    commands: Vec<String>,
+    /// The files there it changes.
+    changed: Vec<String>,
+}
+
 struct Turn {
     started: Instant,
     task: tokio::task::JoinHandle<()>,
@@ -1239,7 +1254,11 @@ struct App {
     /// Those commands once checked, waiting to be allowed: Enter runs
     /// them, Tab runs them and every later reply's too, Esc skips them.
     ask: Option<(std::path::PathBuf, Vec<String>)>,
-    /// Allowed for the session: a reply's commands run without asking.
+    /// The last reply's files, waiting to be allowed: it changes files
+    /// that are there, which aren't written over without asking.
+    write_ask: Option<WriteAsk>,
+    /// Allowed for the session: a reply's changes are written and its
+    /// commands run without asking.
     always_run: bool,
     /// Rounds of fixing a reply's failed command since the user's last
     /// prompt, so a command that keeps failing doesn't go on forever.
@@ -1314,6 +1333,7 @@ impl App {
             kept: None,
             commands: None,
             ask: None,
+            write_ask: None,
             always_run: false,
             command_round: 0,
             last_failure: None,
@@ -2001,6 +2021,69 @@ impl App {
         self.scroll_back = 0;
     }
 
+    /// A reply's files `found` and `commands`, in `root`: a reply changing
+    /// files that are there asks first, as a coding harness asks before an
+    /// edit, unless allowed for the session; else they're written, checked,
+    /// and the commands asked about.
+    fn reply_done(&mut self, root: std::path::PathBuf, found: Vec<files::File>, whole: Vec<String>, commands: Vec<String>) {
+        let plan = files::plan(&root, found.clone(), &whole);
+        if plan.changed.is_empty() || self.always_run {
+            return self.apply_reply(root, found, &whole, commands);
+        }
+        let shown: Vec<(String, usize, usize)> = plan
+            .changed
+            .iter()
+            .map(|f| {
+                let old = std::fs::read_to_string(root.join(&f.path)).unwrap_or_default();
+                let (added, removed) = files::line_changes(&old, &f.content);
+                (f.path.clone(), added, removed)
+            })
+            .collect();
+        let changed = plan.changed.into_iter().map(|f| f.path).collect();
+        self.entries.retain(|e| !matches!(e, Entry::AskWrite(_)));
+        self.entries.push(Entry::AskWrite(shown));
+        self.write_ask = Some(WriteAsk { root, found, whole, commands, changed });
+        self.scroll_back = 0;
+    }
+
+    /// The files asked about, answered: `write` writes them all, else
+    /// only the new ones, and the files there are left as they are;
+    /// `always` writes from now on without asking.
+    fn answer_write(&mut self, write: bool, always: bool) {
+        let Some(ask) = self.write_ask.take() else { return };
+        self.entries.retain(|e| !matches!(e, Entry::AskWrite(_)));
+        let mut found = ask.found;
+        if !write {
+            found.retain(|f| !ask.changed.contains(&f.path));
+            self.entries.push(Entry::Notice(format!("Not written: {}", ask.changed.join(", "))));
+        }
+        if always {
+            self.always_run = true;
+            self.entries.push(Entry::Notice(
+                "Auto-approve on: a reply's changes are written and its commands run without asking (tab turns it off)".to_string(),
+            ));
+        }
+        self.apply_reply(ask.root, found, &ask.whole, ask.commands);
+    }
+
+    /// Write a reply's files, check them, then ask about its commands.
+    fn apply_reply(&mut self, root: std::path::PathBuf, found: Vec<files::File>, whole: &[String], commands: Vec<String>) {
+        let written = self.reply_files(&root, found, whole);
+        if !written.is_empty() {
+            self.run_check(&root, &written);
+        } else if self.fix_round > 0 {
+            self.entries.push(Entry::Warning("The fix changed no file, so the errors stand; see them above".to_string()));
+        }
+        // The reply's commands run once its files are in and checked: a
+        // fix round's reply has none of its own, so the first reply's wait.
+        if !commands.is_empty() {
+            self.commands = Some((root, commands));
+        }
+        if self.check.is_none() {
+            self.run_commands();
+        }
+    }
+
     /// The last reply's shell commands, checked, are shown and asked
     /// about, as opencode asks before a tool runs; allowed for the session
     /// already, they run at once.
@@ -2209,23 +2292,7 @@ impl App {
                             if let Some(root) = turn.files_dir {
                                 let found = files::extract_in(&root, &reply.text);
                                 let commands = files::commands(&reply.text);
-                                let written = self.reply_files(&root, found, &turn.whole);
-                                if !written.is_empty() {
-                                    self.run_check(&root, &written);
-                                } else if self.fix_round > 0 {
-                                    self.entries.push(Entry::Warning(
-                                        "The fix changed no file, so the errors stand; see them above".to_string(),
-                                    ));
-                                }
-                                // The reply's commands run once its files are
-                                // in and checked: a fix round's reply has none
-                                // of its own, so the first reply's wait.
-                                if !commands.is_empty() {
-                                    self.commands = Some((root.clone(), commands));
-                                }
-                                if self.check.is_none() {
-                                    self.run_commands();
-                                }
+                                self.reply_done(root, found, turn.whole, commands);
                             }
                         }
                         Err(e) => reply.ended = Some(e),
@@ -3088,6 +3155,7 @@ impl App {
         let last_esc = self.last_esc.take();
         let esc_again = key.code == KeyCode::Esc && last_esc.is_some_and(|t| t.elapsed() < DOUBLE_ESC);
         let asked = self.ask.is_some() && self.input.is_empty() && self.turn.is_none() && !self.token_entry;
+        let asked_write = self.write_ask.is_some() && self.input.is_empty() && self.turn.is_none() && !self.token_entry;
         match key.code {
             KeyCode::Esc if self.token_entry => {
                 self.token_entry = false;
@@ -3095,6 +3163,11 @@ impl App {
                 self.cursor = 0;
             }
             KeyCode::Esc if self.turn.is_some() => self.stop_turn(),
+            // The reply's changes to files there, asked about: write, write
+            // from now on, or leave those files be.
+            KeyCode::Enter if asked_write && key.modifiers.is_empty() => self.answer_write(true, false),
+            KeyCode::Tab if asked_write => self.answer_write(true, true),
+            KeyCode::Esc if asked_write => self.answer_write(false, false),
             // The reply's commands, asked about: run, run from now on, or skip.
             KeyCode::Enter if asked && key.modifiers.is_empty() => self.answer_ask(true, false),
             KeyCode::Tab if asked => self.answer_ask(true, true),
@@ -3103,7 +3176,11 @@ impl App {
             // a reply's commands run without asking.
             KeyCode::Tab if self.input.is_empty() && !self.token_entry => {
                 self.always_run = !self.always_run;
-                let state = if self.always_run { "on: a reply's commands run without asking" } else { "off: a reply's commands are asked about" };
+                let state = if self.always_run {
+                    "on: a reply's changes are written and its commands run without asking"
+                } else {
+                    "off: a reply's changes to files and its commands are asked about"
+                };
                 self.entries.push(Entry::Notice(format!("Auto-approve {}", state)));
                 self.scroll_back = 0;
             }
@@ -3367,6 +3444,7 @@ impl App {
                 self.shell_context.clear();
                 self.commands = None;
                 self.ask = None;
+                self.write_ask = None;
                 self.session = chat::new_session_id();
                 self.scroll_back = 0;
             }
@@ -3851,6 +3929,7 @@ impl App {
             Entry::Reply(reply) => reply_lines(reply, width, lines),
             Entry::Shell(shell) => shell_lines(shell, self.spinner(), SHELL_SHOWN, lines),
             Entry::Ask(commands) => ask_lines(commands, lines),
+            Entry::AskWrite(changed) => ask_write_lines(changed, lines),
             Entry::Notice(text) => {
                 lines.push(Line::from(vec![Span::styled("■ ", Style::new().fg(Color::Green)), Span::raw(text.clone())]))
             }
@@ -4139,6 +4218,8 @@ impl App {
         } else if self.input.starts_with('!') {
             // Shell mode, said as Claude Code says it, in the rules' color.
             hints.push(Span::styled("! for shell mode", Style::new().fg(pink())));
+        } else if self.write_ask.is_some() && self.input.is_empty() && self.turn.is_none() {
+            hints.extend(key_hints(&[("enter", "write"), ("tab", "always this session"), ("esc", "keep the files")]));
         } else if self.ask.is_some() && self.input.is_empty() && self.turn.is_none() {
             hints.extend(key_hints(&[("enter", "run"), ("tab", "always this session"), ("esc", "skip")]));
         } else if self.input.trim() == "/project import" {
@@ -4956,6 +5037,20 @@ fn ask_lines(commands: &[String], lines: &mut Vec<Line<'static>>) {
                 Span::styled(format!("won't run as it is: fill in {}", holes.join(", ")), Style::new().fg(Color::Yellow)),
             ]));
         }
+    }
+}
+
+fn ask_write_lines(changed: &[(String, usize, usize)], lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::from(vec![
+        Span::styled("? ", Style::new().fg(Color::Yellow).bold()),
+        Span::styled("Write these changes over the files there?", Style::new().bold()),
+    ]));
+    for (path, added, removed) in changed {
+        lines.push(Line::from(vec![
+            Span::styled("  ", dim()),
+            Span::styled(path.clone(), key_style()),
+            Span::styled(format!("  +{} −{}", added, removed), dim()),
+        ]));
     }
 }
 
@@ -6001,6 +6096,8 @@ mod tests {
         assert!(matches!(app.entries.last(), Some(Entry::Warning(w)) if w.starts_with("Still failing after 3 round(s)")));
         // A check that fails for good drops them, and says so.
         turn(&mut app, "`src/main.rs`\n```rust\nfn main() { 1 }\n```\n\n```sh\ngit push\n```\n");
+        // It changes a file that's there: asked first.
+        app.answer_write(true, false);
         let id = app.check.as_ref().unwrap().id;
         app.fix_round = 10;
         app.last_failure = Some("err".into());
@@ -6117,7 +6214,44 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_creates_and_updates_files_without_asking() {
+    fn a_reply_asks_before_writing_over_files_there() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "old\n").unwrap();
+        let file = |path: &str, content: &str| files::File { path: path.into(), content: content.into() };
+        let found = || vec![file("main.rs", "new\n"), file("a.rs", "a\n")];
+        let mut app = app();
+        app.phase = Phase::Ready;
+        // Asked: nothing written yet, the change named.
+        app.reply_done(dir.path().into(), found(), Vec::new(), vec!["git add -A".into()]);
+        assert!(matches!(app.entries.last(), Some(Entry::AskWrite(c)) if c == &[("main.rs".to_string(), 1, 1)]));
+        assert!(!dir.path().join("a.rs").exists());
+        assert!(app.commands.is_none() && app.ask.is_none());
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("Write these changes over the files there?"), "{}", text);
+        assert!(text.contains("keep the files"), "{}", text);
+        // Esc: the file there is kept, the new one written, the commands asked.
+        app.key_edit(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "old\n");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "a\n");
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "Not written: main.rs")));
+        assert!(!app.entries.iter().any(|e| matches!(e, Entry::AskWrite(_))));
+        assert!(app.ask.is_some());
+        app.ask = None;
+        // Enter writes it.
+        app.reply_done(dir.path().into(), found(), Vec::new(), Vec::new());
+        app.key_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "new\n");
+        // Tab writes from now on without asking.
+        app.reply_done(dir.path().into(), vec![file("main.rs", "newer\n")], Vec::new(), Vec::new());
+        app.key_edit(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(app.always_run);
+        app.reply_done(dir.path().into(), vec![file("main.rs", "newest\n")], Vec::new(), Vec::new());
+        assert!(app.write_ask.is_none());
+        assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "newest\n");
+    }
+
+    #[test]
+    fn writing_a_replys_files_reports_each_change() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.rs"), "old\n").unwrap();
         std::fs::write(dir.path().join("same.rs"), "same\n").unwrap();
@@ -7064,10 +7198,10 @@ mod tests {
         // commands around them.
         reply.text = "Here:\n\n```sh\ncat > main.rs <<'EOF'\nfn main() {\n    new();\n}\nEOF\ngit add -A\ncat > lib.rs <<'EOF'\npub".into();
         let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
-        assert!(rows.contains(&"● Writing main.rs · 3 lines".to_string()), "{:?}", rows);
+        // A file done shows its change while the next is still coming.
+        assert!(rows.contains(&"← main.rs  +1 −1".to_string()), "{:?}", rows);
         assert!(rows.contains(&"● Writing lib.rs · 1 line".to_string()), "{:?}", rows);
         assert!(rows.iter().any(|r| r.contains("git add -A")), "{:?}", rows);
-        assert!(!rows.iter().any(|r| r.contains("new();")), "{:?}", rows);
         // In, each heredoc is its change.
         reply.text.push_str(" fn l() {}\nEOF\n```\n");
         reply.stats = Some(TurnStats::default());
