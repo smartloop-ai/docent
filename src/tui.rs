@@ -678,7 +678,14 @@ impl Reply {
                 let mut laid: Vec<Piece> = Vec::new();
                 for (i, (code, segment, start)) in segments(text).into_iter().enumerate() {
                     let file = blocks.iter().find(|b| b.fence == start).map(|b| &b.file);
-                    let streaming = code && file.is_some() && !files::block_closed(&segment);
+                    // A shell block's heredocs that write files, each shown
+                    // as its change.
+                    let span = start + segment.lines().count();
+                    let docs: Vec<&files::Block> = match (code, file) {
+                        (true, None) => blocks.iter().filter(|b| b.fence > start && b.fence < span).collect(),
+                        _ => Vec::new(),
+                    };
+                    let streaming = code && (file.is_some() || !docs.is_empty()) && !files::block_closed(&segment);
                     // A file still coming in is laid out again only once
                     // another of its lines is done, not on every chunk: its
                     // diff against the file there is the costly part.
@@ -688,32 +695,17 @@ impl Reply {
                         Some(end) if streaming && !self.text.ends_with('\n') => segment[..end].to_string(),
                         _ => segment.clone(),
                     };
-                    let path = file.map(|f| f.path.clone());
+                    let path = file.map(|f| f.path.clone()).or_else(|| {
+                        (!docs.is_empty()).then(|| docs.iter().map(|d| d.file.path.as_str()).collect::<Vec<_>>().join("\n"))
+                    });
                     let whole = path.as_ref().is_some_and(|p| self.whole.contains(p));
                     let part = match pieces.get(i) {
                         Some(p) if p.start == start && p.width == width && p.path == path && p.whole == whole && p.key == key => {
                             p.lines.clone()
                         }
                         _ => match (code, file) {
-                            (true, Some(file)) => {
-                                let old = self.old(&file.path);
-                                match old.as_deref() {
-                                    // Holding less than the file, it isn't all
-                                    // of it: shown as it is, since as a change
-                                    // the rest of the file would read as taken
-                                    // out; and not written, see `reply_files`.
-                                    Some(old) if !streaming && !self.whole.contains(&file.path) && files::partial(old, &file.content) => {
-                                        let mut part = vec![Line::from(vec![
-                                            Span::styled("← ", dim()),
-                                            Span::styled(file.path.clone(), Style::new().bold()),
-                                            Span::styled(" · less than the file, so not written over it", dim()),
-                                        ])];
-                                        part.extend(code_lines(&segment, width));
-                                        part
-                                    }
-                                    _ => diff_lines(&files::diff(&file.path, old.as_deref(), &file.content, streaming), width),
-                                }
-                            }
+                            (true, Some(file)) => self.file_part(&file.path, &file.content, false, streaming, &segment, width),
+                            (true, None) if !docs.is_empty() => self.heredoc_part(&segment, start, &docs, width),
                             (true, None) => code_lines(&segment, width),
                             (false, _) => prose_lines(&segment, width),
                         },
@@ -733,6 +725,70 @@ impl Reply {
         }
     }
 
+    /// A file the reply gives, `content` in place of the file there or, by
+    /// a `>>` heredoc, `append`ed to it: its change as a diff. `code` is the
+    /// block that gives it, shown as it is when it holds less than the file.
+    fn file_part(&self, path: &str, content: &str, append: bool, streaming: bool, code: &str, width: u16) -> Vec<Line<'static>> {
+        let old = self.old(path);
+        let new = match (&old, append) {
+            (Some(old), true) => format!("{old}{content}"),
+            _ => content.to_string(),
+        };
+        match old.as_deref() {
+            // Holding less than the file, it isn't all of it: shown as it
+            // is, since as a change the rest of the file would read as
+            // taken out; and not written, see `reply_files`.
+            Some(old) if !append && !streaming && !self.whole.iter().any(|w| w == path) && files::partial(old, &new) => {
+                let mut part = vec![Line::from(vec![
+                    Span::styled("← ", dim()),
+                    Span::styled(path.to_string(), Style::new().bold()),
+                    Span::styled(" · less than the file, so not written over it", dim()),
+                ])];
+                part.extend(code_lines(code, width));
+                part
+            }
+            _ => diff_lines(&files::diff(path, old.as_deref(), &new, streaming), width),
+        }
+    }
+
+    /// A shell block, `segment` from line `start` of the reply, whose
+    /// heredocs `docs` write files: each heredoc as its file's change, the
+    /// commands around them as code.
+    fn heredoc_part(&self, segment: &str, start: usize, docs: &[&files::Block], width: u16) -> Vec<Line<'static>> {
+        let lines: Vec<&str> = segment.lines().collect();
+        let opener = lines.first().copied().unwrap_or("```");
+        let fence = files::opening_fence(opener).map_or_else(|| "```".to_string(), |(f, _)| f);
+        let body_end = if files::block_closed(segment) { lines.len() - 1 } else { lines.len() };
+        let mut out: Vec<Line<'static>> = Vec::new();
+        let push = |out: &mut Vec<Line<'static>>, part: Vec<Line<'static>>| {
+            if part.is_empty() {
+                return;
+            }
+            if !out.is_empty() {
+                out.push(Line::default());
+            }
+            out.extend(part);
+        };
+        let shell = |from: usize, to: usize| {
+            let chunk = &lines[from.min(to)..to];
+            if chunk.iter().all(|l| l.trim().is_empty()) {
+                return Vec::new();
+            }
+            code_lines(&format!("{}\n{}\n{}", opener, chunk.join("\n"), fence), width)
+        };
+        let mut at = 1;
+        for doc in docs {
+            let from = (doc.fence - start).clamp(at, body_end);
+            let to = (doc.end - start).clamp(from, body_end);
+            push(&mut out, shell(at, from));
+            let code = format!("{}\n{}\n{}", opener, lines[from..to].join("\n"), fence);
+            push(&mut out, self.file_part(&doc.file.path, &doc.file.content, doc.append, !doc.closed, &code, width));
+            at = to;
+        }
+        push(&mut out, shell(at, body_end));
+        out
+    }
+
     /// The file at `path` under the reply's folder as it was before the
     /// reply, read the first time it's asked for; none when it's new.
     fn old(&self, path: &str) -> Option<String> {
@@ -745,31 +801,25 @@ impl Reply {
 /// with whether it's code and the line it starts on. A fence left open
 /// runs to the end, as it does while a reply streams.
 fn segments(text: &str) -> Vec<(bool, String, usize)> {
+    let lines: Vec<&str> = text.lines().collect();
     let mut out: Vec<(bool, String, usize)> = Vec::new();
-    let mut fence: Option<String> = None;
-    for (at, line) in text.lines().enumerate() {
-        let (code, closing) = match &fence {
-            Some(open) => (true, files::closes(line, open)),
-            None => {
-                if let Some((open, _)) = files::opening_fence(line) {
-                    fence = Some(open);
-                    out.push((true, String::new(), at));
-                }
-                (fence.is_some(), false)
-            }
+    let (mut prose, mut i) = (0, 0);
+    while i < lines.len() {
+        let Some((fence, info)) = files::opening_fence(lines[i]) else {
+            i += 1;
+            continue;
         };
-        match out.last_mut() {
-            Some((kind, body, _)) if *kind == code => {
-                if !body.is_empty() {
-                    body.push('\n');
-                }
-                body.push_str(line);
-            }
-            _ => out.push((code, line.to_string(), at)),
+        if prose < i {
+            out.push((false, lines[prose..i].join("\n"), prose));
         }
-        if closing {
-            fence = None;
-        }
+        // A fence in a heredoc's body is the body's: see `files::close_of`.
+        let end = files::close_of(&lines, i, &fence, info).map_or(lines.len(), |c| c + 1);
+        out.push((true, lines[i..end].join("\n"), i));
+        i = end;
+        prose = end;
+    }
+    if prose < lines.len() {
+        out.push((false, lines[prose..].join("\n"), prose));
     }
     out
 }
@@ -1037,10 +1087,6 @@ struct Turn {
     files_dir: Option<std::path::PathBuf>,
     /// The files the agent was shown whole, which its reply may give back.
     whole: Vec<String>,
-    /// The files the agent wrote on its own as the turn ended, as it
-    /// reported them: its copy of the reply in `.out/`, or the reply's
-    /// files themselves.
-    agent_wrote: Vec<String>,
 }
 
 /// The working directory's sync to `project`, running until `stop`.
@@ -1602,7 +1648,6 @@ impl App {
             activity: None,
             files_dir,
             whole,
-            agent_wrote: Vec::new(),
         });
         self.busy.store(true, Ordering::Relaxed);
     }
@@ -1710,24 +1755,11 @@ impl App {
     /// alike, as the reply is the edit, then say what changed in each, by
     /// lines; those already as given are left be, and so is a file the
     /// agent wasn't shown `whole` when the reply gives back less of it.
-    /// Files the agent wrote itself as the turn ended, `by_agent`, are
-    /// reported with them, as they're the reply's too. The files written,
-    /// by either.
-    fn reply_files(
-        &mut self,
-        root: &std::path::Path,
-        found: Vec<files::File>,
-        whole: &[String],
-        by_agent: &[String],
-    ) -> Vec<String> {
-        if found.is_empty() && by_agent.is_empty() {
+    /// The files written.
+    fn reply_files(&mut self, root: &std::path::Path, found: Vec<files::File>, whole: &[String]) -> Vec<String> {
+        if found.is_empty() {
             return Vec::new();
         }
-        // The agent's, as they are now: all lines new to this turn.
-        let agent_lines: Vec<(String, usize)> = by_agent
-            .iter()
-            .map(|p| (p.clone(), std::fs::read_to_string(root.join(p)).map_or(0, |t| t.lines().count())))
-            .collect();
         let plan = files::plan(root, found, whole);
         if !plan.refused.is_empty() {
             self.entries.push(Entry::Warning(format!("Not written, outside {}: {}", root.display(), plan.refused.join(", "))));
@@ -1751,19 +1783,13 @@ impl App {
                 (f, false, files::line_changes(&old, &f.content))
             }))
             .collect();
-        let (mut written, failed) = files::write(root, &[plan.new.as_slice(), plan.changed.as_slice()].concat());
-        if !written.is_empty() || !agent_lines.is_empty() {
+        let (written, failed) = files::write(root, &[plan.new.as_slice(), plan.changed.as_slice()].concat());
+        if !written.is_empty() {
             self.entries.push(Entry::Notice(format!("Changed in {}:", root.display())));
         }
         for (file, created, (added, removed)) in changes.iter().filter(|(f, ..)| written.contains(&f.path)) {
             let what = if *created { "created" } else { "updated" };
             self.entries.push(Entry::Notice(format!("  {} {} (+{} −{})", what, file.path, added, removed)));
-        }
-        for (path, lines) in agent_lines {
-            if !written.contains(&path) {
-                self.entries.push(Entry::Notice(format!("  written {} (+{} −0) by the agent", path, lines)));
-                written.push(path);
-            }
         }
         for failure in failed {
             self.entries.push(Entry::Error(format!("Failed to write {}", failure)));
@@ -2149,19 +2175,9 @@ impl App {
                         Ok(stats) => {
                             reply.stats = Some(stats);
                             if let Some(root) = turn.files_dir {
-                                let found = files::extract(&reply.text);
-                                // The files are the reply's output: the agent's
-                                // own copy of it in `.out/` would only repeat them.
-                                if !found.is_empty() {
-                                    for copy in &turn.agent_wrote {
-                                        if files::remove_agent_copy(&root, copy) {
-                                            reply.text = files::without_link(&reply.text, copy);
-                                        }
-                                    }
-                                }
-                                let by_agent = under(&root, &turn.agent_wrote);
+                                let found = files::extract_in(&root, &reply.text);
                                 let commands = files::commands(&reply.text);
-                                let written = self.reply_files(&root, found, &turn.whole, &by_agent);
+                                let written = self.reply_files(&root, found, &turn.whole);
                                 if !written.is_empty() {
                                     self.run_check(&root, &written);
                                 } else if self.fix_round > 0 {
@@ -2488,9 +2504,6 @@ impl App {
                     && let Some(name) = selected_model(&message)
                 {
                     reply.model = Some(name);
-                }
-                if step == "file-write" {
-                    turn.agent_wrote.push(message.clone());
                 }
                 // The agent's indexing for the turn isn't shown: the turn's
                 // line keeps what it was doing.
@@ -4461,17 +4474,6 @@ fn capability_list(list: &str) -> Result<Vec<String>, String> {
     Ok(caps)
 }
 
-/// Of `paths`, those under `root` but not its `.out/`, relative to it.
-fn under(root: &std::path::Path, paths: &[String]) -> Vec<String> {
-    let real = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let root = real(root);
-    paths
-        .iter()
-        .filter_map(|p| real(std::path::Path::new(p)).strip_prefix(&root).ok().map(|r| r.to_string_lossy().replace('\\', "/")))
-        .filter(|p| !p.starts_with(".out/"))
-        .collect()
-}
-
 /// The kind of code project at `root`, as in "Rust", when prompts there are
 /// answered with code: by its mark when it has one (`/code`, or set when it
 /// was linked), else by its files.
@@ -5379,7 +5381,6 @@ mod tests {
             tokens: 0,
             activity: None,
             files_dir: None,
-            agent_wrote: Vec::new(),
             whole: Vec::new(),
         });
         app.chat_event(ChatEvent::Status { step: "index".into(), message: "Reading Testamento ejemplo.pdf".into() });
@@ -5867,7 +5868,6 @@ mod tests {
                 tokens: 0,
                 activity: None,
                 files_dir: Some(dir.path().to_path_buf()),
-                agent_wrote: Vec::new(),
                 whole: Vec::new(),
             });
             app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
@@ -6005,7 +6005,7 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         let file = |path: &str, content: &str| files::File { path: path.into(), content: content.into() };
-        let written = app.reply_files(dir.path(), vec![file("big.rs", "fn short() {}\n"), file("b.rs", "b\n")], &[], &[]);
+        let written = app.reply_files(dir.path(), vec![file("big.rs", "fn short() {}\n"), file("b.rs", "b\n")], &[]);
         assert_eq!(written, ["b.rs"]);
         assert_eq!(std::fs::read_to_string(dir.path().join("big.rs")).unwrap(), long);
         let text = screen(&app, 120, 24);
@@ -6098,25 +6098,17 @@ mod tests {
             dir.path(),
             vec![file("main.rs", "new\n"), file("same.rs", "same\n"), file("src/a.rs", "a\n")],
             &[],
-            &["same.rs".to_string()],
         );
-        // The folder's sync pushes what was written now; a file the agent
-        // wrote itself counts as written, for the check to cover.
+        // The folder's sync pushes what was written now.
         assert!(nudge.load(Ordering::Relaxed));
-        assert_eq!(written, ["src/a.rs", "main.rs", "same.rs"]);
-        let text = screen(&app, 120, 24);
-        assert!(text.contains("written same.rs (+1 −0) by the agent"), "{}", text);
-        let out = dir.path().join(".out");
-        std::fs::create_dir_all(&out).unwrap();
-        let agent = vec![dir.path().join("src/a.rs").to_string_lossy().into_owned(), out.join("x.md").to_string_lossy().into_owned(), "/elsewhere/y.rs".into()];
-        assert_eq!(under(dir.path(), &agent), ["src/a.rs"]);
+        assert_eq!(written, ["src/a.rs", "main.rs"]);
         assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "new\n");
         assert_eq!(std::fs::read_to_string(dir.path().join("src/a.rs")).unwrap(), "a\n");
         let text = screen(&app, 120, 24);
         assert!(text.contains("created src/a.rs (+1 −0)"), "{}", text);
         assert!(text.contains("updated main.rs (+1 −1)"), "{}", text);
-        // Unchanged, it's reported only as the agent's own write.
-        assert!(!text.contains("updated same.rs") && !text.contains("created same.rs"), "{}", text);
+        // Unchanged, it isn't reported.
+        assert!(!text.contains("same.rs"), "{}", text);
     }
 
     #[test]
@@ -6237,7 +6229,6 @@ mod tests {
             tokens: 0,
             activity: Some("Reading northwind-redlines.pdf".into()),
             files_dir: None,
-            agent_wrote: Vec::new(),
             whole: Vec::new(),
         });
         app.input = "".into();
@@ -6593,7 +6584,7 @@ mod tests {
         // still running stops: its session is gone.
         let runtime = tokio::runtime::Runtime::new().unwrap();
         app.entries.push(Entry::Reply(Reply::default()));
-        app.turn = Some(Turn { started: Instant::now(), task: runtime.spawn(async {}), entry: app.entries.len() - 1, tokens: 0, activity: None, files_dir: None, agent_wrote: Vec::new(), whole: Vec::new() });
+        app.turn = Some(Turn { started: Instant::now(), task: runtime.spawn(async {}), entry: app.entries.len() - 1, tokens: 0, activity: None, files_dir: None, whole: Vec::new() });
         app.apply(AppEvent::SwitchProject(Project::from_json(&project("p4", "Contracts", false))));
         assert!(app.turn.is_none());
         assert_eq!(app.project, Some(("p4".into(), "Contracts".into())));
@@ -7213,7 +7204,6 @@ mod tests {
             tokens: 40,
             activity: Some("Reading roadmap.pdf".into()),
             files_dir: None,
-            agent_wrote: Vec::new(),
             whole: Vec::new(),
         });
         let text = screen(&app, 80, 24);

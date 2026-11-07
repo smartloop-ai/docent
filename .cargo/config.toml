@@ -2,3 +2,8 @@
 # public, so a fresh clone builds with no credentials.
 [registries.smartloop]
 index = "sparse+https://dl.smartloop.ai/crates/"
+
+# The framework comes from a private git repo while its branch is unreleased:
+# fetch it with the git CLI so SSH keys work.
+[net]
+git-fetch-with-cli = true

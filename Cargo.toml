@@ -17,9 +17,10 @@ vulkan = ["smartloop/vulkan"]
 cuda = ["smartloop/cuda"]
 
 [dependencies]
-# The SLP framework, run in-process as the local agent, from Smartloop's
-# registry at dl.smartloop.ai (declared in .cargo/config.toml).
-smartloop = { version = "1.2.23", registry = "smartloop" }
+# The SLP framework, run in-process as the local agent. Built from the
+# framework branch that drops its built-in MCP servers until that's released
+# to Smartloop's registry at dl.smartloop.ai (declared in .cargo/config.toml).
+smartloop = { git = "ssh://git@github.com/smartloop-ai/smartloop.git", branch = "refactor/remove-system-mcps" }
 serde_json = "1"
 clap = { version = "4.6.7", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }

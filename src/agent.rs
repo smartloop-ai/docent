@@ -2,8 +2,7 @@
 //!
 //! `framework::launch` starts `<this exe> __agent-serve` detached; that
 //! process serves the agent API in the foreground. The agent in turn spawns
-//! its own workers (project agents, the model host, the stdio MCP system
-//! server, model probes) as `<current exe> -m <module>` or a hidden `__*`
+//! its own workers (project agents, the model host, model probes) as `<current exe> -m <module>` or a hidden `__*`
 //! subcommand, the way the `slp` binary does, so all of those forms are
 //! recognised here on the raw argv before clap sees it.
 
@@ -81,10 +80,6 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     smartloop::server::start_server(&host, port, false, true, true)
 }
 
-fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
-    Ok(tokio::runtime::Builder::new_multi_thread().enable_all().build()?)
-}
-
 /// `slp -m <module> [args...]`: the module's parser sees its own name as the
 /// program, then the remaining arguments.
 fn run_module(module: &str, args: Vec<String>) -> anyhow::Result<()> {
@@ -95,7 +90,6 @@ fn run_module(module: &str, args: Vec<String>) -> anyhow::Result<()> {
     let argv = std::iter::once(module.to_string()).chain(args);
     match module {
         "smartloop.api.project_agent" => project_agent::main(ProjectAgentArgs::parse_from(argv)),
-        "smartloop.api.mcp.system_server" => runtime()?.block_on(smartloop::api::mcp::system_server::run_stdio()),
         "smartloop.model_host" | "smartloop.model_host.__main__" => entry::run(ModelHostArgs::parse_from(argv)),
         "smartloop.model_host.bench" => bench::run(BenchArgs::parse_from(argv)),
         "smartloop.api.main" => {
@@ -110,7 +104,6 @@ fn run_module(module: &str, args: Vec<String>) -> anyhow::Result<()> {
 fn hidden_subcommand_module(name: &str) -> Option<&'static str> {
     match name {
         "__project-agent" => Some("smartloop.api.project_agent"),
-        "__system-server" => Some("smartloop.api.mcp.system_server"),
         "__model-host" => Some("smartloop.model_host"),
         "__model-host-bench" => Some("smartloop.model_host.bench"),
         "__api-server" => Some("smartloop.api.main"),
