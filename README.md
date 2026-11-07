@@ -213,8 +213,8 @@ On exit it prints the session id, to resume with `--session`.
 | `/project new <name>` | create a project and switch to it |
 | `/project import <zip>` | import an exported project and switch to it |
 | `/status` | account, model, agent and versions |
-| `/usage` | web searches and credits used this month |
-| `/upgrade` | Pro plan: 1,000 web searches a month |
+| `/usage` | credits used this month (cloud models and web search) |
+| `/upgrade` | Pro or Plus plan: more credits a month |
 | `/code [on\|off\|auto]` | whether prompts in this folder are answered with code (see [Coding](#coding)); `on` and `off` mark the folder over what its files say, `auto` unmarks it |
 | `/write [path]` | write the last reply's files that were left unwritten, or one of them |
 | `/clear` | clear the chat and start a new session |

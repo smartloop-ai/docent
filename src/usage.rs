@@ -74,16 +74,6 @@ impl SearchUsage {
         self.limit.is_some_and(|limit| self.used >= limit)
     }
 
-    /// Under `/usage`'s bar: `12 used · free plan · resets 2026-11-01`.
-    pub fn detail(&self) -> String {
-        let mut parts = vec![format!("{} used", self.used), format!("{} plan", self.plan)];
-        match (self.limit, &self.resets_on) {
-            (Some(_), Some(on)) => parts.push(format!("resets {}", on)),
-            (None, _) => parts.push("unmetered".to_string()),
-            _ => {}
-        }
-        parts.join(" · ")
-    }
 }
 
 /// The account's credits this month, as the agent's `/v1/chat/quota` relays

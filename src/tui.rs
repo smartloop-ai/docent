@@ -971,8 +971,8 @@ enum Overlay {
     Help,
     /// `/status`: rows fill in once the agent answers.
     Status(Option<Vec<(String, String)>>),
-    /// `/usage`: this month's web search allowance and credits, re-read on
-    /// opening (`loading` until the platform answers), and the week's tokens.
+    /// `/usage`: this month's credits, re-read on opening (`loading` until
+    /// the agent answers).
     Usage { loading: bool },
     /// A shell run, clicked: all it printed, under the prompt.
     Shell(usize),
@@ -2223,13 +2223,13 @@ impl App {
                     self.shell_context.push(context);
                 }
             }
-            AppEvent::Usage(usage) => {
-                self.search = usage;
+            AppEvent::Usage(usage) => self.search = usage,
+            AppEvent::Credits(credits) => {
+                self.credits = credits;
                 if let Overlay::Usage { loading, .. } = &mut self.overlay {
                     *loading = false;
                 }
             }
-            AppEvent::Credits(credits) => self.credits = credits,
             AppEvent::Account(account) => self.account = Some(account),
             AppEvent::Connections(project, servers) => {
                 if self.project.as_ref().is_some_and(|(id, _)| *id == project) {
@@ -4360,101 +4360,70 @@ impl App {
             .collect()
     }
 
-    /// `/usage`: this month's web searches and credits, as bars. Credits read
-    /// as Studio's "Plan & usage" card: the bar fills as they're spent, and
-    /// stays full and muted when they're unlimited.
+    /// `/usage`: this month's credits, one pool for cloud models and web
+    /// searches, read as Studio's "Plan & usage" card: the bar fills as
+    /// they're spent, and stays full and muted when they're unlimited.
     ///
     /// ```text
-    ///  Web search  ███████████████████████░░░░░░░  38 left of 50
-    ///              12 used · free plan · resets 2026-11-01
-    ///              /upgrade to Pro or Plus for more searches and credits a month
-    ///
     ///  Credits     ███████░░░░░░░░░░░░░░░░░░░░░░░  24% used
     ///              480 of 2,000 credits used
     ///              3 calls · 12,000 tokens · Pro · resets Dec 1
     ///              credits cover cloud models and web searches; local models are always free
+    ///              /upgrade to Plus for more credits a month
     /// ```
     fn usage_panel_lines(&self, loading: bool) -> Vec<Line<'static>> {
-        let mut lines = self.search_usage_lines(loading);
         let label = |text: &str| Span::styled(format!(" {:<12}", text), dim());
         let indent = || Span::raw(format!(" {:<12}", ""));
-        if let Some(credits) = self.credits.as_ref() {
-            // As Studio's "Plan & usage": one pool for cloud models and
-            // searches, the bar filling as it's spent; unmetered, the
-            // credits spent and no bar.
-            lines.push(Line::default());
-            let mut head = vec![label("Credits")];
-            match credits.fraction_used() {
-                Some(fraction) => {
-                    let color = if credits.exhausted() {
-                        Color::Red
-                    } else if credits.low() {
-                        Color::Yellow
-                    } else {
-                        pink()
-                    };
-                    head.push(Span::styled(progress::bar(fraction, USAGE_BAR), Style::new().fg(color)));
-                    head.push(Span::styled(format!("  {} used", credits.percent()), key_style()));
-                    if credits.exhausted() || credits.low() {
-                        let flag = if credits.exhausted() { " · allowance used" } else { " · running low" };
-                        head.push(Span::styled(flag, Style::new().fg(color)));
-                    }
-                }
-                None => {
-                    // Nothing to fill toward: a full, muted bar, as Studio draws it.
-                    head.push(Span::styled(progress::bar(1.0, USAGE_BAR), dim()));
-                    let used = credits.amounts().unwrap_or_else(|| "unlimited".to_string());
-                    head.push(Span::styled(format!("  {}", used), key_style()));
-                    if credits.amounts().is_some() {
-                        head.push(Span::styled(" · unlimited", dim()));
-                    }
-                }
-            }
-            lines.push(Line::from(head));
-            // Metered with the amounts given: what's spent of what's allowed.
-            if let Some(amounts) = credits.amounts().filter(|_| !credits.unmetered()) {
-                lines.push(Line::from(vec![indent(), Span::styled(amounts, Style::new())]));
-            }
-            lines.push(Line::from(vec![indent(), Span::styled(credits.detail(), dim())]));
-            lines.push(Line::from(vec![indent(), Span::styled(credits.note(), dim())]));
-        }
-        lines
-    }
-
-    fn search_usage_lines(&self, loading: bool) -> Vec<Line<'static>> {
-        let label = || Span::styled(format!(" {:<12}", "Web search"), dim());
-        let indent = || Span::raw(format!(" {:<12}", ""));
         let switch = (self.web_search == Some(false)).then(|| {
-            Line::from(vec![indent(), Span::styled("off for this project · ctrl+s turns it on", dim())])
+            Line::from(vec![indent(), Span::styled("web search is off for this project · ctrl+s turns it on", dim())])
         });
-        let Some(usage) = self.search.as_ref() else {
+        let Some(credits) = self.credits.as_ref() else {
             let text = if loading {
-                format!("asking api.smartloop.ai {}", self.spinner())
+                format!("asking the agent {}", self.spinner())
             } else {
                 "sign in with /login to see your usage".to_string()
             };
-            return std::iter::once(Line::from(vec![label(), Span::styled(text, dim())])).chain(switch).collect();
+            return std::iter::once(Line::from(vec![label("Credits"), Span::styled(text, dim())])).chain(switch).collect();
         };
         let mut lines = Vec::new();
-        match (usage.limit, usage.remaining()) {
-            (Some(limit), Some(left)) => {
-                // The terminal's own text color, so the bar reads on a light
-                // theme as well as a dark one.
-                let fraction = if limit == 0 { 0.0 } else { left as f64 / limit as f64 };
-                lines.push(Line::from(vec![
-                    label(),
-                    Span::raw(progress::bar(fraction, USAGE_BAR)),
-                    Span::styled(format!("  {} left", left), key_style()),
-                    Span::styled(format!(" of {}", limit), dim()),
-                ]));
+        let mut head = vec![label("Credits")];
+        match credits.fraction_used() {
+            Some(fraction) => {
+                let color = if credits.exhausted() {
+                    Color::Red
+                } else if credits.low() {
+                    Color::Yellow
+                } else {
+                    pink()
+                };
+                head.push(Span::styled(progress::bar(fraction, USAGE_BAR), Style::new().fg(color)));
+                head.push(Span::styled(format!("  {} used", credits.percent()), key_style()));
+                if credits.exhausted() || credits.low() {
+                    let flag = if credits.exhausted() { " · allowance used" } else { " · running low" };
+                    head.push(Span::styled(flag, Style::new().fg(color)));
+                }
             }
-            _ => lines.push(Line::from(vec![label(), Span::styled("unlimited", key_style())])),
+            None => {
+                // Nothing to fill toward: a full, muted bar, as Studio draws it.
+                head.push(Span::styled(progress::bar(1.0, USAGE_BAR), dim()));
+                let used = credits.amounts().unwrap_or_else(|| "unlimited".to_string());
+                head.push(Span::styled(format!("  {}", used), key_style()));
+                if credits.amounts().is_some() {
+                    head.push(Span::styled(" · unlimited", dim()));
+                }
+            }
         }
-        lines.push(Line::from(vec![indent(), Span::styled(usage.detail(), dim())]));
+        lines.push(Line::from(head));
+        // Metered with the amounts given: what's spent of what's allowed.
+        if let Some(amounts) = credits.amounts().filter(|_| !credits.unmetered()) {
+            lines.push(Line::from(vec![indent(), Span::styled(amounts, Style::new())]));
+        }
+        lines.push(Line::from(vec![indent(), Span::styled(credits.detail(), dim())]));
+        lines.push(Line::from(vec![indent(), Span::styled(credits.note(), dim())]));
         // The plans with somewhere to go: Pro and Plus for free, Plus for Pro.
-        let more = match usage.plan.as_str() {
-            "free" => Some(" to Pro or Plus for more searches and credits a month"),
-            "paid" => Some(" to Plus for more searches and credits a month"),
+        let more = match credits.plan.as_str() {
+            "free" => Some(" to Pro or Plus for more credits a month"),
+            "paid" => Some(" to Plus for more credits a month"),
             _ => None,
         };
         if let Some(more) = more {
@@ -5178,8 +5147,8 @@ const COMMANDS: [(&str, &str); 16] = [
     ("/write", "write the last reply's files left unwritten"),
     ("/tasks", "the commands still running: pick one to see its output or stop it"),
     ("/stop", "stop the shell commands still running; /stop <word> those with word in them"),
-    ("/usage", "web searches and credits used this month"),
-    ("/upgrade", "Pro plan: 1,000 web searches a month"),
+    ("/usage", "credits used this month"),
+    ("/upgrade", "Pro or Plus plan: more credits a month"),
     ("/clear", "clear the chat and start a new session"),
     ("/quit", "quit"),
 ];
@@ -5269,8 +5238,8 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/status", "account, model, agent and versions"),
         ("/login", "sign in in the browser (--token to paste one)"),
         ("/logout", "log out"),
-        ("/usage", "web searches and credits used this month"),
-        ("/upgrade", "Pro plan: 1,000 web searches a month"),
+        ("/usage", "credits used this month"),
+        ("/upgrade", "Pro or Plus plan: more credits a month"),
         ("/clear", "clear the chat and start a new session"),
         ("/<skill> [prompt]", "run one of the project's skills"),
         ("!<command>", "run a shell command; the next prompt shares its output"),
@@ -6476,34 +6445,40 @@ mod tests {
     }
 
     #[test]
-    fn usage_shows_whats_left_as_a_bar() {
+    fn usage_shows_only_credits_and_how_to_get_more() {
         let mut app = app();
         app.phase = Phase::Ready;
         app.project = Some(("p1".into(), "Default".into()));
         app.overlay = Overlay::Usage { loading: true };
-        assert!(screen(&app, 80, 24).contains("asking api.smartloop.ai"));
+        assert!(screen(&app, 80, 24).contains("asking the agent"));
         app.apply(AppEvent::Usage(Some(SearchUsage {
             used: 12,
             limit: Some(50),
             plan: "free".into(),
             resets_on: Some("2026-11-01".into()),
         })));
-        let text = screen(&app, 80, 24);
-        for expected in [
-            "Web search",
-            "38 left of 50",
-            "12 used · free plan · resets 2026-11-01",
-            "/upgrade to Pro or Plus for more searches and credits a month",
-        ] {
+        app.apply(AppEvent::Credits(Some(CreditUsage {
+            percent_used: Some(24.0),
+            used: None,
+            limit: None,
+            plan: "free".into(),
+            resets_at: None,
+            requests: 3,
+            tokens: 12_000,
+        })));
+        let text = screen(&app, 100, 24);
+        assert!(!text.contains("Web search"), "{}", text);
+        assert!(!text.contains("38 left of 50"), "{}", text);
+        for expected in ["Credits", "24% used", "/upgrade to Pro or Plus for more credits a month"] {
             assert!(text.contains(expected), "{}\n{}", expected, text);
         }
         // ctrl+s turned search off: say so, and how to turn it back on.
         app.apply(AppEvent::WebSearch { enabled: false, toggled: true });
-        let text = screen(&app, 80, 30);
-        assert!(text.contains("off for this project · ctrl+s turns it on"), "{}", text);
+        let text = screen(&app, 100, 30);
+        assert!(text.contains("web search is off for this project · ctrl+s turns it on"), "{}", text);
         // Signed out: nothing to show but how to sign in.
-        app.apply(AppEvent::Usage(None));
-        assert!(screen(&app, 80, 24).contains("sign in with /login"));
+        app.apply(AppEvent::Credits(None));
+        assert!(screen(&app, 100, 24).contains("sign in with /login"));
     }
 
     #[test]
@@ -6524,7 +6499,12 @@ mod tests {
         // Metered with the amounts: the share, then what's spent of what's allowed.
         app.apply(AppEvent::Credits(Some(credits(Some(1_700.0), Some(2_000.0), Some(85.0), "paid"))));
         let text = screen(&app, 100, 30);
-        for expected in ["85% used · running low", "1,700 of 2,000 credits used", "316 calls · 11,848,606 tokens · Pro"] {
+        for expected in [
+            "85% used · running low",
+            "1,700 of 2,000 credits used",
+            "316 calls · 11,848,606 tokens · Pro",
+            "/upgrade to Plus for more credits a month",
+        ] {
             assert!(text.contains(expected), "{}\n{}", expected, text);
         }
         // Unmetered: the credits spent, and no bar.
