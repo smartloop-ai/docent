@@ -48,7 +48,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::chat::{self, ChatEvent, TurnStats};
 use crate::progress::{self, Steps, format_duration, format_size};
-use crate::usage::{CreditUsage, SearchUsage, TokenStats};
+use crate::usage::{CreditUsage, SearchUsage};
 use crate::{ModelRow, docent, files, framework, mcp};
 
 const LABEL_WIDTH: usize = 28;
@@ -973,7 +973,7 @@ enum Overlay {
     Status(Option<Vec<(String, String)>>),
     /// `/usage`: this month's web search allowance and credits, re-read on
     /// opening (`loading` until the platform answers), and the week's tokens.
-    Usage { loading: bool, tokens: TokenStats },
+    Usage { loading: bool },
     /// A shell run, clicked: all it printed, under the prompt.
     Shell(usize),
     /// `ctrl+b`: the commands still running, one selected from the
@@ -998,10 +998,6 @@ struct Turn {
     tokens: u64,
     /// The latest `chat.status` message, for the status line.
     activity: Option<String>,
-    /// The agent is indexing the folder for this turn: shown on the status
-    /// line's own indexing row, as a background pass is, not repeated on
-    /// the turn's line.
-    indexing: bool,
     /// Where the files its reply gives are written: only for a turn asked
     /// to make them.
     files_dir: Option<std::path::PathBuf>,
@@ -1582,7 +1578,6 @@ impl App {
             entry,
             tokens: 0,
             activity: None,
-            indexing: false,
             files_dir,
             whole,
             agent_wrote: Vec::new(),
@@ -2502,10 +2497,9 @@ impl App {
                 if step == "file-write" {
                     turn.agent_wrote.push(message.clone());
                 }
-                // Indexing shows on the status line's own row, where a
-                // background pass shows too; the turn's line keeps what it
-                // was doing.
-                turn.indexing = step == "index";
+                // The agent's indexing for the turn isn't shown: the turn's
+                // line keeps what it was doing.
+                let indexing = step == "index";
                 if step == "streaming" {
                     // The agent's "Generating response" says nothing a
                     // reader needs; the model writing the answer does.
@@ -2513,7 +2507,7 @@ impl App {
                         Some(model) => format!("Answering with {}", model),
                         None => "Answering".to_string(),
                     });
-                } else if !turn.indexing {
+                } else if !indexing {
                     turn.activity = Some(message.trim_end_matches(['.', '…']).to_string());
                 }
             }
@@ -2902,7 +2896,7 @@ impl App {
     }
 
     fn open_usage(&mut self) {
-        self.overlay = Overlay::Usage { loading: true, tokens: TokenStats::load() };
+        self.overlay = Overlay::Usage { loading: true };
         self.load_usage();
     }
 
@@ -3549,9 +3543,9 @@ impl App {
                 let block = panel(&bar_hints(&[("esc", "close")]));
                 frame.render_widget(Paragraph::new(self.status_panel_lines(rows)).block(block), footer);
             }
-            Overlay::Usage { loading, tokens } => {
+            Overlay::Usage { loading } => {
                 let block = panel(&bar_hints(&[("esc", "close")]));
-                frame.render_widget(Paragraph::new(self.usage_panel_lines(*loading, tokens)).block(block), footer);
+                frame.render_widget(Paragraph::new(self.usage_panel_lines(*loading)).block(block), footer);
             }
             Overlay::Shell(id) => self.draw_shell(frame, footer, *id),
             Overlay::Jobs { selected } => self.draw_jobs(frame, footer, *selected),
@@ -3572,7 +3566,7 @@ impl App {
             Overlay::Projects { .. } => 1,
             Overlay::Help => help_lines().len(),
             Overlay::Status(rows) => self.status_panel_lines(rows).len(),
-            Overlay::Usage { loading, tokens } => self.usage_panel_lines(*loading, tokens).len(),
+            Overlay::Usage { loading } => self.usage_panel_lines(*loading).len(),
             // Its command, all it printed, and how it ended or that it runs.
             Overlay::Shell(id) => self.shell_of(*id).map_or(1, |s| s.command.lines().count() + s.output.lines().count() + 1),
             Overlay::Jobs { .. } => self.jobs.len().max(1),
@@ -3594,6 +3588,21 @@ impl App {
                 Span::styled(format!(" ({})", detail), dim()),
             ])
         };
+        // Indexing has a row only between turns: during one, the row says
+        // what the turn is doing, and the folder's sync holds off.
+        let indexing_now = self.agent.as_ref().is_some_and(|a| a.state == "indexing")
+            || self.indexing_until.is_some_and(|until| Instant::now() < until);
+        let between_turns = matches!(self.phase, Phase::Ready) && self.turn.is_none();
+        let indexing = (between_turns && (self.syncing > 0 || indexing_now)).then(|| {
+            // Counts up to what was pushed, as the agent gets through it.
+            let left = if self.syncing > 0 { self.syncing } else { self.agent.as_ref().map_or(0, |a| a.pending) };
+            let total = self.indexing_total.max(left);
+            match (left, total) {
+                (0, _) => "Indexing documents".to_string(),
+                (_, 1) => "Indexing 1 document".to_string(),
+                (left, total) => format!("Indexing {} of {} documents", total - left, total),
+            }
+        });
         match (&self.phase, &self.turn) {
             (Phase::Setup, _) if self.setup.failure.is_none() => {
                 let (what, took) = match self.setup.active() {
@@ -3616,19 +3625,7 @@ impl App {
             }
             _ => {}
         }
-        // A turn's own indexing shows here too, on the one row.
-        let indexing = self.agent.as_ref().is_some_and(|a| a.state == "indexing")
-            || self.indexing_until.is_some_and(|until| Instant::now() < until)
-            || self.turn.as_ref().is_some_and(|turn| turn.indexing);
-        if matches!(self.phase, Phase::Ready) && (self.syncing > 0 || indexing) {
-            // Counts up to what was pushed, as the agent gets through it.
-            let left = if self.syncing > 0 { self.syncing } else { self.agent.as_ref().map_or(0, |a| a.pending) };
-            let total = self.indexing_total.max(left);
-            let what = match (left, total) {
-                (0, _) => "Indexing documents".to_string(),
-                (_, 1) => "Indexing 1 document".to_string(),
-                (left, total) => format!("Indexing {} of {} documents", total - left, total),
-            };
+        if let Some(what) = indexing {
             lines.push(Line::from(vec![spinner.clone(), Span::styled(format!("{}…", what), dim())]));
         }
         for d in self.downloads.iter().filter(|d| !d.finished) {
@@ -4189,7 +4186,8 @@ impl App {
             Some(Err(e)) => return frame.render_widget(Paragraph::new(e.clone()).block(block).wrap(Wrap { trim: false }), area),
             Some(Ok(list)) => list,
         };
-        let name_width = list.iter().map(|m| m.name.chars().count()).max().unwrap_or(0) + 2;
+        let label = |m: &ModelRow| if m.cloud { format!("{} ☁", m.name) } else { m.name.clone() };
+        let name_width = list.iter().map(|m| label(m).chars().count()).max().unwrap_or(0) + 2;
         let lines: Vec<Line> = list
             .iter()
             .enumerate()
@@ -4198,7 +4196,7 @@ impl App {
                 let mut spans = vec![
                     Span::styled(if chosen { "› " } else { "  " }, Style::new().fg(pink()).bold()),
                     Span::styled(
-                        format!("{:<w$}", m.name, w = name_width),
+                        format!("{:<w$}", label(m), w = name_width),
                         if chosen { Style::new().fg(pink()).bold() } else { Style::new() },
                     ),
                 ];
@@ -4209,6 +4207,7 @@ impl App {
                     }
                     Some(_) => Span::styled(format!("downloading {}", self.spinner()), Style::new().fg(pink())),
                     None if m.enabled => Span::styled("✓ enabled", Style::new().fg(Color::Green)),
+                    None if m.cloud => Span::styled("disabled", dim()),
                     None if m.downloaded => Span::styled("downloaded", dim()),
                     None => Span::styled("not downloaded", dim()),
                 };
@@ -4361,84 +4360,64 @@ impl App {
             .collect()
     }
 
-    /// `/usage`: how many web searches and credits are left this month, as
-    /// bars that empty as they're spent, then the week's tokens and what
-    /// they'd have cost on a hosted model, as on the web app's dashboard.
+    /// `/usage`: this month's web searches and credits, as bars. Credits read
+    /// as Studio's "Plan & usage" card: the bar fills as they're spent, and
+    /// stays full and muted when they're unlimited.
     ///
     /// ```text
     ///  Web search  ███████████████████████░░░░░░░  38 left of 50
     ///              12 used · free plan · resets 2026-11-01
     ///              /upgrade to Pro or Plus for more searches and credits a month
     ///
-    ///  Credits     ███████████████████████░░░░░░░  76% left
-    ///              3 calls · 12,000 tokens · paid plan · resets 2026-11-01
-    ///              cloud models cost credits by model and load; local ones cost none
-    ///
-    ///  Tokens      45,210 in the last 7 days  ▁▁▃▂█▅▁
-    ///              40,120 in · 5,090 out · on this machine
-    ///
-    ///  Cost saved  $0.1512 in the last 7 days
-    ///              vs. a hosted frontier model at $2.50/M in, $10/M out
+    ///  Credits     ███████░░░░░░░░░░░░░░░░░░░░░░░  24% used
+    ///              480 of 2,000 credits used
+    ///              3 calls · 12,000 tokens · Pro · resets Dec 1
+    ///              credits cover cloud models and web searches; local models are always free
     /// ```
-    fn usage_panel_lines(&self, loading: bool, tokens: &TokenStats) -> Vec<Line<'static>> {
+    fn usage_panel_lines(&self, loading: bool) -> Vec<Line<'static>> {
         let mut lines = self.search_usage_lines(loading);
         let label = |text: &str| Span::styled(format!(" {:<12}", text), dim());
         let indent = || Span::raw(format!(" {:<12}", ""));
-        if let Some(credits) = self.credits.as_ref().filter(|_| self.search.is_some()) {
-            // Credits sit under the searches: the same month, the same plan.
-            // The platform gives every account the share spent and admins
-            // the amounts, so the bar is drawn from the share.
+        if let Some(credits) = self.credits.as_ref() {
+            // As Studio's "Plan & usage": one pool for cloud models and
+            // searches, the bar filling as it's spent; unmetered, the
+            // credits spent and no bar.
             lines.push(Line::default());
-            match credits.fraction_left() {
+            let mut head = vec![label("Credits")];
+            match credits.fraction_used() {
                 Some(fraction) => {
-                    let left = match (credits.remaining(), credits.limit) {
-                        (Some(left), Some(limit)) => {
-                            format!("  {} left of {}", crate::usage::thousands(left), crate::usage::thousands(limit))
-                        }
-                        _ => format!("  {}% left", (fraction * 100.0).round() as u64),
+                    let color = if credits.exhausted() {
+                        Color::Red
+                    } else if credits.low() {
+                        Color::Yellow
+                    } else {
+                        pink()
                     };
-                    lines.push(Line::from(vec![
-                        label("Credits"),
-                        Span::raw(progress::bar(fraction, USAGE_BAR)),
-                        Span::styled(left, key_style()),
-                    ]));
+                    head.push(Span::styled(progress::bar(fraction, USAGE_BAR), Style::new().fg(color)));
+                    head.push(Span::styled(format!("  {} used", credits.percent()), key_style()));
+                    if credits.exhausted() || credits.low() {
+                        let flag = if credits.exhausted() { " · allowance used" } else { " · running low" };
+                        head.push(Span::styled(flag, Style::new().fg(color)));
+                    }
                 }
-                None => lines.push(Line::from(vec![label("Credits"), Span::styled("unlimited", key_style())])),
+                None => {
+                    // Nothing to fill toward: a full, muted bar, as Studio draws it.
+                    head.push(Span::styled(progress::bar(1.0, USAGE_BAR), dim()));
+                    let used = credits.amounts().unwrap_or_else(|| "unlimited".to_string());
+                    head.push(Span::styled(format!("  {}", used), key_style()));
+                    if credits.amounts().is_some() {
+                        head.push(Span::styled(" · unlimited", dim()));
+                    }
+                }
+            }
+            lines.push(Line::from(head));
+            // Metered with the amounts given: what's spent of what's allowed.
+            if let Some(amounts) = credits.amounts().filter(|_| !credits.unmetered()) {
+                lines.push(Line::from(vec![indent(), Span::styled(amounts, Style::new())]));
             }
             lines.push(Line::from(vec![indent(), Span::styled(credits.detail(), dim())]));
-            let note = credits.why_off().unwrap_or("cloud models cost credits by model and load; local ones cost none");
-            lines.push(Line::from(vec![indent(), Span::styled(note, dim())]));
+            lines.push(Line::from(vec![indent(), Span::styled(credits.note(), dim())]));
         }
-        let days = format!(" in the last {} days", crate::usage::TOKEN_DAYS);
-        // A blank line between sections, so each reads on its own.
-        lines.push(Line::default());
-        lines.push(Line::from(vec![
-            label("Tokens"),
-            Span::styled(crate::usage::thousands(tokens.total()), key_style()),
-            Span::styled(days.clone(), dim()),
-            Span::raw(format!("  {}", tokens.sparkline())),
-        ]));
-        lines.push(Line::from(vec![
-            indent(),
-            Span::styled(
-                format!(
-                    "{} in · {} out · on this machine",
-                    crate::usage::thousands(tokens.prompt()),
-                    crate::usage::thousands(tokens.completion())
-                ),
-                dim(),
-            ),
-        ]));
-        lines.push(Line::default());
-        lines.push(Line::from(vec![
-            label("Cost saved"),
-            Span::styled(format!("${:.4}", tokens.saved()), key_style()),
-            Span::styled(days, dim()),
-        ]));
-        lines.push(Line::from(vec![
-            indent(),
-            Span::styled("vs. a hosted frontier model at $2.50/M in, $10/M out", dim()),
-        ]));
         lines
     }
 
@@ -5199,7 +5178,7 @@ const COMMANDS: [(&str, &str); 16] = [
     ("/write", "write the last reply's files left unwritten"),
     ("/tasks", "the commands still running: pick one to see its output or stop it"),
     ("/stop", "stop the shell commands still running; /stop <word> those with word in them"),
-    ("/usage", "web searches and credits left, tokens and cost saved"),
+    ("/usage", "web searches and credits used this month"),
     ("/upgrade", "Pro plan: 1,000 web searches a month"),
     ("/clear", "clear the chat and start a new session"),
     ("/quit", "quit"),
@@ -5290,7 +5269,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/status", "account, model, agent and versions"),
         ("/login", "sign in in the browser (--token to paste one)"),
         ("/logout", "log out"),
-        ("/usage", "web searches and credits left, tokens and cost saved"),
+        ("/usage", "web searches and credits used this month"),
         ("/upgrade", "Pro plan: 1,000 web searches a month"),
         ("/clear", "clear the chat and start a new session"),
         ("/<skill> [prompt]", "run one of the project's skills"),
@@ -5439,7 +5418,7 @@ mod tests {
     }
 
     #[test]
-    fn indexing_for_the_turn_shows_on_the_status_row_not_the_turns_line() {
+    fn indexing_is_not_shown_during_a_turn() {
         let mut app = app();
         app.phase = Phase::Ready;
         let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 1, pending: 0 };
@@ -5452,24 +5431,24 @@ mod tests {
             entry: app.entries.len() - 1,
             tokens: 0,
             activity: None,
-            indexing: false,
             files_dir: None,
             agent_wrote: Vec::new(),
             whole: Vec::new(),
         });
         app.chat_event(ChatEvent::Status { step: "index".into(), message: "Reading Testamento ejemplo.pdf".into() });
 
-        // The header's row says it; the turn's line doesn't repeat it.
+        // The turn's row alone, with the agent indexing too: no file, no
+        // "Indexing".
         let shown = screen(&app, 80, 24);
-        assert!(shown.contains("Indexing documents…"), "{}", shown);
+        assert!(shown.contains("Thinking…"), "{}", shown);
+        assert!(!shown.contains("Indexing"), "{}", shown);
         assert!(!shown.contains("Reading Testamento ejemplo.pdf"), "{}", shown);
-        assert!(shown.contains("Thinking"), "{}", shown);
 
-        // Past indexing, the turn's line follows the agent again.
+        // Past indexing, the turn's row follows the agent.
         app.chat_event(ChatEvent::Status { step: "explore".into(), message: "Searching documents".into() });
         let shown = screen(&app, 80, 24);
         assert!(shown.contains("Searching documents…"), "{}", shown);
-        assert!(shown.contains("Indexing documents…"), "{}", shown);
+        assert!(!shown.contains("Indexing documents…"), "{}", shown);
 
         // The answer being written says which model writes it, not the
         // agent's "Generating response".
@@ -5962,7 +5941,6 @@ mod tests {
                 entry: app.entries.len() - 1,
                 tokens: 0,
                 activity: None,
-                indexing: false,
                 files_dir: Some(dir.path().to_path_buf()),
                 agent_wrote: Vec::new(),
                 whole: Vec::new(),
@@ -6151,6 +6129,7 @@ mod tests {
             accessible: true,
             downloaded: true,
             enabled: true,
+            cloud: false,
         }];
         app.overlay = Overlay::Models { rows: Some(Ok(rows)), selected: 0 };
         let text = screen(&app, 100, 24);
@@ -6337,7 +6316,6 @@ mod tests {
             entry: 3,
             tokens: 0,
             activity: Some("Reading northwind-redlines.pdf".into()),
-            indexing: false,
             files_dir: None,
             agent_wrote: Vec::new(),
             whole: Vec::new(),
@@ -6502,7 +6480,7 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         app.project = Some(("p1".into(), "Default".into()));
-        app.overlay = Overlay::Usage { loading: true, tokens: TokenStats { days: vec![(0, 0), (0, 0), (0, 0), (0, 0), (500, 50), (0, 0), (1_000_000, 100_000)] } };
+        app.overlay = Overlay::Usage { loading: true };
         assert!(screen(&app, 80, 24).contains("asking api.smartloop.ai"));
         app.apply(AppEvent::Usage(Some(SearchUsage {
             used: 12,
@@ -6516,9 +6494,6 @@ mod tests {
             "38 left of 50",
             "12 used · free plan · resets 2026-11-01",
             "/upgrade to Pro or Plus for more searches and credits a month",
-            "Tokens      1,100,550 in the last 7 days  ▁▁▁▁▂▁█",
-            "1,000,500 in · 100,050 out · on this machine",
-            "Cost saved  $3.5018 in the last 7 days",
         ] {
             assert!(text.contains(expected), "{}\n{}", expected, text);
         }
@@ -6529,6 +6504,34 @@ mod tests {
         // Signed out: nothing to show but how to sign in.
         app.apply(AppEvent::Usage(None));
         assert!(screen(&app, 80, 24).contains("sign in with /login"));
+    }
+
+    #[test]
+    fn usage_shows_credits_used_of_what_is_allowed() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.overlay = Overlay::Usage { loading: false };
+        let credits = |used, limit, percent_used, plan: &str| CreditUsage {
+            percent_used,
+            used,
+            limit,
+            plan: plan.into(),
+            resets_at: None,
+            requests: 316,
+            tokens: 11_848_606,
+        };
+        // Metered with the amounts: the share, then what's spent of what's allowed.
+        app.apply(AppEvent::Credits(Some(credits(Some(1_700.0), Some(2_000.0), Some(85.0), "paid"))));
+        let text = screen(&app, 100, 30);
+        for expected in ["85% used · running low", "1,700 of 2,000 credits used", "316 calls · 11,848,606 tokens · Pro"] {
+            assert!(text.contains(expected), "{}\n{}", expected, text);
+        }
+        // Unmetered: the credits spent, and no bar.
+        app.apply(AppEvent::Credits(Some(credits(Some(565.66), None, None, "admin"))));
+        let text = screen(&app, 100, 30);
+        assert!(text.contains("Credits     ██████████████████████████████  566 credits used · unlimited"), "{}", text);
+        assert!(text.contains("unlimited credits for cloud models and web searches"), "{}", text);
     }
 
     #[test]
@@ -6659,7 +6662,7 @@ mod tests {
         // still running stops: its session is gone.
         let runtime = tokio::runtime::Runtime::new().unwrap();
         app.entries.push(Entry::Reply(Reply::default()));
-        app.turn = Some(Turn { started: Instant::now(), task: runtime.spawn(async {}), entry: app.entries.len() - 1, tokens: 0, activity: None, indexing: false, files_dir: None, agent_wrote: Vec::new(), whole: Vec::new() });
+        app.turn = Some(Turn { started: Instant::now(), task: runtime.spawn(async {}), entry: app.entries.len() - 1, tokens: 0, activity: None, files_dir: None, agent_wrote: Vec::new(), whole: Vec::new() });
         app.apply(AppEvent::SwitchProject(Project::from_json(&project("p4", "Contracts", false))));
         assert!(app.turn.is_none());
         assert_eq!(app.project, Some(("p4".into(), "Contracts".into())));
@@ -6704,14 +6707,17 @@ mod tests {
             accessible: true,
             downloaded,
             enabled,
+            cloud: false,
         };
+        let cloud = ModelRow { cloud: true, ..model("sonnet", false, false) };
         app.overlay = Overlay::Models {
-            rows: Some(Ok(vec![model("gemma4-e4b", false, false), model("qwen3.5-2b", true, true)])),
+            rows: Some(Ok(vec![model("gemma4-e4b", false, false), model("qwen3.5-2b", true, true), cloud])),
             selected: 1,
         };
         let text = screen(&app, 80, 24);
         assert!(text.contains("  gemma4-e4b  not downloaded  general, vision"), "{}", text);
         assert!(text.contains("› qwen3.5-2b  ✓ enabled"), "{}", text);
+        assert!(text.contains("  sonnet ☁    disabled"), "{}", text);
         assert!(!text.contains("Capabilities") && !text.contains("Models"), "{}", text);
     }
 
@@ -7255,7 +7261,6 @@ mod tests {
             entry: 1,
             tokens: 40,
             activity: Some("Reading roadmap.pdf".into()),
-            indexing: false,
             files_dir: None,
             agent_wrote: Vec::new(),
             whole: Vec::new(),

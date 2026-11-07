@@ -479,6 +479,8 @@ pub struct ModelRow {
     pub accessible: bool,
     pub downloaded: bool,
     pub enabled: bool,
+    /// A cloud (remote) model: nothing to download, only on or off.
+    pub cloud: bool,
 }
 
 /// The catalog (`/v1/models`) joined with the project's state. A model the
@@ -506,6 +508,7 @@ pub fn model_rows(client: &Client, project_id: &str) -> Result<Vec<ModelRow>, St
                 accessible: model["is_accessible"].as_bool() != Some(false),
                 downloaded: flag("downloaded"),
                 enabled: flag("enabled"),
+                cloud: model["type"].as_str() == Some("remote"),
                 name,
             }
         })
