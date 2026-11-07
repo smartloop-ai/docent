@@ -21,7 +21,7 @@ pub enum ChatEvent {
 }
 
 /// A finished turn's size and time.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct TurnStats {
     pub tokens: u64,
     pub elapsed: Duration,

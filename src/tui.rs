@@ -610,6 +610,8 @@ struct Piece {
     path: Option<String>,
     whole: bool,
     key: String,
+    /// Laid out while the reply was coming in, its files only named.
+    pending: bool,
     lines: Vec<Line<'static>>,
 }
 
@@ -625,9 +627,10 @@ struct Reply {
     stats: Option<TurnStats>,
     /// Why it ended early: stopped by the user, or an error.
     ended: Option<String>,
-    /// `text` as last drawn, with its length and width: the conversation
-    /// redraws every tick, and only a reply still streaming changes.
-    rendered: std::cell::RefCell<Option<(usize, u16, Vec<Line<'static>>)>>,
+    /// `text` as last drawn, with its length and width and whether it was
+    /// still coming in: the conversation redraws every tick, and only a
+    /// reply still streaming changes, or one that's just ended.
+    rendered: std::cell::RefCell<Option<(usize, u16, bool, Vec<Line<'static>>)>>,
     /// When it was last laid out: a reply streaming in is laid out again
     /// at most once a tick, not once a chunk.
     rendered_at: std::cell::Cell<Option<Instant>>,
@@ -653,7 +656,7 @@ impl Reply {
     /// `code_lines`.
     fn body(&self, width: u16) -> Vec<Line<'static>> {
         self.layout(width);
-        self.rendered.borrow().as_ref().map(|(_, _, lines)| lines.clone()).unwrap_or_default()
+        self.rendered.borrow().as_ref().map(|(_, _, _, lines)| lines.clone()).unwrap_or_default()
     }
 
     /// Lay `text` out at `width` for `body`, unless it's laid out as it
@@ -666,12 +669,16 @@ impl Reply {
         let fresh = self.rendered_at.get().is_some_and(|at| at.elapsed() < TICK);
         match &*rendered {
             // By the length as it came, so a line just ended counts.
-            Some((len, at, _)) if *len == self.text.len() && *at == width => {}
+            Some((len, at, was, _)) if *len == self.text.len() && *at == width && *was == streaming => {}
             // Still coming in, and laid out a moment ago: that will do until
             // the next tick.
-            Some((_, at, _)) if streaming && fresh && *at == width => {}
+            Some((_, at, true, _)) if streaming && fresh && *at == width => {}
             _ => {
                 self.rendered_at.set(Some(Instant::now()));
+                // While the reply comes in, its files are only named: their
+                // changes show once it's all in, as a coding harness shows
+                // an edit once it's made.
+                let pending = streaming;
                 let blocks = if self.root.is_some() { files::blocks(text) } else { Vec::new() };
                 let mut lines: Vec<Line<'static>> = Vec::new();
                 let mut pieces = self.pieces.borrow_mut();
@@ -700,17 +707,25 @@ impl Reply {
                     });
                     let whole = path.as_ref().is_some_and(|p| self.whole.contains(p));
                     let part = match pieces.get(i) {
-                        Some(p) if p.start == start && p.width == width && p.path == path && p.whole == whole && p.key == key => {
+                        Some(p)
+                            if p.start == start
+                                && p.width == width
+                                && p.path == path
+                                && p.whole == whole
+                                && p.key == key
+                                && p.pending == pending =>
+                        {
                             p.lines.clone()
                         }
                         _ => match (code, file) {
+                            (true, Some(file)) if pending => vec![writing_line(&file.path, &file.content, false)],
                             (true, Some(file)) => self.file_part(&file.path, &file.content, false, streaming, &segment, width),
-                            (true, None) if !docs.is_empty() => self.heredoc_part(&segment, start, &docs, width),
+                            (true, None) if !docs.is_empty() => self.heredoc_part(&segment, start, &docs, pending, width),
                             (true, None) => code_lines(&segment, width),
                             (false, _) => prose_lines(&segment, width),
                         },
                     };
-                    laid.push(Piece { start, width, path, whole, key, lines: part.clone() });
+                    laid.push(Piece { start, width, path, whole, key, pending, lines: part.clone() });
                     if part.is_empty() {
                         continue;
                     }
@@ -720,7 +735,7 @@ impl Reply {
                     lines.extend(part);
                 }
                 *pieces = laid;
-                *rendered = Some((self.text.len(), width, lines));
+                *rendered = Some((self.text.len(), width, streaming, lines));
             }
         }
     }
@@ -754,7 +769,7 @@ impl Reply {
     /// A shell block, `segment` from line `start` of the reply, whose
     /// heredocs `docs` write files: each heredoc as its file's change, the
     /// commands around them as code.
-    fn heredoc_part(&self, segment: &str, start: usize, docs: &[&files::Block], width: u16) -> Vec<Line<'static>> {
+    fn heredoc_part(&self, segment: &str, start: usize, docs: &[&files::Block], pending: bool, width: u16) -> Vec<Line<'static>> {
         let lines: Vec<&str> = segment.lines().collect();
         let opener = lines.first().copied().unwrap_or("```");
         let fence = files::opening_fence(opener).map_or_else(|| "```".to_string(), |(f, _)| f);
@@ -782,7 +797,12 @@ impl Reply {
             let to = (doc.end - start).clamp(from, body_end);
             push(&mut out, shell(at, from));
             let code = format!("{}\n{}\n{}", opener, lines[from..to].join("\n"), fence);
-            push(&mut out, self.file_part(&doc.file.path, &doc.file.content, doc.append, !doc.closed, &code, width));
+            let part = if pending {
+                vec![writing_line(&doc.file.path, &doc.file.content, doc.append)]
+            } else {
+                self.file_part(&doc.file.path, &doc.file.content, doc.append, !doc.closed, &code, width)
+            };
+            push(&mut out, part);
             at = to;
         }
         push(&mut out, shell(at, body_end));
@@ -795,6 +815,18 @@ impl Reply {
         let root = self.root.as_ref()?;
         self.olds.borrow_mut().entry(path.to_string()).or_insert_with(|| std::fs::read_to_string(root.join(path)).ok()).clone()
     }
+}
+
+/// A file a reply still coming in gives, named with its lines so far:
+/// its change shows once the reply is in.
+fn writing_line(path: &str, content: &str, append: bool) -> Line<'static> {
+    let lines = content.lines().count();
+    Line::from(vec![
+        Span::styled("● ", dim()),
+        Span::styled(if append { "Adding to " } else { "Writing " }, dim()),
+        Span::styled(path.to_string(), Style::new().bold()),
+        Span::styled(format!(" · {} line{}", lines, if lines == 1 { "" } else { "s" }), dim()),
+    ])
 }
 
 /// `text` split into its prose and its fenced code blocks, in order, each
@@ -7003,26 +7035,49 @@ mod tests {
         std::fs::write(dir.path().join("main.rs"), "fn main() {\n    old();\n}\n").unwrap();
         let mut reply = Reply { root: Some(dir.path().to_path_buf()), ..Default::default() };
         let shown = |reply: &Reply| reply.body(40).iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        // While the reply comes in, the file is only named, with its lines.
         reply.text = "Here:\n\n`main.rs`\n```rust\nfn main() {\n    ne".into();
-        assert!(shown(&reply).contains("    ne"));
-        // More of the same line: the diff isn't redone.
+        assert!(shown(&reply).contains("Writing main.rs · 2 lines"), "{}", shown(&reply));
+        // More of the same line: it isn't laid out again.
         reply.text.push_str("w();");
         reply.rendered_at.set(None);
-        assert!(!shown(&reply).contains("new();"));
-        // The line done, it is.
-        reply.text.push('\n');
+        assert!(shown(&reply).contains("· 2 lines"));
+        // Another line done, it is.
+        reply.text.push_str("\n}\n");
         reply.rendered_at.set(None);
-        assert!(shown(&reply).contains("new();"));
+        assert!(shown(&reply).contains("· 3 lines"), "{}", shown(&reply));
+        assert!(!shown(&reply).contains("new();"));
+        // The reply in, its change shows.
+        reply.text.push_str("```\n");
+        reply.stats = Some(TurnStats::default());
+        assert!(shown(&reply).contains("new();"), "{}", shown(&reply));
         // The prose before it is kept as it was laid out.
         assert_eq!(reply.pieces.borrow()[0].key, "Here:\n\n`main.rs`");
     }
 
     #[test]
-    fn a_reply_making_files_shows_each_as_its_change_while_it_streams() {
+    fn a_reply_making_files_shows_each_as_its_change_once_its_in() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.rs"), "fn main() {\n    old();\n}\n").unwrap();
         let mut reply = Reply { root: Some(dir.path().to_path_buf()), ..Default::default() };
-        // Streaming: the block is open, and the old file's end isn't gone yet.
+        // Streaming, the files are only named, heredocs too, with the
+        // commands around them.
+        reply.text = "Here:\n\n```sh\ncat > main.rs <<'EOF'\nfn main() {\n    new();\n}\nEOF\ngit add -A\ncat > lib.rs <<'EOF'\npub".into();
+        let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
+        assert!(rows.contains(&"● Writing main.rs · 3 lines".to_string()), "{:?}", rows);
+        assert!(rows.contains(&"● Writing lib.rs · 1 line".to_string()), "{:?}", rows);
+        assert!(rows.iter().any(|r| r.contains("git add -A")), "{:?}", rows);
+        assert!(!rows.iter().any(|r| r.contains("new();")), "{:?}", rows);
+        // In, each heredoc is its change.
+        reply.text.push_str(" fn l() {}\nEOF\n```\n");
+        reply.stats = Some(TurnStats::default());
+        let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
+        assert!(rows.contains(&"← main.rs  +1 −1".to_string()), "{:?}", rows);
+        assert!(rows.contains(&"# lib.rs  +1".to_string()), "{:?}", rows);
+        assert!(rows.iter().any(|r| r.contains("git add -A")), "{:?}", rows);
+        // Cut short with its block still open, the old file's end isn't
+        // gone yet.
+        let mut reply = Reply { root: Some(dir.path().to_path_buf()), ended: Some("stopped".into()), ..Default::default() };
         reply.text = "Here:\n\n`main.rs`\n```rust\nfn main() {\n    new();".into();
         let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
         let at = |rows: &[String]| rows.iter().position(|r| r == "← main.rs  +1 −1").unwrap_or_else(|| panic!("{:?}", rows));
@@ -7032,6 +7087,8 @@ mod tests {
         assert_eq!(rows[h + 1..h + 5], ["  @@ -1,2 +1,2 @@", "   1  1  fn main() {", "   2    -    old();", "      2 +    new();"]);
         assert!(!rows.iter().any(|r| r.contains("-}")), "{:?}", rows);
         // Closed: the whole change. A new file is all additions.
+        reply.ended = None;
+        reply.stats = Some(TurnStats::default());
         reply.text = "Here:\n\n`main.rs`\n```rust\nfn main() {\n    new();\n}\n```\n\n`lib.rs`\n```rust\npub fn l() {}\n```\n".into();
         reply.rendered_at.set(None);
         let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
