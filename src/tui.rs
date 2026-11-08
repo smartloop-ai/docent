@@ -691,7 +691,8 @@ impl Reply {
                 let mut pieces = self.pieces.borrow_mut();
                 let mut laid: Vec<Piece> = Vec::new();
                 for (i, (code, segment, start)) in segments(text).into_iter().enumerate() {
-                    let file = blocks.iter().find(|b| b.fence == start).map(|b| &b.file);
+                    let block = blocks.iter().find(|b| b.fence == start);
+                    let file = block.map(|b| &b.file);
                     // A shell block's heredocs that write files, each shown
                     // as its change.
                     let span = start + segment.lines().count();
@@ -726,6 +727,9 @@ impl Reply {
                             p.lines.clone()
                         }
                         _ => match (code, file) {
+                            (true, Some(_)) if block.is_some_and(|b| b.edit.is_some()) => {
+                                self.edit_part(block.unwrap(), &blocks, pending, &segment, width)
+                            }
                             (true, Some(file)) if pending => streaming_part(&file.path, &file.content, false, width),
                             (true, Some(file)) => self.file_part(&file.path, &file.content, false, streaming, &segment, width),
                             (true, None) if !docs.is_empty() => self.heredoc_part(&segment, start, &docs, replying, width),
@@ -815,6 +819,44 @@ impl Reply {
         }
         push(&mut out, shell(at, body_end));
         out
+    }
+
+    /// An edit block `block` of the reply's `blocks`, `segment` its text:
+    /// streaming, its search and replace text as they come; done, its
+    /// change to the file, as the reply's blocks before it left it; or why
+    /// it can't be made.
+    fn edit_part(&self, block: &files::Block, blocks: &[files::Block], pending: bool, segment: &str, width: u16) -> Vec<Line<'static>> {
+        let path = &block.file.path;
+        if pending {
+            let mut part = vec![Line::from(vec![
+                Span::styled("● ", dim()),
+                Span::styled(path.clone(), Style::new().bold()),
+                Span::styled(" · editing", dim()),
+            ])];
+            part.extend(code_lines(segment, width));
+            return part;
+        }
+        // The file as the blocks before this one leave it.
+        let mut before = self.old(path);
+        for earlier in blocks.iter().filter(|b| b.fence < block.fence && b.file.path == *path) {
+            before = match &earlier.edit {
+                Some(edits) => files::apply_edits(before.as_deref(), edits).ok().or(before),
+                None if earlier.append => Some(format!("{}{}", before.unwrap_or_default(), earlier.file.content)),
+                None => Some(earlier.file.content.clone()),
+            };
+        }
+        match files::apply_edits(before.as_deref(), block.edit.as_deref().unwrap_or_default()) {
+            Ok(after) => diff_lines(&files::diff(path, before.as_deref(), &after, false), width),
+            Err(why) => {
+                let mut part = vec![Line::from(vec![
+                    Span::styled("← ", dim()),
+                    Span::styled(path.clone(), Style::new().bold()),
+                    Span::styled(format!(" · not changed: {why}"), Style::new().fg(Color::Yellow)),
+                ])];
+                part.extend(code_lines(segment, width));
+                part
+            }
+        }
     }
 
     /// The file at `path` under the reply's folder as it was before the
@@ -1129,6 +1171,8 @@ struct WriteAsk {
     commands: Vec<String>,
     /// The files there it changes.
     changed: Vec<String>,
+    /// Its edits that couldn't be made, by path, with why.
+    failed: Vec<(String, String)>,
 }
 
 struct Turn {
@@ -1170,6 +1214,12 @@ enum AfterCheck {
 /// The loop goes on as long as the errors are not fixed, round after round,
 /// and stops only when a round made no difference: the check's `output` is
 /// what it was after the last failure.
+/// Times the agent's asked again for edits that didn't apply, before it's
+/// left to the user.
+const EDIT_ROUNDS: u32 = 2;
+/// Characters of a file sent back with an edit that didn't apply.
+const EDIT_SHOWN: usize = 40_000;
+
 fn after_check(code: Option<i32>, output: &str, fix_round: u32, last_failure: Option<&str>) -> AfterCheck {
     match code {
         Some(0) => AfterCheck::Passed,
@@ -1249,6 +1299,9 @@ struct App {
     check: Option<Check>,
     /// Rounds of fixing a failed check since the user's last prompt.
     fix_round: u32,
+    /// Rounds the agent's been asked again for edits that didn't apply,
+    /// since the user last asked something.
+    edit_round: u32,
     /// The widest context window among the project's enabled models, in
     /// tokens, once the models are known: how much of the project a prompt
     /// may carry.
@@ -1340,6 +1393,7 @@ impl App {
             jobs: Vec::new(),
             check: None,
             fix_round: 0,
+            edit_round: 0,
             window: None,
             kept: None,
             commands: None,
@@ -2008,7 +2062,7 @@ impl App {
                 let shown = format!("Fix the errors from `{}`", check.command);
                 let message = format!(
                     "I ran `{}` in the project after your change; it failed:\n```\n{}\n```\nFix these errors in \
-                     the project's files. Give each file you change whole again, as before.",
+                     the project's files, as before: an edit block for a file that's there, a heredoc for a new one.",
                     check.command,
                     head(&output, SHELL_KEPT)
                 );
@@ -2036,10 +2090,13 @@ impl App {
     /// files that are there asks first, as a coding harness asks before an
     /// edit, unless allowed for the session; else they're written, checked,
     /// and the commands asked about.
-    fn reply_done(&mut self, root: std::path::PathBuf, found: Vec<files::File>, whole: Vec<String>, commands: Vec<String>) {
+    fn reply_done(&mut self, root: std::path::PathBuf, found: files::Extracted, mut whole: Vec<String>, commands: Vec<String>) {
+        // An edited file is the file there with the edits made: all of it.
+        whole.extend(found.edited);
+        let (found, failed) = (found.files, found.failed);
         let plan = files::plan(&root, found.clone(), &whole);
         if plan.changed.is_empty() || self.always_run {
-            return self.apply_reply(root, found, &whole, commands);
+            return self.apply_reply(root, found, &whole, commands, failed);
         }
         let shown: Vec<(String, usize, usize)> = plan
             .changed
@@ -2053,7 +2110,7 @@ impl App {
         let changed = plan.changed.into_iter().map(|f| f.path).collect();
         self.entries.retain(|e| !matches!(e, Entry::AskWrite(_)));
         self.entries.push(Entry::AskWrite(shown));
-        self.write_ask = Some(WriteAsk { root, found, whole, commands, changed });
+        self.write_ask = Some(WriteAsk { root, found, whole, commands, changed, failed });
         self.scroll_back = 0;
     }
 
@@ -2074,25 +2131,71 @@ impl App {
                 "Auto-approve on: a reply's changes are written and its commands run without asking (tab turns it off)".to_string(),
             ));
         }
-        self.apply_reply(ask.root, found, &ask.whole, ask.commands);
+        self.apply_reply(ask.root, found, &ask.whole, ask.commands, ask.failed);
     }
 
     /// Write a reply's files, check them, then ask about its commands.
-    fn apply_reply(&mut self, root: std::path::PathBuf, found: Vec<files::File>, whole: &[String], commands: Vec<String>) {
+    /// Edits that couldn't be made go back to the agent first, with the
+    /// files as they are, as opencode hands a failed edit back to the model.
+    fn apply_reply(
+        &mut self,
+        root: std::path::PathBuf,
+        found: Vec<files::File>,
+        whole: &[String],
+        commands: Vec<String>,
+        failed: Vec<(String, String)>,
+    ) {
         let written = self.reply_files(&root, found, whole);
+        // The reply's commands run once its files are in and checked: a
+        // fix round's reply has none of its own, so the first reply's wait.
+        if !commands.is_empty() {
+            self.commands = Some((root.clone(), commands));
+        }
+        if !failed.is_empty() {
+            for (path, why) in &failed {
+                self.entries.push(Entry::Warning(format!("Not changed, {}: {}", path, why)));
+            }
+            if self.edit_round < EDIT_ROUNDS {
+                self.edit_round += 1;
+                return self.resend_edits(&root, &failed);
+            }
+            self.entries.push(Entry::Warning(format!(
+                "The edits still don't apply after {} tries; ask again, or change the files by hand",
+                EDIT_ROUNDS
+            )));
+        }
         if !written.is_empty() {
             self.run_check(&root, &written);
         } else if self.fix_round > 0 {
             self.entries.push(Entry::Warning("The fix changed no file, so the errors stand; see them above".to_string()));
         }
-        // The reply's commands run once its files are in and checked: a
-        // fix round's reply has none of its own, so the first reply's wait.
-        if !commands.is_empty() {
-            self.commands = Some((root, commands));
-        }
         if self.check.is_none() {
             self.run_commands();
         }
+    }
+
+    /// Ask the agent again for the edits that `failed` in `root`, with
+    /// each file as it is now.
+    fn resend_edits(&mut self, root: &std::path::Path, failed: &[(String, String)]) {
+        let mut paths: Vec<&str> = failed.iter().map(|(p, _)| p.as_str()).collect();
+        paths.dedup();
+        let reasons: Vec<String> = failed.iter().map(|(p, why)| format!("- {p}: {why}")).collect();
+        let files: Vec<String> = paths
+            .iter()
+            .map(|p| match std::fs::read_to_string(root.join(p)) {
+                Ok(text) => format!("`{p}` as it is now:\n````\n{}\n````", head(&text, EDIT_SHOWN)),
+                Err(_) => format!("`{p}` isn't there."),
+            })
+            .collect();
+        self.entries.push(Entry::Notice(format!("Asking the agent for those edits again (try {} of {})", self.edit_round, EDIT_ROUNDS)));
+        let message = format!(
+            "These edits from your last reply couldn't be made, so those files weren't changed:\n{}\n\n{}\n\nGive \
+             just those edits again, as edit blocks whose SEARCH text is copied exactly from the file as it is now \
+             and is found in it once. Don't repeat the changes that were made.",
+            reasons.join("\n"),
+            files.join("\n\n")
+        );
+        self.send_turn(format!("Redo the edits to {}", paths.join(", ")), message, Vec::new(), true);
     }
 
     /// The last reply's shell commands, checked, are shown and asked
@@ -3484,6 +3587,7 @@ impl App {
                 }
                 let making = self.making(&input);
                 self.fix_round = 0;
+                self.edit_round = 0;
                 self.command_round = 0;
                 self.last_failure = None;
                 self.send_turn(input.clone(), message, files, making);
@@ -6225,6 +6329,70 @@ mod tests {
     }
 
     #[test]
+    fn a_replys_edits_change_the_files_and_those_that_dont_apply_are_asked_for_again() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let turn = |app: &mut App, text: &str| {
+            app.entries.push(Entry::Reply(Reply { text: text.into(), ..Default::default() }));
+            app.turn = Some(Turn {
+                started: Instant::now(),
+                task: runtime.spawn(async {}),
+                entry: app.entries.len() - 1,
+                tokens: 0,
+                activity: None,
+                files_dir: Some(dir.path().to_path_buf()),
+                whole: Vec::new(),
+            });
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+        };
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        app.always_run = true;
+        let reply = "```edit a.txt\n<<<<<<< SEARCH\ntwo\n=======\n2\n>>>>>>> REPLACE\n```\n\n\
+                     ```edit b.txt\n<<<<<<< SEARCH\nzzz\n=======\ny\n>>>>>>> REPLACE\n```\n";
+        turn(&mut app, reply);
+        // The edit that applies is made; it takes most of the file out of
+        // nothing, it's still the whole file.
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "one\n2\nthree\n");
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "b\n");
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Warning(w) if w.starts_with("Not changed, b.txt: the edit: its SEARCH isn't in the file"))));
+        // The one that doesn't goes back to the agent, with the file.
+        assert_eq!(app.edit_round, 1);
+        assert!(app.turn.is_some(), "the edit was asked for again");
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::User(u) if u == "Redo the edits to b.txt")));
+        app.stop_turn();
+        // Only so many times.
+        app.edit_round = EDIT_ROUNDS;
+        turn(&mut app, reply);
+        assert!(app.turn.is_none());
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Warning(w) if w.starts_with("The edits still don't apply"))));
+    }
+
+    #[test]
+    fn an_edit_block_streams_then_shows_as_its_change() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let mut reply = Reply { root: Some(dir.path().to_path_buf()), ..Default::default() };
+        let rows = |reply: &Reply| -> Vec<String> { reply.body(60).iter().map(|l| l.to_string().trim_end().to_string()).collect() };
+        reply.text = "```edit a.txt\n<<<<<<< SEARCH\ntwo\n=======\n2".into();
+        let shown = rows(&reply);
+        assert!(shown.contains(&"● a.txt · editing".to_string()), "{:?}", shown);
+        reply.text.push_str("\n>>>>>>> REPLACE\n```\n");
+        reply.rendered_at.set(None);
+        let shown = rows(&reply);
+        assert!(shown.contains(&"← a.txt  +1 −1".to_string()), "{:?}", shown);
+        // One that can't be made says why, with its text.
+        reply.text.push_str("\n```edit a.txt\n<<<<<<< SEARCH\nnope\n=======\nx\n>>>>>>> REPLACE\n```\n");
+        reply.stats = Some(TurnStats::default());
+        let shown = rows(&reply);
+        assert!(shown.iter().any(|r| r.starts_with("← a.txt · not changed: the edit: its SEARCH isn't in the file")), "{:?}", shown);
+    }
+
+    #[test]
     fn a_reply_asks_before_writing_over_files_there() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.rs"), "old\n").unwrap();
@@ -6233,7 +6401,7 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         // Asked: nothing written yet, the change named.
-        app.reply_done(dir.path().into(), found(), Vec::new(), vec!["git add -A".into()]);
+        app.reply_done(dir.path().into(), files::Extracted { files: found(), ..Default::default() }, Vec::new(), vec!["git add -A".into()]);
         assert!(matches!(app.entries.last(), Some(Entry::AskWrite(c)) if c == &[("main.rs".to_string(), 1, 1)]));
         assert!(!dir.path().join("a.rs").exists());
         assert!(app.commands.is_none() && app.ask.is_none());
@@ -6249,14 +6417,14 @@ mod tests {
         assert!(app.ask.is_some());
         app.ask = None;
         // Enter writes it.
-        app.reply_done(dir.path().into(), found(), Vec::new(), Vec::new());
+        app.reply_done(dir.path().into(), files::Extracted { files: found(), ..Default::default() }, Vec::new(), Vec::new());
         app.key_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "new\n");
         // Tab writes from now on without asking.
-        app.reply_done(dir.path().into(), vec![file("main.rs", "newer\n")], Vec::new(), Vec::new());
+        app.reply_done(dir.path().into(), files::Extracted { files: vec![file("main.rs", "newer\n")], ..Default::default() }, Vec::new(), Vec::new());
         app.key_edit(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(app.always_run);
-        app.reply_done(dir.path().into(), vec![file("main.rs", "newest\n")], Vec::new(), Vec::new());
+        app.reply_done(dir.path().into(), files::Extracted { files: vec![file("main.rs", "newest\n")], ..Default::default() }, Vec::new(), Vec::new());
         assert!(app.write_ask.is_none());
         assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "newest\n");
     }
