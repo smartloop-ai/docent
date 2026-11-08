@@ -2424,7 +2424,7 @@ impl App {
         let Some((project, _)) = self.project.clone() else { return };
         let mut runs = Vec::new();
         for command in self.runnable(commands) {
-            let (command, background) = detached(&command);
+            let (command, background) = detached(&co_authored(&command));
             let (id, report) = self.shell_entry(command.clone(), background);
             runs.push((id, command, background, report));
         }
@@ -5159,6 +5159,34 @@ fn terminate(pid: u32, _hard: bool) {
         .status();
 }
 
+/// Who docent's commits are co-authored by, as git and GitHub read it.
+const CO_AUTHOR: &str = "Co-authored-by: Docent <docent@smartloop.ai>";
+
+/// `command`, a reply's, with each `git commit` in it given docent as a
+/// co-author, by a trailer git adds to the message's end: run as shown.
+/// One that names it already is left as it is.
+fn co_authored(command: &str) -> String {
+    if command.contains(CO_AUTHOR) {
+        return command.to_string();
+    }
+    let trailer = format!("git commit --trailer \"{CO_AUTHOR}\"");
+    let mut out = String::with_capacity(command.len());
+    let mut rest = command;
+    while let Some(at) = rest.find("git commit") {
+        let (before, after) = (&rest[..at], &rest[at + "git commit".len()..]);
+        // A command of its own: at a line's start or after `&&`, `;`, `|`,
+        // `(` and the like; and `git commit` itself, not `git commit-tree`.
+        let line = before.rsplit('\n').next().unwrap_or("").trim_end();
+        let starts = line.is_empty() || line.ends_with(['&', ';', '|', '(', '{']);
+        let ends = after.chars().next().is_none_or(char::is_whitespace);
+        out.push_str(before);
+        out.push_str(if starts && ends { &trailer } else { "git commit" });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// `command` without a `&` at its end, and whether it had one: a command
 /// to start in the background, as `npm run dev &`. `&&` isn't that.
 fn detached(command: &str) -> (String, bool) {
@@ -6325,7 +6353,8 @@ mod tests {
         // Enter runs them, each block its own.
         turn(&mut app, "```sh\ngit add -A\ngit commit -m \"wip\"\n```\n\n```sh\ngit push\n```\n");
         key(&mut app, KeyCode::Enter);
-        assert_eq!(shells(&app), ["git add -A\ngit commit -m \"wip\"", "git push"]);
+        // A commit is co-authored by docent.
+        assert_eq!(shells(&app), [format!("git add -A\ngit commit --trailer \"{CO_AUTHOR}\" -m \"wip\""), "git push".to_string()]);
         // With a file: the check first, the question once it passes; Tab
         // runs them, and the next reply's without asking.
         turn(&mut app, "`src/main.rs`\n```rust\nfn main() {}\n```\n\n```bash\ngit commit -am \"main\"\n```\n");
@@ -6338,7 +6367,7 @@ mod tests {
         assert!(app.commands.is_none());
         key(&mut app, KeyCode::Tab);
         assert!(app.always_run);
-        assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "git commit -am \"main\"" && s.ended.is_none()));
+        assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == format!("git commit --trailer \"{CO_AUTHOR}\" -am \"main\"") && s.ended.is_none()));
         turn(&mut app, "```sh\ngit push\n```\n");
         assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "git push"));
         assert!(app.ask.is_none());
@@ -6676,6 +6705,20 @@ mod tests {
         let started = Instant::now();
         assert_eq!(working_word(started), working_word(started));
         assert!(WORKING_WORDS.contains(&working_word(started)));
+    }
+
+    #[test]
+    fn a_replys_commits_are_co_authored_by_docent() {
+        let with = |c: &str| format!("git commit --trailer \"{CO_AUTHOR}\"{c}");
+        assert_eq!(co_authored("git commit -m \"wip\""), with(" -m \"wip\""));
+        assert_eq!(co_authored("git add -A && git commit -am x\ngit push"), format!("git add -A && {}\ngit push", with(" -am x")));
+        assert_eq!(co_authored("git add .; git commit"), format!("git add .; {}", with("")));
+        assert_eq!(co_authored("git add -A\n  git commit -m x"), format!("git add -A\n  {}", with(" -m x")));
+        // Not another command, a word in a message, or one already so.
+        assert_eq!(co_authored("git commit-tree abc"), "git commit-tree abc");
+        assert_eq!(co_authored("echo \"run git commit\""), "echo \"run git commit\"");
+        let done = format!("git commit -m x --trailer \"{CO_AUTHOR}\"");
+        assert_eq!(co_authored(&done), done);
     }
 
     #[test]
