@@ -81,8 +81,6 @@ detect_target() {
 
     OS="$os_part"
     TARGET="${arch_part}-${os_part}"
-    # `smartloop` is the old name, kept as a second one so existing
-    # commands and scripts still run.
     if [ "$os_part" = "pc-windows-msvc" ]; then
         ARCHIVE_EXT="zip"
         EXE=".exe"
@@ -91,7 +89,9 @@ detect_target() {
         EXE=""
     fi
     BIN_NAME="docent${EXE}"
-    ALIAS_NAME="smartloop${EXE}"
+    # The name before the rename: older releases' archives hold it, and
+    # older installs left it as a second name, taken out now.
+    OLD_NAME="smartloop${EXE}"
 }
 
 # Latest release tag, read straight off the redirect so no JSON parser and no
@@ -341,7 +341,7 @@ install_docent() {
     local name="docent-${VERSION}-${TARGET}" packed="$BIN_NAME"
     if ! grep -q " ${name}.${ARCHIVE_EXT}\$" "${TMP_DIR}/SHA256SUMS"; then
         name="smartloop-${VERSION}-${TARGET}"
-        packed="$ALIAS_NAME"
+        packed="$OLD_NAME"
     fi
     local archive="${name}.${ARCHIVE_EXT}"
 
@@ -392,17 +392,13 @@ install_docent() {
     "${INSTALL_DIR}/${BIN_NAME}" --version >/dev/null 2>&1 \
         || error "Installation verification failed: 'docent --version' did not succeed"
 
-    # `smartloop` is the same binary under its old name: a symlink, or on
-    # Windows (no symlinks without admin) a copy.
-    rm -f "${INSTALL_DIR}/${ALIAS_NAME}"
+    # The `smartloop` name an older install left, a link or a copy, goes.
+    rm -f "${INSTALL_DIR}/${OLD_NAME}"
     if [ "$OS" = "pc-windows-msvc" ]; then
         cp "${TMP_DIR}/${name}"/*.dll "$INSTALL_DIR"/ 2>/dev/null || true
-        cp "${INSTALL_DIR}/${BIN_NAME}" "${INSTALL_DIR}/${ALIAS_NAME}"
-    else
-        ln -sf "$BIN_NAME" "${INSTALL_DIR}/${ALIAS_NAME}"
     fi
 
-    say "${GREEN}Installed${NC} ${INSTALL_DIR}/${BIN_NAME} ${MUTED}(also as${NC} smartloop${MUTED})${NC}"
+    say "${GREEN}Installed${NC} ${INSTALL_DIR}/${BIN_NAME}"
 
     say "${MUTED}Processing triggers for docent (${VERSION}) ...${NC}"
     if [ "$OS" = "pc-windows-msvc" ]; then

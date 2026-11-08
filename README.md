@@ -1,8 +1,10 @@
 # Docent
 
-Frontier quality. Local first. Chat with your PDFs and Office files, search the web, and connect MCP servers, all from the terminal. If no local agent is running, the CLI downloads the framework and models it needs and starts one itself.
+The private coding agent for your terminal. Frontier quality, local first.
 
-It installs as `docent`, and as `smartloop` (its old name) so existing commands keep working; the two are the same binary.
+Ask for a change and docent writes it: new files whole, changes to the files there as small edits, each shown as a diff as it streams and written as soon as it's done. Changes to files that are there ask first. It checks its work with your language servers (rust-analyzer, gopls, typescript-language-server, pyright, clangd) and your build, hands any errors back to the model to fix, then runs the commands the reply gives, such as a commit, co-authored by docent.
+
+It's a document assistant too: chat with your PDFs and Office files, search the web, and connect MCP servers. If no local agent is running, the CLI downloads the framework and models it needs and starts one itself.
 
 <img width="822" alt="docent run: a reply with its sources, the status line and the prompt" src="docs/tui.png" />
 

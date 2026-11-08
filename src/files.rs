@@ -2,9 +2,13 @@
 //!
 //! The agent answers in text: asked to make a project, it shows the files
 //! rather than writing them. A prompt that asks for something to be made
-//! carries `HINT`, so the reply gives each file whole, in a fenced block
-//! with its path on the line above; `extract` finds those blocks, and the
-//! TUI writes them, asking before it replaces a file that's already there.
+//! carries `HINT`, so the reply gives each new file whole, as a `cat > path`
+//! heredoc in a shell block (or, as models also write it, a fenced block
+//! with its path on the line above), and each change to a file that's there
+//! as an `edit` block of SEARCH/REPLACE pairs; `extract` finds those, and the TUI
+//! shows each as a diff and writes it, asking before it replaces a file
+//! that's already there. A skill is a file like any other, under
+//! `.docent/skills/`, which docent hands on to the framework.
 //! Work that isn't a file, such as a commit, comes as a shell block with
 //! no path; `commands` finds those, and the TUI runs them in the folder.
 
@@ -13,19 +17,26 @@ use std::path::{Component, Path, PathBuf};
 
 /// Told to the agent with a prompt that asks for something to be made.
 pub const HINT: &str = "If your answer creates or changes files, start with a short summary of what you \
-changed and why, then give each file's complete contents in its own \
-fenced code block, with the file's path relative to the working folder alone on the line just above the block, \
-like `src/main.rs`. Include every file the change needs, such as the manifest when the code uses a new \
-dependency. The files are written for me from those blocks, so don't tell me to create them by hand or \
-with a command. Something to do in the folder that isn't a file, such as committing or pushing to git, \
-installing a dependency or running the tests, you do by giving the shell commands for it in a fenced block \
-marked `sh`, with no path: they're run for me in the working folder, in order, and their output comes back \
-to you with my next message. So never say you can't run commands or reach git: give the commands. Use the \
-folder's real values in them, such as its git branch and remote as given below, never a placeholder like \
-`<your-username>`; something you'd need and don't have, such as a remote that isn't set, ask me for \
-instead. A command that keeps running until it's stopped, such as a dev server or a watcher, you give with \
-`&` at its end, as `npm run dev &`, in a block of its own: it's started in the background, and what comes \
-after doesn't wait for it.";
+changed and why. To change a file that's there, don't give it whole: give an edit block, a fenced block \
+marked `edit` with the file's path, as ```` ```edit src/main.rs ````, holding one or more changes, each as a \
+line `<<<<<<< SEARCH`, the lines to change copied exactly from the file, a line `=======`, the lines to put in \
+their place, then a line `>>>>>>> REPLACE`. Each SEARCH must be found in the file once: give a few unchanged \
+lines around a change when a line alone could be found twice, and keep it short otherwise. A new file you write \
+whole with a shell heredoc in a fenced block marked `sh`: a line `cat > path/to/file <<'EOF'`, with the path \
+relative to the working folder, then the file's complete contents, then `EOF` alone on its line. When a file's \
+contents hold a line of three backticks, open and close its block with four. Include every file the change \
+needs, such as the manifest when the code uses a new dependency. I'm shown each change as a diff and the files \
+are written for me from those blocks, so don't tell me to create or edit them by hand. Asked to make \
+or save a skill, write it the same way, to `.docent/skills/<name>/SKILL.md`: frontmatter with its `name` and a \
+one-line `description` of when to use it, then its instructions. Something to do in the folder that isn't a \
+file, such as committing or pushing to git, installing a dependency or running the tests, you do by giving the \
+shell commands for it in a fenced block marked `sh`: they're run for me in the working folder, in order, after \
+the files are written, and their output comes back to you with my next message. So never say you can't run \
+commands or reach git: give the commands. Use the folder's real values in them, such as its git branch and \
+remote as given below, never a placeholder like `<your-username>`; something you'd need and don't have, such as \
+a remote that isn't set, ask me for instead. A command that keeps running until it's stopped, such as a dev \
+server or a watcher, you give with `&` at its end, as `npm run dev &`, in a block of its own: it's started in \
+the background, and what comes after doesn't wait for it.";
 
 /// Files at a folder's top that say it's a code project, and its kind.
 const MARKERS: [(&str, &str); 14] = [
@@ -303,7 +314,7 @@ pub fn system_context() -> &'static str {
 }
 
 /// Whether `tool` is a program in a `PATH` directory.
-fn on_path(tool: &str) -> bool {
+pub(crate) fn on_path(tool: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else { return false };
     let names: Vec<String> = if cfg!(windows) {
         ["exe", "cmd", "bat"].iter().map(|ext| format!("{}.{}", tool, ext)).collect()
@@ -394,9 +405,9 @@ fn cut(text: &str, limit: usize) -> &str {
 }
 
 /// Words that ask for something to be made, as the prompt's first concern.
-const MAKING: [&str; 13] = [
+const MAKING: [&str; 14] = [
     "create", "generate", "scaffold", "build", "make", "write", "add", "implement", "bootstrap", "init",
-    "setup", "update", "fix",
+    "setup", "update", "fix", "save",
 ];
 
 /// Names without an extension that are still files a project keeps.
@@ -440,23 +451,208 @@ pub struct File {
     pub content: String,
 }
 
-/// A file in a reply, and the line of the reply its code starts on: the
-/// opening fence, or the first indented line.
+/// A file in a reply, and the lines of the reply that give it: from the
+/// opening fence, the first indented line, or the heredoc's `cat` line, to
+/// the line past its end.
 pub struct Block {
     pub file: File,
     pub fence: usize,
+    pub end: usize,
+    /// A heredoc written with `>>`: its contents go at the end of the file.
+    pub append: bool,
+    /// Its end has come: its closing fence, or its heredoc's end word.
+    pub closed: bool,
+    /// An edit block: search/replace pairs for the file there, in place of
+    /// its whole contents (`file.content` is then empty).
+    pub edit: Option<Vec<Edit>>,
+}
+
+/// One change of an edit block: `search`, text of the file as it is,
+/// becomes `replace`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Edit {
+    pub search: String,
+    pub replace: String,
+}
+
+/// What a reply gives: its files, whole, with its edits made; the paths
+/// it edited; and each edit that couldn't be made, by path, with why.
+#[derive(Debug, Default)]
+pub struct Extracted {
+    pub files: Vec<File>,
+    pub edited: Vec<String>,
+    pub failed: Vec<(String, String)>,
 }
 
 /// The files in `reply`: each fenced block whose path is on the line above
 /// it, in its info string (```` ```rust src/main.rs ````), or in a comment
-/// on its first line. A path given twice keeps its last contents.
+/// on its first line, and each `cat > path <<'EOF'` heredoc of a shell
+/// block. A path given twice keeps its last contents. A heredoc written
+/// with `>>` adds to what's before it in the reply, or else to nothing: see
+/// `extract_in` for the file it adds to.
+#[cfg(test)]
 pub fn extract(reply: &str) -> Vec<File> {
+    gather(reply, |_| None).files
+}
+
+/// `extract` for a reply about the folder `root`: a heredoc written with
+/// `>>` adds to the file there when the reply hasn't given it before, and
+/// an edit block changes it, or what the reply gave of it before.
+#[cfg(test)]
+pub fn extract_in(root: &Path, reply: &str) -> Extracted {
+    gather(reply, |path| fs::read_to_string(root.join(path)).ok())
+}
+
+/// `extract` for a reply about files as `before` gives them, by path, as
+/// they were before any of its files were written.
+pub fn extract_with(reply: &str, before: impl Fn(&str) -> Option<String>) -> Extracted {
+    gather(reply, before)
+}
+
+fn gather(reply: &str, on_disk: impl Fn(&str) -> Option<String>) -> Extracted {
     let mut files: Vec<File> = Vec::new();
+    let (mut edited, mut failed) = (Vec::new(), Vec::new());
     for block in blocks(reply) {
-        files.retain(|f| f.path != block.file.path);
-        files.push(block.file);
+        let mut file = block.file;
+        if let Some(edits) = &block.edit {
+            let before = files.iter().find(|f| f.path == file.path).map(|f| f.content.clone()).or_else(|| on_disk(&file.path));
+            match apply_edits(before.as_deref(), edits) {
+                Ok(after) => file.content = after,
+                Err(why) => {
+                    failed.push((file.path, why));
+                    continue;
+                }
+            }
+            if !edited.contains(&file.path) {
+                edited.push(file.path.clone());
+            }
+        } else if block.append {
+            let before = files.iter().find(|f| f.path == file.path).map(|f| f.content.clone()).or_else(|| on_disk(&file.path));
+            if let Some(before) = before {
+                file.content = before + &file.content;
+            }
+        }
+        files.retain(|f| f.path != file.path);
+        files.push(file);
     }
-    files
+    Extracted { files, edited, failed }
+}
+
+/// A line opening an edit's search text: `<<<<<<< SEARCH`.
+fn is_search(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("<<<<<<<") && t.trim_start_matches('<').trim() == "SEARCH"
+}
+
+/// A line ending an edit's replacement: `>>>>>>> REPLACE`.
+fn is_replace(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with(">>>>>>>") && t.trim_start_matches('>').trim() == "REPLACE"
+}
+
+/// A line between an edit's search and its replacement: `=======`.
+fn is_divider(line: &str) -> bool {
+    let t = line.trim();
+    t.len() >= 7 && t.chars().all(|c| c == '=')
+}
+
+/// The search/replace pairs of an edit block's `body` that have ended;
+/// one still coming in isn't among them.
+pub fn edits(body: &[&str]) -> Vec<Edit> {
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k < body.len() {
+        if !is_search(body[k]) {
+            k += 1;
+            continue;
+        }
+        let Some(divider) = (k + 1..body.len()).find(|&j| is_divider(body[j])) else { break };
+        let Some(end) = (divider + 1..body.len()).find(|&j| is_replace(body[j])) else { break };
+        out.push(Edit { search: body[k + 1..divider].join("\n"), replace: body[divider + 1..end].join("\n") });
+        k = end + 1;
+    }
+    out
+}
+
+/// `old`, a file's contents (none when it isn't there), with `edits`
+/// made in turn; or why one couldn't be. Each edit's search text must be
+/// found once: as it is, else line by line ignoring the whitespace around
+/// each, else ignoring all whitespace, else by its first and last lines,
+/// as opencode finds an edit. An empty search makes a file that isn't
+/// there.
+pub fn apply_edits(old: Option<&str>, edits: &[Edit]) -> Result<String, String> {
+    if edits.is_empty() {
+        return Err("the edit block has no complete SEARCH/REPLACE pair".to_string());
+    }
+    let (mut text, rest) = match old {
+        Some(old) => (old.to_string(), edits),
+        None if edits[0].search.trim().is_empty() => (format!("{}\n", edits[0].replace), &edits[1..]),
+        None => return Err("the file isn't there; give a new file whole as a heredoc".to_string()),
+    };
+    for (n, edit) in rest.iter().enumerate() {
+        let which = if edits.len() > 1 { format!("edit {} of {}", n + 1 + edits.len() - rest.len(), edits.len()) } else { "the edit".to_string() };
+        if edit.search.trim().is_empty() {
+            return Err(format!("{which} has an empty SEARCH, and the file is there"));
+        }
+        text = replace_once(&text, edit).map_err(|why| format!("{which}: {why}"))?;
+    }
+    Ok(text)
+}
+
+/// `text` with `edit`'s search text, found once, replaced.
+fn replace_once(text: &str, edit: &Edit) -> Result<String, String> {
+    let (search, replace) = (edit.search.as_str(), edit.replace.as_str());
+    match text.matches(search).count() {
+        1 => return Ok(text.replacen(search, replace, 1)),
+        0 => {}
+        n => return Err(format!("its SEARCH is found {n} times; give more lines around it so it's found once")),
+    }
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let wanted: Vec<&str> = search.lines().collect();
+    let squeeze = |s: &str| s.split_whitespace().collect::<String>();
+    let trimmed = |a: &str, b: &str| a.trim() == b.trim();
+    let spaced = |a: &str, b: &str| squeeze(a) == squeeze(b);
+    for same in [&trimmed as &dyn Fn(&str, &str) -> bool, &spaced] {
+        let found: Vec<usize> = (0..lines.len().saturating_sub(wanted.len() - 1))
+            .filter(|&i| wanted.iter().enumerate().all(|(j, w)| same(lines[i + j], w)))
+            .collect();
+        match found.as_slice() {
+            [i] => return Ok(splice(&lines, *i, *i + wanted.len(), replace)),
+            [] => {}
+            many => return Err(format!("its SEARCH is found {} times; give more lines around it so it's found once", many.len())),
+        }
+    }
+    // By its first and last lines, with as many lines between, give or
+    // take a quarter: the middle may differ a little from the file's.
+    if wanted.len() >= 3 {
+        let (first, last) = (wanted[0].trim(), wanted[wanted.len() - 1].trim());
+        let slack = wanted.len() / 4;
+        let found: Vec<(usize, usize)> = (0..lines.len())
+            .filter(|&i| !first.is_empty() && lines[i].trim() == first)
+            .filter_map(|i| {
+                let lo = i + wanted.len() - 1 - slack.min(wanted.len() - 2);
+                (lo..=(i + wanted.len() - 1 + slack).min(lines.len().saturating_sub(1))).find(|&j| lines[j].trim() == last).map(|j| (i, j))
+            })
+            .collect();
+        if let [(i, j)] = found.as_slice() {
+            return Ok(splice(&lines, *i, j + 1, replace));
+        }
+    }
+    Err("its SEARCH isn't in the file".to_string())
+}
+
+/// `lines` with those from `from` to `to` put in place by `replace`.
+fn splice(lines: &[&str], from: usize, to: usize, replace: &str) -> String {
+    let mut out: String = lines[..from].concat();
+    if !replace.is_empty() {
+        out.push_str(replace);
+        // The lines taken out ended a line; so does what goes in.
+        if lines[to - 1].ends_with('\n') || to < lines.len() {
+            out.push('\n');
+        }
+    }
+    out.push_str(&lines[to..].concat());
+    out
 }
 
 /// Every block of `reply` that gives a file, in order, with its lines.
@@ -477,7 +673,7 @@ pub fn blocks(reply: &str) -> Vec<Block> {
                 && let Some((content, next)) = indented_block(&lines, i)
             {
                 let fence = (i..next).find(|k| !lines[*k].trim().is_empty()).unwrap_or(i);
-                blocks.push(Block { file: File { path, content }, fence });
+                blocks.push(Block { file: File { path, content }, fence, end: next, append: false, closed: true, edit: None });
                 i = next;
                 above = None;
                 continue;
@@ -488,12 +684,10 @@ pub fn blocks(reply: &str) -> Vec<Block> {
             continue;
         };
         let start = i;
-        while i < lines.len() && !closes(lines[i], &fence) {
-            i += 1;
-        }
-        let mut body: Vec<&str> = lines[start..i].to_vec();
+        let close = close_of(&lines, at, &fence, info);
+        let mut body: Vec<&str> = lines[start..close.unwrap_or(lines.len())].to_vec();
         // Past the closing fence, when there is one.
-        i = (i + 1).min(lines.len());
+        i = close.map_or(lines.len(), |c| c + 1);
         let mut path = info_path(info);
         if path.is_none()
             && let Some((_, label)) = above
@@ -503,6 +697,17 @@ pub fn blocks(reply: &str) -> Vec<Block> {
         }
         if path.is_none() {
             path = body.first().and_then(|first| comment_path(first));
+        }
+        // An edit block's path on a line of its own ahead of its first
+        // SEARCH, as models also write it: ```` ```edit ````, then the path.
+        if path.is_none()
+            && let Some(first) = body.iter().position(|l| !l.trim().is_empty())
+            && !is_search(body[first])
+            && body[first..].iter().any(|l| is_search(l))
+            && let Some(named) = label_path(body[first])
+        {
+            path = Some(named);
+            body.drain(..=first);
         }
         // A "File: src/main.rs" line leading the block names it, and goes;
         // so does a fence right under it, the block's real start, as small
@@ -517,12 +722,181 @@ pub fn blocks(reply: &str) -> Vec<Block> {
             }
         }
         above = None;
-        let Some(path) = path else { continue };
+        let Some(path) = path else {
+            // A shell block names no file of its own; its heredocs do.
+            if heredoc_lang(info) {
+                for doc in heredocs(&body) {
+                    blocks.push(Block {
+                        file: File { path: doc.path, content: doc.content },
+                        fence: start + doc.from,
+                        end: start + doc.to,
+                        append: doc.append,
+                        closed: doc.ended || close.is_some(),
+                        edit: None,
+                    });
+                }
+            }
+            continue;
+        };
+        // Search/replace pairs, not the file whole: an edit block.
+        if body.iter().any(|l| is_search(l)) {
+            let file = File { path, content: String::new() };
+            blocks.push(Block { file, fence: at, end: i, append: false, closed: close.is_some(), edit: Some(edits(&body)) });
+            continue;
+        }
         let mut content = body.join("\n");
         content.push('\n');
-        blocks.push(Block { file: File { path, content }, fence: at });
+        blocks.push(Block { file: File { path, content }, fence: at, end: i, append: false, closed: close.is_some(), edit: None });
     }
     blocks
+}
+
+/// A heredoc of a shell block that writes a file, by its lines in the
+/// block: `from` its `cat` line to `to`, past its end word.
+struct Heredoc {
+    path: String,
+    content: String,
+    append: bool,
+    from: usize,
+    to: usize,
+    /// Its end word has come.
+    ended: bool,
+}
+
+/// The heredocs in a shell block's `body` that write a file.
+fn heredocs(body: &[&str]) -> Vec<Heredoc> {
+    let mut docs = Vec::new();
+    let mut k = 0;
+    while k < body.len() {
+        let line = body[k];
+        k += 1;
+        let Some((word, tabs)) = heredoc_word(line) else { continue };
+        let from = k - 1;
+        let mut end = k;
+        while end < body.len() && !ends_heredoc(body[end], &word) {
+            end += 1;
+        }
+        let ended = end < body.len();
+        let to = if ended { end + 1 } else { end };
+        if let Some((path, append)) = heredoc_target(line) {
+            let content: String = body[k..end]
+                .iter()
+                .map(|l| if tabs { l.trim_start_matches('\t') } else { l })
+                .flat_map(|l| [l, "\n"])
+                .collect();
+            docs.push(Heredoc { path, content, append, from, to, ended });
+        }
+        k = to;
+    }
+    docs
+}
+
+/// Info strings of a block whose heredocs can write files: a shell block,
+/// or one that names no language.
+fn heredoc_lang(info: &str) -> bool {
+    let lang = info.split_whitespace().next().unwrap_or("").to_lowercase();
+    lang.is_empty() || SHELL_LANGS.contains(&lang.as_str())
+}
+
+/// The end word of a heredoc `line` starts (`<<EOF`, `<<'EOF'`,
+/// `<<-"EOF"`), and whether its body's leading tabs go (`<<-`).
+fn heredoc_word(line: &str) -> Option<(String, bool)> {
+    if line.contains("$((") {
+        return None;
+    }
+    let at = line.find("<<")?;
+    let rest = &line[at + 2..];
+    if rest.starts_with('<') || line[..at].ends_with('<') {
+        return None;
+    }
+    let (tabs, rest) = match rest.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, rest),
+    };
+    let word: String =
+        rest.trim_start().chars().take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '|' | '&' | '>' | '<' | ')')).collect();
+    let word = word.trim_start_matches('\\').trim_matches(|c| c == '\'' || c == '"');
+    let named = word.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && word.chars().all(|c| c.is_alphanumeric() || c == '_');
+    named.then(|| (word.to_string(), tabs))
+}
+
+/// Whether `line` ends the heredoc whose end word is `word`.
+fn ends_heredoc(line: &str, word: &str) -> bool {
+    line.trim() == word
+}
+
+/// The file a heredoc `line` writes, and whether it adds to it (`>>`):
+/// `cat > path <<'EOF'`, `cat <<EOF >> path`, `tee path <<EOF`, after any
+/// `mkdir -p dir &&`. None for a heredoc that does anything else.
+fn heredoc_target(line: &str) -> Option<(String, bool)> {
+    let mut parts: Vec<&str> = line.split("&&").map(str::trim).collect();
+    let last = parts.pop()?;
+    if parts.iter().any(|p| !p.starts_with("mkdir ")) {
+        return None;
+    }
+    if last.contains(['|', ';', '`', '$']) {
+        return None;
+    }
+    // The heredoc's own part goes: `<<`, `-`, and the word, quoted or not.
+    let at = last.find("<<")?;
+    let rest = last[at + 2..].trim_start_matches('-').trim_start();
+    let word_len = rest.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(rest.len());
+    let command = format!("{} {}", &last[..at], &rest[word_len..]);
+    let mut words: Vec<String> = Vec::new();
+    for word in command.split_whitespace() {
+        // `>path` and `>>path` as two words.
+        let (op, rest) = if let Some(rest) = word.strip_prefix(">>") {
+            (">>", rest)
+        } else if let Some(rest) = word.strip_prefix('>') {
+            (">", rest)
+        } else {
+            ("", word)
+        };
+        words.extend([op, rest].into_iter().filter(|w| !w.is_empty()).map(|w| w.trim_matches(['\'', '"']).to_string()));
+    }
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let (path, append) = match words.as_slice() {
+        ["cat", ">", path] => (*path, false),
+        ["cat", ">>", path] => (*path, true),
+        ["tee", rest @ ..] => {
+            let append = rest.iter().any(|w| matches!(*w, "-a" | "--append"));
+            let rest: Vec<&str> = rest.iter().copied().filter(|w| !matches!(*w, "-a" | "--append")).collect();
+            match rest.as_slice() {
+                [path] | [path, ">", "/dev/null"] => (*path, append),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    as_path(path).map(|path| (path, append))
+}
+
+/// The line that closes the block opened at `lines[open]`, by `fence`;
+/// none while it's open. In a shell block, a fence line in a heredoc is
+/// the heredoc's, so long as the heredoc's end word comes after it, as a
+/// README written with `cat` has its own code blocks.
+pub(crate) fn close_of(lines: &[&str], open: usize, fence: &str, info: &str) -> Option<usize> {
+    let shell = heredoc_lang(info);
+    let mut doc: Option<String> = None;
+    for i in open + 1..lines.len() {
+        let line = lines[i];
+        if let Some(word) = &doc {
+            if ends_heredoc(line, word) {
+                doc = None;
+            } else if closes(line, fence) && !lines[i + 1..].iter().any(|l| ends_heredoc(l, word)) {
+                return Some(i);
+            }
+            continue;
+        }
+        if closes(line, fence) {
+            return Some(i);
+        }
+        if shell {
+            doc = heredoc_word(line).map(|(word, _)| word);
+        }
+    }
+    None
 }
 
 /// The shell commands `reply` gives to run, one script per fenced block
@@ -530,7 +904,8 @@ pub fn blocks(reply: &str) -> Vec<Block> {
 /// that names no file, in order. A block written as a transcript, with
 /// `$ ` ahead of each command, keeps the commands and not what they
 /// printed. A block with a path above or in its fence is a file to write,
-/// not a script to run.
+/// not a script to run; so is a heredoc that writes a file, which is taken
+/// out of its script.
 pub fn commands(reply: &str) -> Vec<String> {
     let files: Vec<usize> = blocks(reply).iter().map(|b| b.fence).collect();
     let lines: Vec<&str> = reply.lines().collect();
@@ -541,15 +916,20 @@ pub fn commands(reply: &str) -> Vec<String> {
         i += 1;
         let Some((fence, info)) = opening_fence(lines[at]) else { continue };
         let start = i;
-        while i < lines.len() && !closes(lines[i], &fence) {
-            i += 1;
-        }
-        let body = &lines[start..i];
-        i = (i + 1).min(lines.len());
+        let close = close_of(&lines, at, &fence, info);
+        let body = &lines[start..close.unwrap_or(lines.len())];
+        i = close.map_or(lines.len(), |c| c + 1);
         let lang = info.split_whitespace().next().unwrap_or("").to_lowercase();
         if files.contains(&at) || !SHELL_LANGS.contains(&lang.as_str()) {
             continue;
         }
+        let written: Vec<(usize, usize)> = heredocs(body).iter().map(|d| (d.from, d.to)).collect();
+        let body: Vec<&str> = body
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| !written.iter().any(|(from, to)| (*from..*to).contains(k)))
+            .map(|(_, l)| *l)
+            .collect();
         // A transcript, with prompts, shows what each command printed too:
         // only the commands are run.
         let prompted = |l: &str| l.starts_with("$ ") || l == "$";
@@ -574,9 +954,9 @@ const SHELL_LANGS: [&str; 6] = ["sh", "bash", "zsh", "shell", "console", "termin
 /// Whether `block`, a fenced block's text from its opening fence, has its
 /// closing fence: not while it streams.
 pub fn block_closed(block: &str) -> bool {
-    let mut lines = block.lines();
-    let Some((fence, _)) = lines.next().and_then(opening_fence) else { return false };
-    lines.any(|l| closes(l, &fence))
+    let lines: Vec<&str> = block.lines().collect();
+    let Some((fence, info)) = lines.first().and_then(|l| opening_fence(l)) else { return false };
+    close_of(&lines, 0, &fence, info).is_some()
 }
 
 /// Lines of context shown around a change in a diff.
@@ -1033,33 +1413,6 @@ fn build_script(root: &Path) -> bool {
         .is_some_and(|pkg| pkg["scripts"]["build"].is_string())
 }
 
-/// Remove the agent's own copy of a reply, at `copy`, when it's in `.out/`
-/// right under `root`, and `.out/` with it once empty; whether it went.
-pub fn remove_agent_copy(root: &Path, copy: &str) -> bool {
-    let out = root.join(".out");
-    let copy = Path::new(copy);
-    if copy.parent() != Some(out.as_path()) || copy.extension().is_none_or(|e| e != "md") {
-        return false;
-    }
-    let removed = fs::remove_file(copy).is_ok();
-    if removed {
-        // Fails, as it should, while anything else is in there.
-        let _ = fs::remove_dir(&out);
-    }
-    removed
-}
-
-/// `reply` without the link to `copy` the agent puts at its end.
-pub fn without_link(reply: &str, copy: &str) -> String {
-    let name = Path::new(copy).file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-    let posix = copy.replace('\\', "/");
-    let link = format!("[{}]({})", name, posix);
-    match reply.trim_end().strip_suffix(&link) {
-        Some(rest) => rest.trim_end().to_string(),
-        None => reply.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1206,25 +1559,6 @@ mod tests {
         // Near its size, it's taken as the whole file.
         let most = long.lines().skip(5).map(|l| format!("{}\n", l)).collect::<String>();
         assert_eq!(plan(dir.path(), vec![file(&most)], &[]).changed.len(), 1);
-    }
-
-    #[test]
-    fn the_agents_own_copy_goes_only_from_out() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join(".out");
-        fs::create_dir(&out).unwrap();
-        let copy = out.join("project_summary.md");
-        fs::write(&copy, "x").unwrap();
-        let elsewhere = dir.path().join("notes.md");
-        fs::write(&elsewhere, "x").unwrap();
-        assert!(!remove_agent_copy(dir.path(), &elsewhere.to_string_lossy()));
-        assert!(elsewhere.exists());
-        let copy = copy.to_string_lossy().into_owned();
-        assert!(remove_agent_copy(dir.path(), &copy));
-        assert!(!out.exists());
-        let reply = format!("Done.\n\n[project_summary.md]({})\n", copy);
-        assert_eq!(without_link(&reply, &copy), "Done.");
-        assert_eq!(without_link("Done.", &copy), "Done.");
     }
 
     #[test]
@@ -1391,5 +1725,139 @@ mod tests {
         assert!(wants_files("Generate a rust project"));
         assert!(wants_files("set up a vite app"));
         assert!(!wants_files("what does the contract say about renewals?"));
+    }
+
+    #[test]
+    fn heredocs_in_a_shell_block_are_files_and_not_commands() {
+        let reply = "Done.\n\n```sh\nmkdir -p src && cat > src/main.rs <<'EOF'\nfn main() {}\nEOF\ncat >Cargo.toml << \"EOF\"\n[package]\nEOF\ngit add -A\n```\n";
+        let files = extract(reply);
+        assert_eq!(paths(reply), ["src/main.rs", "Cargo.toml"]);
+        assert_eq!(files[0].content, "fn main() {}\n");
+        assert_eq!(files[1].content, "[package]\n");
+        assert_eq!(commands(reply), ["git add -A"]);
+        let blocks = blocks(reply);
+        assert_eq!((blocks[0].fence, blocks[0].end, blocks[0].closed), (3, 6, true));
+    }
+
+    #[test]
+    fn a_fence_inside_a_heredoc_is_the_files() {
+        let reply = "```sh\ncat > README.md <<'EOF'\n# Hi\n```\ncargo run\n```\nEOF\n```\nafter";
+        assert_eq!(extract(reply)[0].content, "# Hi\n```\ncargo run\n```\n");
+        assert!(commands(reply).is_empty());
+        // Its end word not come yet, the fence still closes the block.
+        let cut = "```sh\ncat > a.txt <<EOF\nhi\n```\nmore prose";
+        assert_eq!(extract(cut)[0].content, "hi\n");
+        assert!(blocks(cut)[0].closed);
+    }
+
+    #[test]
+    fn a_heredoc_streaming_in_is_open() {
+        let blocks = blocks("```sh\ncat > a.txt <<'EOF'\none\ntw");
+        assert_eq!(blocks[0].file.content, "one\ntw\n");
+        assert!(!blocks[0].closed);
+    }
+
+    fn edit(search: &str, replace: &str) -> Edit {
+        Edit { search: search.into(), replace: replace.into() }
+    }
+
+    #[test]
+    fn an_edit_block_gives_its_search_and_replace_pairs() {
+        let reply = "Fix:\n\n```edit src/main.rs\n<<<<<<< SEARCH\n    old();\n=======\n    new();\n>>>>>>> REPLACE\n<<<<<<< SEARCH\nfn a() {}\n=======\n>>>>>>> REPLACE\n```\n";
+        let blocks = blocks(reply);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].file.path, "src/main.rs");
+        assert_eq!(blocks[0].edit.as_deref(), Some(&[edit("    old();", "    new();"), edit("fn a() {}", "")][..]));
+        // Not a command to run, and not the file whole.
+        assert!(commands(reply).is_empty());
+        // Still coming in, only the pairs that have ended count.
+        let open = "```edit a.rs\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n<<<<<<< SEARCH\nz\n=======\n";
+        let blocks = super::blocks(open);
+        assert!(!blocks[0].closed);
+        assert_eq!(blocks[0].edit.as_deref(), Some(&[edit("x", "y")][..]));
+    }
+
+    #[test]
+    fn an_edit_blocks_path_may_be_its_first_line() {
+        let reply = "```edit\nsrc/sound.js\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```\n\n```edit\n**index.html**\n<<<<<<< SEARCH\nc\n=======\nd\n>>>>>>> REPLACE\n```\n";
+        let blocks = blocks(reply);
+        let paths: Vec<&str> = blocks.iter().map(|b| b.file.path.as_str()).collect();
+        assert_eq!(paths, ["src/sound.js", "index.html"]);
+        assert_eq!(blocks[0].edit.as_deref(), Some(&[edit("a", "b")][..]));
+    }
+
+    #[test]
+    fn edits_are_made_in_turn_found_once() {
+        let file = "fn main() {\n    old();\n}\n\nfn a() {}\n";
+        let made = apply_edits(Some(file), &[edit("    old();", "    new();\n    more();"), edit("fn a() {}", "fn b() {}")]);
+        assert_eq!(made.unwrap(), "fn main() {\n    new();\n    more();\n}\n\nfn b() {}\n");
+        // Taking lines out.
+        assert_eq!(apply_edits(Some("a\nb\nc\n"), &[edit("b", "")]).unwrap(), "a\n\nc\n");
+        assert_eq!(apply_edits(Some("a\nb\nc\n"), &[edit("b\n", "")]).unwrap(), "a\nc\n");
+        // Found twice, or not at all, it isn't made.
+        let twice = apply_edits(Some("x\nx\n"), &[edit("x", "y")]).unwrap_err();
+        assert!(twice.contains("found 2 times"), "{twice}");
+        let missing = apply_edits(Some("a\n"), &[edit("a\n", "b"), edit("zz", "y")]).unwrap_err();
+        assert!(missing.starts_with("edit 2 of 2") && missing.contains("isn't in the file"), "{missing}");
+        // A new file from an empty search; an existing one isn't replaced so.
+        assert_eq!(apply_edits(None, &[edit("", "hi")]).unwrap(), "hi\n");
+        assert!(apply_edits(None, &[edit("a", "b")]).is_err());
+        assert!(apply_edits(Some("a\n"), &[edit("", "b")]).is_err());
+    }
+
+    #[test]
+    fn an_edit_is_found_past_whitespace_and_by_its_ends() {
+        let file = "fn main() {\n\tlet x = 1;\n    let y  = 2;\n}\n";
+        // Indented otherwise.
+        let made = apply_edits(Some(file), &[edit("  let x = 1;\n  let y  = 2;", "\tlet z = 3;")]).unwrap();
+        assert_eq!(made, "fn main() {\n\tlet z = 3;\n}\n");
+        // Spaced otherwise inside the line.
+        let made = apply_edits(Some(file), &[edit("let y = 2;", "let y = 4;")]).unwrap();
+        assert_eq!(made, "fn main() {\n\tlet x = 1;\nlet y = 4;\n}\n");
+        // Its middle a little off, found by its first and last lines.
+        let file = "a\nb\nc\nd\ne\nf\n";
+        let made = apply_edits(Some(file), &[edit("b\nC!\nd\ne", "x")]).unwrap();
+        assert_eq!(made, "a\nx\nf\n");
+    }
+
+    #[test]
+    fn a_reply_s_edits_change_the_file_there_or_say_why_not() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn a() {\n    old();\n}\n").unwrap();
+        fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let reply = "```edit a.rs\n<<<<<<< SEARCH\n    old();\n=======\n    new();\n>>>>>>> REPLACE\n```\n\n\
+                     ```edit b.rs\n<<<<<<< SEARCH\nnope\n=======\nx\n>>>>>>> REPLACE\n```\n\n\
+                     ```edit a.rs\n<<<<<<< SEARCH\n    new();\n=======\n    newer();\n>>>>>>> REPLACE\n```\n";
+        let found = extract_in(dir.path(), reply);
+        assert_eq!(found.files, [File { path: "a.rs".into(), content: "fn a() {\n    newer();\n}\n".into() }]);
+        assert_eq!(found.edited, ["a.rs"]);
+        assert_eq!(found.failed.len(), 1);
+        assert_eq!(found.failed[0].0, "b.rs");
+    }
+
+    #[test]
+    fn appending_adds_to_the_file_there() {
+        let dir = std::env::temp_dir().join(format!("docent-append-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("notes.txt"), "a\n").unwrap();
+        let reply = "```sh\ncat >> notes.txt <<'EOF'\nb\nEOF\ntee -a notes.txt <<EOF\nc\nEOF\n```\n";
+        let files = extract_in(&dir, reply).files;
+        assert_eq!(files, [File { path: "notes.txt".into(), content: "a\nb\nc\n".into() }]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn heredocs_that_dont_write_a_file_stay_commands() {
+        for line in ["cat <<EOF | sh", "cat > /etc/hosts <<EOF", "cat > ../x.txt <<EOF", "python3 - <<'PY'"] {
+            let reply = format!("```sh\n{line}\nbody\nEOF\nPY\n```\n");
+            assert!(extract(&reply).is_empty(), "{line}");
+            assert!(!commands(&reply).is_empty(), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_skill_is_a_file_under_docent() {
+        let reply = "```sh\nmkdir -p .docent/skills/review && cat > .docent/skills/review/SKILL.md <<'EOF'\n---\nname: review\n---\nRead it.\nEOF\n```";
+        assert_eq!(paths(reply), [".docent/skills/review/SKILL.md"]);
     }
 }
