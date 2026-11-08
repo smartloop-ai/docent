@@ -733,7 +733,10 @@ impl Reply {
                     // as its change.
                     let span = start + segment.lines().count();
                     let docs: Vec<&files::Block> = match (code, file) {
-                        (true, None) => blocks.iter().filter(|b| b.fence > start && b.fence < span).collect(),
+                        // Not an edit's pairs, fenced by `segments` when bare.
+                        (true, None) if !segment.lines().nth(1).is_some_and(files::is_search) => {
+                            blocks.iter().filter(|b| b.fence > start && b.fence < span).collect()
+                        }
                         _ => Vec::new(),
                     };
                     let streaming = code && (file.is_some() || !docs.is_empty()) && !files::block_closed(&segment);
@@ -887,7 +890,7 @@ impl Reply {
                 let mut part = vec![Line::from(vec![
                     Span::styled("← ", dim()),
                     Span::styled(path.clone(), Style::new().bold()),
-                    Span::styled(format!(" · not changed: {why}"), Style::new().fg(Color::Yellow)),
+                    Span::styled(format!(" · not changed: {}", files::plainly(&why)), Style::new().fg(Color::Yellow)),
                 ])];
                 part.extend(code_lines(segment, width));
                 part
@@ -930,6 +933,21 @@ fn segments(text: &str) -> Vec<(bool, String, usize)> {
     let mut out: Vec<(bool, String, usize)> = Vec::new();
     let (mut prose, mut i) = (0, 0);
     while i < lines.len() {
+        // SEARCH/REPLACE pairs with no fence are an edit all the same:
+        // drawn as a block, fenced here, not run together as prose.
+        if let Some((end, closed)) = files::bare_edit(&lines, i) {
+            if prose < i {
+                out.push((false, lines[prose..i].join("\n"), prose));
+            }
+            let body = &lines[i..end];
+            let longest = body.iter().map(|l| l.trim_start().chars().take_while(|c| *c == '`').count()).max().unwrap_or(0);
+            let fence = "`".repeat(longest.max(2) + 1);
+            let close = if closed { format!("\n{fence}") } else { String::new() };
+            out.push((true, format!("{fence}\n{}{close}", body.join("\n")), i));
+            i = end;
+            prose = end;
+            continue;
+        }
         let Some((fence, info)) = files::opening_fence(lines[i]) else {
             i += 1;
             continue;
@@ -1792,7 +1810,7 @@ impl App {
                 format!("{}\n\n", c.text)
             });
             // The machine first: a prompt cut to a model's window keeps its head.
-            message = format!("{}\n{}{}\n\n{}", files::system_context(), context, message, files::HINT);
+            message = format!("{}\n{}{}\n\n{}\n\n{}", files::system_context(), context, message, files::HINT, files::EDIT_EXAMPLE);
             // Its language server starts now, indexing while the reply comes,
             // to be ready for the files it gives.
             if !cfg!(test)
@@ -2319,7 +2337,7 @@ impl App {
         }
         if !failed.is_empty() {
             for (path, why) in &failed {
-                self.entries.push(Entry::Warning(format!("Not changed, {}: {}", path, why)));
+                self.entries.push(Entry::Warning(format!("Not changed, {}: {}", path, files::plainly(why))));
             }
             if self.edit_round < EDIT_ROUNDS {
                 self.edit_round += 1;
@@ -2357,9 +2375,11 @@ impl App {
         let message = format!(
             "These edits from your last reply couldn't be made, so those files weren't changed:\n{}\n\n{}\n\nGive \
              just those edits again, as edit blocks whose SEARCH text is copied exactly from the file as it is now \
-             and is found in it once. Don't repeat the changes that were made.",
+             and is found in it once, each with its `<<<<<<< SEARCH`, `=======` and `>>>>>>> REPLACE` lines. Don't \
+             repeat the changes that were made.\n\n{}",
             reasons.join("\n"),
-            files.join("\n\n")
+            files.join("\n\n"),
+            files::EDIT_EXAMPLE
         );
         self.send_turn(format!("Redo the edits to {}", paths.join(", ")), message, Vec::new(), true);
     }
@@ -6579,7 +6599,7 @@ mod tests {
         // nothing, it's still the whole file.
         assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "one\n2\nthree\n");
         assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "b\n");
-        assert!(app.entries.iter().any(|e| matches!(e, Entry::Warning(w) if w.starts_with("Not changed, b.txt: the edit: its SEARCH isn't in the file"))));
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Warning(w) if w.starts_with("Not changed, b.txt: the lines it replaces aren't in the file"))));
         // The one that doesn't goes back to the agent, with the file.
         assert_eq!(app.edit_round, 1);
         assert!(app.turn.is_some(), "the edit was asked for again");
@@ -6609,7 +6629,21 @@ mod tests {
         reply.text.push_str("\n```edit a.txt\n<<<<<<< SEARCH\nnope\n=======\nx\n>>>>>>> REPLACE\n```\n");
         reply.stats = Some(TurnStats::default());
         let shown = rows(&reply);
-        assert!(shown.iter().any(|r| r.starts_with("← a.txt · not changed: the edit: its SEARCH isn't in the file")), "{:?}", shown);
+        assert!(shown.iter().any(|r| r.starts_with("← a.txt · not changed: the lines it replaces aren't in the file")), "{:?}", shown);
+    }
+
+    #[test]
+    fn an_edit_given_bare_shows_as_its_change_not_as_prose() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let mut reply = Reply { root: Some(dir.path().to_path_buf()), ..Default::default() };
+        let rows = |reply: &Reply| -> Vec<String> { reply.body(60).iter().map(|l| l.to_string().trim_end().to_string()).collect() };
+        reply.text = "Fix:\n\na.txt\n<<<<<<< SEARCH\ntwo\n=======\n2\n>>>>>>> REPLACE\n\nDone.\n".into();
+        reply.stats = Some(TurnStats::default());
+        let shown = rows(&reply);
+        assert!(shown.contains(&"← a.txt  +1 −1".to_string()), "{:?}", shown);
+        assert!(!shown.iter().any(|r| r.contains("SEARCH")), "{:?}", shown);
+        assert_eq!(files::extract_in(dir.path(), &reply.text).files[0].content, "one\n2\nthree\n");
     }
 
     #[test]

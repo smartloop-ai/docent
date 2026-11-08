@@ -20,7 +20,8 @@ pub const HINT: &str = "If your answer creates or changes files, start with a sh
 changed and why. To change a file that's there, don't give it whole: give an edit block, a fenced block \
 marked `edit` with the file's path, as ```` ```edit src/main.rs ````, holding one or more changes, each as a \
 line `<<<<<<< SEARCH`, the lines to change copied exactly from the file, a line `=======`, the lines to put in \
-their place, then a line `>>>>>>> REPLACE`. Each SEARCH must be found in the file once: give a few unchanged \
+their place, then a line `>>>>>>> REPLACE`; never leave out any of those three lines, and never split one change over two \
+blocks. Each SEARCH must be found in the file once: give a few unchanged \
 lines around a change when a line alone could be found twice, and keep it short otherwise. A new file you write \
 whole with a shell heredoc in a fenced block marked `sh`: a line `cat > path/to/file <<'EOF'`, with the path \
 relative to the working folder, then the file's complete contents, then `EOF` alone on its line. When a file's \
@@ -37,6 +38,10 @@ remote as given below, never a placeholder like `<your-username>`; something you
 a remote that isn't set, ask me for instead. A command that keeps running until it's stopped, such as a dev \
 server or a watcher, you give with `&` at its end, as `npm run dev &`, in a block of its own: it's started in \
 the background, and what comes after doesn't wait for it.";
+
+/// An edit block as it's to be written, shown to the agent with `HINT`
+/// and again when its edits are asked for over.
+pub const EDIT_EXAMPLE: &str = "For example, to change one line of `src/app.js`:\n\n```edit src/app.js\n<<<<<<< SEARCH\nconst speed = 2;\n=======\nconst speed = 3;\n>>>>>>> REPLACE\n```";
 
 /// Files at a folder's top that say it's a code project, and its kind.
 const MARKERS: [(&str, &str); 14] = [
@@ -539,7 +544,7 @@ fn gather(reply: &str, on_disk: impl Fn(&str) -> Option<String>) -> Extracted {
 }
 
 /// A line opening an edit's search text: `<<<<<<< SEARCH`.
-fn is_search(line: &str) -> bool {
+pub(crate) fn is_search(line: &str) -> bool {
     let t = line.trim();
     t.starts_with("<<<<<<<") && t.trim_start_matches('<').trim() == "SEARCH"
 }
@@ -554,6 +559,48 @@ fn is_replace(line: &str) -> bool {
 fn is_divider(line: &str) -> bool {
     let t = line.trim();
     t.len() >= 7 && t.chars().all(|c| c == '=')
+}
+
+/// An edit given bare, its SEARCH/REPLACE pairs outside any fence, as
+/// models also write it, when `lines[k]` opens it: the index past its
+/// last pair (past the reply while one is still coming in), and whether
+/// it has ended, its last pair done and something else after it.
+pub(crate) fn bare_edit(lines: &[&str], k: usize) -> Option<(usize, bool)> {
+    if !is_search(lines.get(k)?) {
+        return None;
+    }
+    let mut at = k;
+    loop {
+        let Some(divider) = (at + 1..lines.len()).find(|&j| is_divider(lines[j])) else { return Some((lines.len(), false)) };
+        let Some(replace) = (divider + 1..lines.len()).find(|&j| is_replace(lines[j])) else { return Some((lines.len(), false)) };
+        let next = (replace + 1..lines.len()).find(|&j| !lines[j].trim().is_empty());
+        match next {
+            Some(j) if is_search(lines[j]) => at = j,
+            Some(_) => return Some((replace + 1, true)),
+            None => return Some((replace + 1, false)),
+        }
+    }
+}
+
+/// The pairs of an edit block's `body` given with no SEARCH lines: each
+/// runs to a REPLACE line or the body's end and has one `=======`. None
+/// when one hasn't.
+fn markerless_edits(body: &[&str]) -> Vec<Edit> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while from < body.len() {
+        let to = (from..body.len()).find(|&j| is_replace(body[j])).unwrap_or(body.len());
+        let chunk = &body[from..to];
+        from = to + 1;
+        if chunk.iter().all(|l| l.trim().is_empty()) {
+            continue;
+        }
+        let dividers: Vec<usize> = (0..chunk.len()).filter(|&k| is_divider(chunk[k])).collect();
+        let [d] = dividers.as_slice() else { return Vec::new() };
+        let lead = chunk.iter().take_while(|l| l.trim().is_empty()).count().min(*d);
+        out.push(Edit { search: chunk[lead..*d].join("\n"), replace: chunk[d + 1..].join("\n") });
+    }
+    out
 }
 
 /// The search/replace pairs of an edit block's `body` that have ended;
@@ -597,6 +644,31 @@ pub fn apply_edits(old: Option<&str>, edits: &[Edit]) -> Result<String, String> 
         text = replace_once(&text, edit).map_err(|why| format!("{which}: {why}"))?;
     }
     Ok(text)
+}
+
+/// Why an edit couldn't be made, as `apply_edits` tells the agent, put
+/// for the person reading along: what's wrong with the change, not the
+/// format it was to be written in.
+pub fn plainly(why: &str) -> String {
+    let (which, rest) = match why.split_once(": ") {
+        Some((which, rest)) if which == "the edit" || which.starts_with("edit ") => (which.replacen("edit", "change", 1), rest),
+        _ => (String::new(), why),
+    };
+    let what = if rest.starts_with("the edit block has no complete") {
+        "the change came in a form that can't be read".to_string()
+    } else if rest.starts_with("the file isn't there") {
+        "the file isn't there".to_string()
+    } else if rest.contains("has an empty SEARCH") {
+        let which = rest.split(" has an empty").next().unwrap_or("").replacen("edit", "change", 1);
+        return format!("{which} doesn't say which lines it replaces");
+    } else if let Some(n) = rest.strip_prefix("its SEARCH is found ").and_then(|r| r.split(' ').next()) {
+        format!("the lines it replaces are in the file {n} times, so it's unclear which to change")
+    } else if rest.starts_with("its SEARCH isn't in the file") {
+        "the lines it replaces aren't in the file as it is now".to_string()
+    } else {
+        rest.to_string()
+    };
+    if which.is_empty() || which == "the change" { what } else { format!("{which}: {what}") }
 }
 
 /// `text` with `edit`'s search text, found once, replaced.
@@ -666,6 +738,19 @@ pub fn blocks(reply: &str) -> Vec<Block> {
         let at = i;
         i += 1;
         let Some((fence, info)) = opening_fence(line) else {
+            // SEARCH/REPLACE pairs with no fence around them: an edit of
+            // the file named on the line above.
+            if let Some((end, closed)) = bare_edit(&lines, at) {
+                if let Some((_, label)) = above
+                    && let Some(path) = label_path(label)
+                {
+                    let file = File { path, content: String::new() };
+                    blocks.push(Block { file, fence: at, end, append: false, closed, edit: Some(edits(&lines[at..end])) });
+                }
+                i = end;
+                above = None;
+                continue;
+            }
             // A path on a line of its own, then a block indented by four
             // spaces rather than fenced, as markdown also has it, is that
             // file too.
@@ -742,6 +827,18 @@ pub fn blocks(reply: &str) -> Vec<Block> {
         if body.iter().any(|l| is_search(l)) {
             let file = File { path, content: String::new() };
             blocks.push(Block { file, fence: at, end: i, append: false, closed: close.is_some(), edit: Some(edits(&body)) });
+            continue;
+        }
+        // A block marked `edit` is never the file whole, markers or not.
+        // Without its SEARCH lines, as models also write it, each pair
+        // starts where the block or the last REPLACE line leaves off: what
+        // to find above its `=======`, what goes in its place below it, to
+        // its REPLACE line or the block's end. Anything else is no edit,
+        // and asked for again.
+        if info.split_whitespace().next() == Some("edit") {
+            let edit = if close.is_some() { markerless_edits(&body) } else { Vec::new() };
+            let file = File { path, content: String::new() };
+            blocks.push(Block { file, fence: at, end: i, append: false, closed: close.is_some(), edit: Some(edit) });
             continue;
         }
         let mut content = body.join("\n");
@@ -1775,6 +1872,58 @@ mod tests {
         let blocks = super::blocks(open);
         assert!(!blocks[0].closed);
         assert_eq!(blocks[0].edit.as_deref(), Some(&[edit("x", "y")][..]));
+    }
+
+    #[test]
+    fn an_edit_block_is_never_the_file_whole() {
+        // Its markers left out: above the divider is found, below goes in.
+        let reply = "```edit src/main.js\nold();\n=======\nnew();\n```\n";
+        let blocks = blocks(reply);
+        assert_eq!(blocks[0].edit.as_deref(), Some(&[edit("old();", "new();")][..]));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.js"), "a();\nold();\nb();\n").unwrap();
+        assert_eq!(extract_in(dir.path(), reply).files[0].content, "a();\nnew();\nb();\n");
+        // No divider, or more than one: no edit, and nothing written.
+        for body in ["new();", "a\n=======\nb\n=======\nc"] {
+            let found = extract_in(dir.path(), &format!("```edit src/main.js\n{body}\n```\n"));
+            assert!(found.files.is_empty(), "{body}");
+            assert_eq!(found.failed.len(), 1, "{body}");
+        }
+    }
+
+    #[test]
+    fn why_an_edit_failed_is_put_plainly() {
+        let none = apply_edits(Some("a\n"), &[]).unwrap_err();
+        assert_eq!(plainly(&none), "the change came in a form that can't be read");
+        let missing = apply_edits(Some("a\n"), &[edit("zzz", "y")]).unwrap_err();
+        assert_eq!(plainly(&missing), "the lines it replaces aren't in the file as it is now");
+        let twice = apply_edits(Some("a\nb\na\n"), &[edit("b", "c"), edit("a", "y")]).unwrap_err();
+        assert_eq!(plainly(&twice), "change 2 of 2: the lines it replaces are in the file 2 times, so it's unclear which to change");
+        let empty = apply_edits(Some("a\n"), &[edit("", "y")]).unwrap_err();
+        assert_eq!(plainly(&empty), "the change doesn't say which lines it replaces");
+        assert!([none, missing, twice, empty].iter().all(|w| !plainly(w).contains("SEARCH")));
+    }
+
+    #[test]
+    fn an_edit_block_may_leave_out_its_search_lines() {
+        let reply = "```edit a.js\nold();\n=======\nnew();\n>>>>>>> REPLACE\n\nx();\n=======\ny();\n>>>>>>> REPLACE\n```\n";
+        assert_eq!(blocks(reply)[0].edit.as_deref(), Some(&[edit("old();", "new();"), edit("x();", "y();")][..]));
+    }
+
+    #[test]
+    fn an_edit_given_bare_is_an_edit_of_the_file_named_above() {
+        let reply = "Now the canvas.\n\n**src/game.js**\n<<<<<<< SEARCH\nconst w = 1;\n=======\nconst w = 2;\n>>>>>>> REPLACE\n\n<<<<<<< SEARCH\ncanvas.\n=======\nboard.\n>>>>>>> REPLACE\n\nDone.\n";
+        let blocks = blocks(reply);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].file.path, "src/game.js");
+        assert!(blocks[0].closed);
+        assert_eq!(blocks[0].edit.as_deref(), Some(&[edit("const w = 1;", "const w = 2;"), edit("canvas.", "board.")][..]));
+        // Still coming in, it hasn't ended.
+        let open = "src/game.js\n<<<<<<< SEARCH\nconst w = 1;\n=======\nconst w = 2;\n>>>>>>> REPLACE\n";
+        assert!(!super::blocks(open)[0].closed);
+        // With no file named, it isn't one.
+        assert!(super::blocks("<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n").is_empty());
     }
 
     #[test]
