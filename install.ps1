@@ -136,11 +136,10 @@ try {
     # the application directory.
     Copy-Item -Path (Join-Path $tmp "$name\*.dll") -Destination $InstallDir -Force
 
-    # `smartloop` is the same binary under its old name, so existing commands
-    # and scripts still run; symlinks need admin.
-    Copy-Item -Path (Join-Path $InstallDir 'docent.exe') -Destination (Join-Path $InstallDir 'smartloop.exe') -Force
+    # The `smartloop.exe` copy an older install left goes.
+    Remove-Item -Path (Join-Path $InstallDir 'smartloop.exe') -Force -ErrorAction SilentlyContinue
 
-    Write-Host "${GREEN}Installed${NC} $(Join-Path $InstallDir 'docent.exe') ${MUTED}(also as${NC} smartloop${MUTED})${NC}"
+    Write-Host "${GREEN}Installed${NC} $(Join-Path $InstallDir 'docent.exe')"
 
     Write-Host "${MUTED}Processing triggers for docent ($version) ...$NC"
 

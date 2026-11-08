@@ -924,14 +924,7 @@ fn main() {
         exit(code);
     }
 
-    // Installed as `docent`, and as `smartloop` for those who had it under
-    // its old name: name it as it was run.
-    let smartloop = std::env::args_os()
-        .next()
-        .and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s == "smartloop"))
-        .unwrap_or_default();
-    let name = if smartloop { "smartloop" } else { "docent" };
-    let args = Args::from_arg_matches(&Args::command().name(name).bin_name(name).get_matches())
+    let args = Args::from_arg_matches(&Args::command().name("docent").bin_name("docent").get_matches())
         .unwrap_or_else(|e| e.exit());
 
     // Bare `docent` is `docent run`, options and all.
