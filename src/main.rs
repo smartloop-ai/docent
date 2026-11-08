@@ -13,6 +13,7 @@ mod docent;
 mod files;
 mod framework;
 mod links;
+mod lsp;
 mod mcp;
 mod progress;
 mod tui;

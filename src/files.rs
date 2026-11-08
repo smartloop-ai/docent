@@ -314,7 +314,7 @@ pub fn system_context() -> &'static str {
 }
 
 /// Whether `tool` is a program in a `PATH` directory.
-fn on_path(tool: &str) -> bool {
+pub(crate) fn on_path(tool: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else { return false };
     let names: Vec<String> = if cfg!(windows) {
         ["exe", "cmd", "bat"].iter().map(|ext| format!("{}.{}", tool, ext)).collect()

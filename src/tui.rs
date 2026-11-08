@@ -49,7 +49,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::chat::{self, ChatEvent, TurnStats};
 use crate::progress::{self, Steps, format_duration, format_size};
 use crate::usage::{CreditUsage, SearchUsage};
-use crate::{ModelRow, docent, files, framework, mcp};
+use crate::{ModelRow, docent, files, framework, lsp, mcp};
 
 const LABEL_WIDTH: usize = 28;
 const DETAIL_WIDTH: usize = 12;
@@ -182,6 +182,9 @@ enum AppEvent {
     /// A check of the project after files were written: its shell entry's
     /// id, output and end.
     Check(usize, String, Ended),
+    /// The language servers' errors in the files written: the check's id,
+    /// the servers asked, and what they report.
+    Diagnostics(usize, Vec<&'static str>, Vec<lsp::Problem>),
 }
 
 /// One `Steps` call, carried from a worker thread to the app.
@@ -1197,6 +1200,9 @@ struct Check {
     id: usize,
     project: String,
     command: String,
+    /// Asked of the language servers, not run: the folder and the files,
+    /// to check with the build once they're clean.
+    servers: Option<(std::path::PathBuf, Vec<String>)>,
 }
 
 /// What a check's end calls for, by its exit code and whether the round
@@ -1214,6 +1220,9 @@ enum AfterCheck {
 /// The loop goes on as long as the errors are not fixed, round after round,
 /// and stops only when a round made no difference: the check's `output` is
 /// what it was after the last failure.
+/// Errors from the language servers shown, and sent to the agent.
+const DIAGNOSTICS_SHOWN: usize = 30;
+
 /// Times the agent's asked again for edits that didn't apply, before it's
 /// left to the user.
 const EDIT_ROUNDS: u32 = 2;
@@ -1292,6 +1301,10 @@ struct App {
     shell_context: Vec<String>,
     /// Ids for `!command` runs, so each result finds its entry.
     shell_runs: usize,
+    /// The language servers started this session, kept for the next turn.
+    lsp: Arc<lsp::Lsp>,
+    /// Checks asked of the language servers, for their ids.
+    lsp_runs: usize,
     /// The shell runs still going, which `/stop` ends, and quitting too.
     jobs: Vec<Job>,
     /// The check running on the project after a reply's files were
@@ -1390,6 +1403,8 @@ impl App {
             attachments: Vec::new(),
             shell_context: Vec::new(),
             shell_runs: 0,
+            lsp: Arc::default(),
+            lsp_runs: 0,
             jobs: Vec::new(),
             check: None,
             fix_round: 0,
@@ -1715,6 +1730,14 @@ impl App {
             });
             // The machine first: a prompt cut to a model's window keeps its head.
             message = format!("{}\n{}{}\n\n{}", files::system_context(), context, message, files::HINT);
+            // Its language server starts now, indexing while the reply comes,
+            // to be ready for the files it gives.
+            if !cfg!(test)
+                && let Some(kind) = files::project_kind(root)
+            {
+                let (lsp, root, kind) = (self.lsp.clone(), root.clone(), kind.to_string());
+                std::thread::spawn(move || lsp.warm(&root, &kind));
+            }
         }
         // The framework takes it from here: its orchestrator picks the
         // model and decides whether to search the web, for coding as for
@@ -2021,10 +2044,32 @@ impl App {
     /// changed, with the command for its kind, or each file's own, as a
     /// shell entry; what comes of it is handled when it ends.
     fn run_check(&mut self, root: &std::path::Path, written: &[String]) {
+        // The files written go to their language servers first, as
+        // opencode has an edit's errors from the server: quicker than the
+        // build, and they're the files' own.
+        if !cfg!(test) && lsp::Lsp::serves(written) {
+            let Some((project, _)) = self.project.clone() else { return };
+            self.lsp_runs += 1;
+            let id = self.lsp_runs;
+            let servers = Some((root.to_path_buf(), written.to_vec()));
+            self.check = Some(Check { id, project, command: "the language server".to_string(), servers });
+            let (lsp, dir, written) = (self.lsp.clone(), root.to_path_buf(), written.to_vec());
+            self.spawn(move |_, tx| {
+                let (asked, problems) = lsp.errors(&dir, &written);
+                let _ = tx.send(AppEvent::Diagnostics(id, asked, problems));
+            });
+            return;
+        }
+        self.run_build_check(root, written);
+    }
+
+    /// Check that the project at `root` still builds after `written`
+    /// changed, by its build command or each file's own.
+    fn run_build_check(&mut self, root: &std::path::Path, written: &[String]) {
         let Some((project, _)) = self.project.clone() else { return };
         let Some(command) = files::check_command(root, code_kind(root), written) else { return };
         let (id, report) = self.shell_entry(command.clone(), false);
-        self.check = Some(Check { id, project, command: command.clone() });
+        self.check = Some(Check { id, project, command: command.clone(), servers: None });
         if cfg!(test) {
             return;
         }
@@ -2040,8 +2085,47 @@ impl App {
     /// nothing.
     fn check_ended(&mut self, id: usize, output: String, ended: Ended) {
         self.shell_reported(id, &output, Some(ended));
-        let Some(check) = self.check.take_if(|c| c.id == id) else { return };
-        let code = ended.code();
+        let Some(check) = self.check.take_if(|c| c.id == id && c.servers.is_none()) else { return };
+        self.check_outcome(check, ended.code(), output);
+    }
+
+    /// The language servers have answered about the files written: their
+    /// errors go to the agent to fix as a failed check's do; none, the
+    /// build is checked.
+    fn diagnostics_ended(&mut self, id: usize, servers: Vec<&'static str>, problems: Vec<lsp::Problem>) {
+        let Some(mut check) = self.check.take_if(|c| c.id == id && c.servers.is_some()) else { return };
+        let Some((root, written)) = check.servers.clone() else { return };
+        if servers.is_empty() {
+            // None would start: the build is the check.
+            return self.run_build_check(&root, &written);
+        }
+        check.command = servers.join(", ");
+        if problems.is_empty() {
+            if self.project.as_ref().is_some_and(|(p, _)| *p == check.project) {
+                let files = if written.len() == 1 { written[0].clone() } else { format!("{} files", written.len()) };
+                self.entries.push(Entry::Notice(format!("{}: no errors in {}", check.command, files)));
+                self.run_build_check(&root, &written);
+                if self.check.is_none() {
+                    self.last_failure = None;
+                    self.run_commands();
+                }
+            }
+            return;
+        }
+        let shown: Vec<String> = problems.iter().take(DIAGNOSTICS_SHOWN).map(|p| p.to_string()).collect();
+        let more = problems.len().saturating_sub(DIAGNOSTICS_SHOWN);
+        let mut output = shown.join("\n");
+        if more > 0 {
+            output.push_str(&format!("\n…and {more} more"));
+        }
+        self.entries.push(Entry::Error(format!("{} reports {} error(s):\n{}", check.command, problems.len(), output)));
+        self.check_outcome(check, Some(1), output);
+    }
+
+    /// What a check that ended with `code` and `output` calls for: passed,
+    /// the reply's commands; failed, a round of fixes, unless the last one
+    /// changed nothing.
+    fn check_outcome(&mut self, check: Check, code: Option<i32>, output: String) {
         // The project switched meanwhile: its errors aren't this one's.
         if self.project.as_ref().is_none_or(|(p, _)| *p != check.project) {
             self.commands = None;
@@ -2060,10 +2144,13 @@ impl App {
                 self.last_failure = Some(output.clone());
                 self.entries.push(Entry::Notice(format!("Asking the agent to fix it (round {}; esc stops)", round)));
                 let shown = format!("Fix the errors from `{}`", check.command);
+                let what = match check.servers {
+                    Some(_) => format!("The language server ({}) reports these errors in the files after your change", check.command),
+                    None => format!("I ran `{}` in the project after your change; it failed", check.command),
+                };
                 let message = format!(
-                    "I ran `{}` in the project after your change; it failed:\n```\n{}\n```\nFix these errors in \
-                     the project's files, as before: an edit block for a file that's there, a heredoc for a new one.",
-                    check.command,
+                    "{what}:\n```\n{}\n```\nFix these errors in the project's files, as before: an edit block for \
+                     a file that's there, a heredoc for a new one.",
                     head(&output, SHELL_KEPT)
                 );
                 self.send_turn(shown, message, Vec::new(), true);
@@ -2439,6 +2526,7 @@ impl App {
             }
             AppEvent::Error(text) => self.entries.push(Entry::Error(text)),
             AppEvent::Check(id, output, code) => self.check_ended(id, output, code),
+            AppEvent::Diagnostics(id, servers, problems) => self.diagnostics_ended(id, servers, problems),
             AppEvent::Ran(id, project, output, code) => self.ran(id, project, output, code),
             AppEvent::Unrun(ids) => self.unrun(&ids),
             AppEvent::Started(id, pid) => {
@@ -6390,6 +6478,37 @@ mod tests {
         reply.stats = Some(TurnStats::default());
         let shown = rows(&reply);
         assert!(shown.iter().any(|r| r.starts_with("← a.txt · not changed: the edit: its SEARCH isn't in the file")), "{:?}", shown);
+    }
+
+    #[test]
+    fn a_language_servers_errors_go_to_the_agent_and_none_lead_to_the_build_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let asked = |app: &mut App, id: usize| {
+            let servers = Some((dir.path().to_path_buf(), vec!["main.c".to_string()]));
+            app.check = Some(Check { id, project: "p1".into(), command: "the language server".into(), servers });
+        };
+        // Errors: shown, and sent to be fixed.
+        asked(&mut app, 1);
+        let problem = lsp::Problem { path: "main.c".into(), line: 2, column: 12, message: "use of undeclared identifier 'x'".into() };
+        app.apply(AppEvent::Diagnostics(1, vec!["clangd"], vec![problem]));
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Error(t) if t.starts_with("clangd reports 1 error(s):\nmain.c:2:12: use of undeclared"))));
+        assert_eq!(app.fix_round, 1);
+        assert!(app.turn.is_some());
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::User(u) if u == "Fix the errors from `clangd`")));
+        app.stop_turn();
+        // A build check's end isn't taken for the servers'.
+        asked(&mut app, 2);
+        app.apply(AppEvent::Check(2, String::new(), Ended::Exited(0)));
+        assert!(app.check.is_some());
+        // None: said, and the build is checked.
+        app.apply(AppEvent::Diagnostics(2, vec!["clangd"], Vec::new()));
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "clangd: no errors in main.c")));
+        assert!(app.check.as_ref().is_none_or(|c| c.servers.is_none()));
     }
 
     #[test]
