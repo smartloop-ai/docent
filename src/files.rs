@@ -698,6 +698,17 @@ pub fn blocks(reply: &str) -> Vec<Block> {
         if path.is_none() {
             path = body.first().and_then(|first| comment_path(first));
         }
+        // An edit block's path on a line of its own ahead of its first
+        // SEARCH, as models also write it: ```` ```edit ````, then the path.
+        if path.is_none()
+            && let Some(first) = body.iter().position(|l| !l.trim().is_empty())
+            && !is_search(body[first])
+            && body[first..].iter().any(|l| is_search(l))
+            && let Some(named) = label_path(body[first])
+        {
+            path = Some(named);
+            body.drain(..=first);
+        }
         // A "File: src/main.rs" line leading the block names it, and goes;
         // so does a fence right under it, the block's real start, as small
         // models write it inside a bare one.
@@ -1764,6 +1775,15 @@ mod tests {
         let blocks = super::blocks(open);
         assert!(!blocks[0].closed);
         assert_eq!(blocks[0].edit.as_deref(), Some(&[edit("x", "y")][..]));
+    }
+
+    #[test]
+    fn an_edit_blocks_path_may_be_its_first_line() {
+        let reply = "```edit\nsrc/sound.js\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```\n\n```edit\n**index.html**\n<<<<<<< SEARCH\nc\n=======\nd\n>>>>>>> REPLACE\n```\n";
+        let blocks = blocks(reply);
+        let paths: Vec<&str> = blocks.iter().map(|b| b.file.path.as_str()).collect();
+        assert_eq!(paths, ["src/sound.js", "index.html"]);
+        assert_eq!(blocks[0].edit.as_deref(), Some(&[edit("a", "b")][..]));
     }
 
     #[test]
