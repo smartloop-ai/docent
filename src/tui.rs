@@ -1253,6 +1253,31 @@ enum AfterCheck {
 /// The loop goes on as long as the errors are not fixed, round after round,
 /// and stops only when a round made no difference: the check's `output` is
 /// what it was after the last failure.
+/// Words for a reply being written, when the model writing it isn't known.
+const WORKING_WORDS: [&str; 12] = [
+    "Generating",
+    "Composing",
+    "Crafting",
+    "Drafting",
+    "Working",
+    "Thinking",
+    "Pondering",
+    "Brewing",
+    "Cooking",
+    "Assembling",
+    "Tinkering",
+    "Conjuring",
+];
+
+/// One of `WORKING_WORDS`, by when the turn `started`: the same all
+/// through a turn, another the next.
+fn working_word(started: Instant) -> &'static str {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    started.hash(&mut hasher);
+    WORKING_WORDS[(hasher.finish() % WORKING_WORDS.len() as u64) as usize]
+}
+
 /// Errors from the language servers shown, and sent to the agent.
 const DIAGNOSTICS_SHOWN: usize = 30;
 
@@ -2888,10 +2913,11 @@ impl App {
                 let indexing = step == "index";
                 if step == "streaming" {
                     // The agent's "Generating response" says nothing a
-                    // reader needs; the model writing the answer does.
+                    // reader needs; the model writing the answer does, or,
+                    // not known, a word for it, kept for the turn.
                     turn.activity = Some(match &reply.model {
-                        Some(model) => format!("Answering with {}", model),
-                        None => "Answering".to_string(),
+                        Some(model) => format!("Generating with {}", model),
+                        None => working_word(turn.started).to_string(),
                     });
                 } else if !indexing {
                     turn.activity = Some(message.trim_end_matches(['.', '…']).to_string());
@@ -5810,7 +5836,7 @@ mod tests {
         app.chat_event(ChatEvent::Status { step: "model".into(), message: "Selected minimax-m3 for the response".into() });
         app.chat_event(ChatEvent::Status { step: "streaming".into(), message: "Generating response...".into() });
         let shown = screen(&app, 80, 24);
-        assert!(shown.contains("Answering with minimax-m3…"), "{}", shown);
+        assert!(shown.contains("Generating with minimax-m3…"), "{}", shown);
         assert!(!shown.contains("Generating response"), "{}", shown);
 
         // Nor once the turn is over.
@@ -6643,6 +6669,13 @@ mod tests {
         assert_eq!(read("log.txt").as_deref(), Some("first\nsecond\n"));
         assert_eq!(read("a.txt").as_deref(), Some("one\n3\n"));
         assert!(!app.entries.iter().any(|e| matches!(e, Entry::Warning(w) if w.starts_with("Not changed"))));
+    }
+
+    #[test]
+    fn a_turns_working_word_stays_the_same_through_it() {
+        let started = Instant::now();
+        assert_eq!(working_word(started), working_word(started));
+        assert!(WORKING_WORDS.contains(&working_word(started)));
     }
 
     #[test]
