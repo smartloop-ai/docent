@@ -726,7 +726,7 @@ impl Reply {
                             p.lines.clone()
                         }
                         _ => match (code, file) {
-                            (true, Some(file)) if pending => vec![writing_line(&file.path, &file.content, false)],
+                            (true, Some(file)) if pending => streaming_part(&file.path, &file.content, false, width),
                             (true, Some(file)) => self.file_part(&file.path, &file.content, false, streaming, &segment, width),
                             (true, None) if !docs.is_empty() => self.heredoc_part(&segment, start, &docs, replying, width),
                             (true, None) => code_lines(&segment, width),
@@ -806,7 +806,7 @@ impl Reply {
             push(&mut out, shell(at, from));
             let code = format!("{}\n{}\n{}", opener, lines[from..to].join("\n"), fence);
             let part = if replying && !doc.closed {
-                vec![writing_line(&doc.file.path, &doc.file.content, doc.append)]
+                streaming_part(&doc.file.path, &doc.file.content, doc.append, width)
             } else {
                 self.file_part(&doc.file.path, &doc.file.content, doc.append, !doc.closed, &code, width)
             };
@@ -825,16 +825,23 @@ impl Reply {
     }
 }
 
-/// A file a reply is still giving, named with its lines so far: its
-/// change shows once its block is done.
-fn writing_line(path: &str, content: &str, append: bool) -> Line<'static> {
+/// A file a reply is still giving: its name, then its code as it streams
+/// in. Nothing is written yet; once its block is done it shows as its
+/// change, and it's written when the reply is in.
+fn streaming_part(path: &str, content: &str, append: bool, width: u16) -> Vec<Line<'static>> {
     let lines = content.lines().count();
-    Line::from(vec![
+    let mut part = vec![Line::from(vec![
         Span::styled("● ", dim()),
-        Span::styled(if append { "Adding to " } else { "Writing " }, dim()),
         Span::styled(path.to_string(), Style::new().bold()),
-        Span::styled(format!(" · {} line{}", lines, if lines == 1 { "" } else { "s" }), dim()),
-    ])
+        Span::styled(
+            format!(" · {}{} line{}", if append { "adding " } else { "" }, lines, if lines == 1 { "" } else { "s" }),
+            dim(),
+        ),
+    ])];
+    let lang = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
+    let fence = if content.lines().any(|l| l.trim_start().starts_with("```")) { "````" } else { "```" };
+    part.extend(code_lines(&format!("{fence}{lang}\n{}\n{fence}", content.trim_end_matches('\n')), width));
+    part
 }
 
 /// `text` split into its prose and its fenced code blocks, in order, each
@@ -7173,9 +7180,9 @@ mod tests {
         std::fs::write(dir.path().join("main.rs"), "fn main() {\n    old();\n}\n").unwrap();
         let mut reply = Reply { root: Some(dir.path().to_path_buf()), ..Default::default() };
         let shown = |reply: &Reply| reply.body(40).iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
-        // While the reply comes in, the file is only named, with its lines.
+        // While the reply comes in, the file is named, with its lines.
         reply.text = "Here:\n\n`main.rs`\n```rust\nfn main() {\n    ne".into();
-        assert!(shown(&reply).contains("Writing main.rs · 2 lines"), "{}", shown(&reply));
+        assert!(shown(&reply).contains("● main.rs · 2 lines"), "{}", shown(&reply));
         // More of the same line: it isn't laid out again.
         reply.text.push_str("w();");
         reply.rendered_at.set(None);
@@ -7184,11 +7191,13 @@ mod tests {
         reply.text.push_str("\n}\n");
         reply.rendered_at.set(None);
         assert!(shown(&reply).contains("· 3 lines"), "{}", shown(&reply));
-        assert!(!shown(&reply).contains("new();"));
+        // Its code streams in; it isn't a change yet.
+        assert!(shown(&reply).contains("new();"), "{}", shown(&reply));
+        assert!(!shown(&reply).contains("← main.rs"), "{}", shown(&reply));
         // The reply in, its change shows.
         reply.text.push_str("```\n");
         reply.stats = Some(TurnStats::default());
-        assert!(shown(&reply).contains("new();"), "{}", shown(&reply));
+        assert!(shown(&reply).contains("← main.rs"), "{}", shown(&reply));
         // The prose before it is kept as it was laid out.
         assert_eq!(reply.pieces.borrow()[0].key, "Here:\n\n`main.rs`");
     }
@@ -7198,13 +7207,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.rs"), "fn main() {\n    old();\n}\n").unwrap();
         let mut reply = Reply { root: Some(dir.path().to_path_buf()), ..Default::default() };
-        // Streaming, the files are only named, heredocs too, with the
+        // Streaming, a file still coming shows its code, heredocs too, with the
         // commands around them.
         reply.text = "Here:\n\n```sh\ncat > main.rs <<'EOF'\nfn main() {\n    new();\n}\nEOF\ngit add -A\ncat > lib.rs <<'EOF'\npub".into();
         let rows: Vec<String> = reply.body(40).iter().map(|l| l.to_string().trim_end().to_string()).collect();
         // A file done shows its change while the next is still coming.
         assert!(rows.contains(&"← main.rs  +1 −1".to_string()), "{:?}", rows);
-        assert!(rows.contains(&"● Writing lib.rs · 1 line".to_string()), "{:?}", rows);
+        assert!(rows.contains(&"● lib.rs · 1 line".to_string()), "{:?}", rows);
         assert!(rows.iter().any(|r| r.contains("git add -A")), "{:?}", rows);
         // In, each heredoc is its change.
         reply.text.push_str(" fn l() {}\nEOF\n```\n");
