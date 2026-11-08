@@ -51,12 +51,6 @@ use crate::progress::{self, Steps, format_duration, format_size};
 use crate::usage::{CreditUsage, SearchUsage};
 use crate::{ModelRow, docent, files, framework, lsp, mcp};
 
-const LABEL_WIDTH: usize = 28;
-const DETAIL_WIDTH: usize = 12;
-/// Blocks in each setup step's bar.
-const BLOCKS: usize = 16;
-/// An active step shows its elapsed time once it has run this long.
-const SHOW_ELAPSED_AFTER: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(100);
 /// How often the welcome card's agent state is re-read.
 const AGENT_EVERY: Duration = Duration::from_secs(3);
@@ -132,6 +126,8 @@ enum AppEvent {
     /// named with `/project <name>`.
     SwitchProject(Project),
     Models(Result<Vec<ModelRow>, String>),
+    /// A newer docent release than this one, for the footer.
+    Update(String),
     /// The project's MCP servers, for `/mcp`.
     Mcp(Result<Vec<mcp::Server>, String>),
     Chat(ChatEvent),
@@ -364,106 +360,6 @@ impl StepList {
 
     fn active(&self) -> Option<&StepRow> {
         self.steps.iter().find(|s| s.state == State::Active)
-    }
-
-    /// Setup as a box, a row per step, each with a bar of blocks: filling
-    /// as a download's bytes arrive, a pulse while any other step runs,
-    /// full and green once it's done.
-    ///
-    /// ```text
-    /// ╭ Booting up …           ──────────────────────────────────╮
-    /// │                                                          │
-    /// │  ■ Start agent          ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰  port 38540     │
-    /// │  ■ Decision model sl-mini   ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱  49%          │
-    /// │  □ Default project      ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱                 │
-    /// │                                                          │
-    /// ╰──────────────────────────────── 377 MB of 769 MB · 23s ──╯
-    /// ```
-    fn card(&self, ticks: usize) -> Vec<Line<'static>> {
-        // Labels as wide as the longest, so the bars line up close to them.
-        let label_width = self.steps.iter().map(|s| s.label.chars().count()).max().unwrap_or(0).min(LABEL_WIDTH);
-        let rows: Vec<Line<'static>> = self.steps.iter().map(|s| self.card_row(s, label_width, ticks)).collect();
-        let inner = rows.iter().map(Line::width).max().unwrap_or(0) + 2;
-        let border = dim();
-
-        let title = " Booting up… ";
-        let mut lines = vec![Line::from(vec![
-            Span::styled("╭", border),
-            Span::styled(title, Style::new().bold()),
-            Span::styled(format!("{}╮", "─".repeat(inner.saturating_sub(title.chars().count()))), border),
-        ])];
-        let blank = Line::default();
-        for row in std::iter::once(&blank).chain(rows.iter()).chain(std::iter::once(&blank)) {
-            let mut spans = vec![Span::styled("│", border)];
-            spans.extend(row.spans.iter().cloned());
-            spans.push(Span::raw(" ".repeat(inner.saturating_sub(row.width()))));
-            spans.push(Span::styled("│", border));
-            lines.push(Line::from(spans));
-        }
-        // The running download's bytes and time, or how long it all took.
-        let note = match (self.active(), self.took) {
-            (_, Some(took)) => format!(" done in {} ", format_duration(took)),
-            (Some(StepRow { bytes: Some((done, total)), started, .. }), None) if *total > 0 => format!(
-                " {} of {} · {} ",
-                format_size(*done),
-                format_size(*total),
-                format_duration(started.map_or(Duration::ZERO, |t| t.elapsed()))
-            ),
-            (Some(StepRow { started: Some(t), .. }), None) => format!(" {} ", format_duration(t.elapsed())),
-            _ => String::new(),
-        };
-        let fill = inner.saturating_sub(note.chars().count() + 2);
-        lines.push(Line::from(vec![
-            Span::styled(format!("╰{}", "─".repeat(fill)), border),
-            Span::styled(note, dim()),
-            Span::styled("──╯", border),
-        ]));
-        lines
-    }
-
-    fn card_row(&self, s: &StepRow, label_width: usize, ticks: usize) -> Line<'static> {
-        let label = format!("{:<w$}", truncate(&s.label, label_width), w = label_width);
-        // A square ahead of each step, as the conversation marks its
-        // entries: filled once it's done or while it runs, empty before.
-        let square = |color: Color| Span::styled("■ ", Style::new().fg(color));
-        let (mark, label_style) = match s.state {
-            State::Done => (square(Color::Green), Style::new()),
-            State::Failed => (Span::styled("✗ ", Style::new().fg(Color::Red)), Style::new()),
-            State::Active => (square(pink()), Style::new()),
-            State::Pending => (Span::styled("□ ", dim()), dim()),
-        };
-        let lit = |on: bool, color: Color| {
-            if on { Span::styled("▰", Style::new().fg(color)) } else { Span::styled("▱", dim()) }
-        };
-        let blocks: Vec<Span<'static>> = match (s.state, s.bytes) {
-            (State::Done, _) => (0..BLOCKS).map(|_| lit(true, Color::Green)).collect(),
-            (State::Active, Some((done, total))) if total > 0 => {
-                let lit_count = (done as f64 / total as f64 * BLOCKS as f64).round() as usize;
-                (0..BLOCKS).map(|i| lit(i < lit_count, pink())).collect()
-            }
-            // Running with nothing to count: a pulse of three blocks sweeps
-            // along the track.
-            (State::Active, _) => {
-                let at = ticks % (BLOCKS + 3);
-                (0..BLOCKS).map(|i| lit(i < at && i + 3 >= at, pink())).collect()
-            }
-            _ => (0..BLOCKS).map(|_| lit(false, pink())).collect(),
-        };
-        let detail = match (s.state, s.bytes) {
-            (State::Active, Some((done, total))) if total > 0 => format!("{}%", done * 100 / total),
-            (State::Active, _) => s
-                .started
-                .map(|t| t.elapsed())
-                .filter(|t| *t >= SHOW_ELAPSED_AFTER)
-                .map(format_duration)
-                .map_or(s.detail.clone(), |t| if s.detail.is_empty() { t } else { format!("{} {}", s.detail, t) }),
-            (State::Done, _) => s.detail.clone(),
-            _ => String::new(),
-        };
-        let mut spans = vec![Span::raw("  "), mark, Span::styled(label, label_style), Span::raw("  ")];
-        spans.extend(blocks);
-        spans.push(Span::styled(format!("  {:<w$}", detail, w = DETAIL_WIDTH), dim()));
-        Line::from(spans)
     }
 }
 
@@ -1399,6 +1295,9 @@ struct App {
     /// tokens, once the models are known: how much of the project a prompt
     /// may carry.
     window: Option<u64>,
+    /// The project's enabled models, once read; empty asks for one on the
+    /// card.
+    enabled_models: Option<Vec<String>>,
     /// The last reply's files left unwritten, as the agent wasn't shown
     /// them whole, with their folder: `/write` writes them after all.
     kept: Option<(std::path::PathBuf, Vec<files::File>)>,
@@ -1439,6 +1338,11 @@ struct App {
     sync: Option<Sync>,
     /// This month's web search usage, shown in the footer once known.
     search: Option<SearchUsage>,
+    /// A newer release's version, for the footer to ask for an upgrade.
+    update: Option<String>,
+    /// Whether this project's models were read since opening it, so the
+    /// nudge to pick one comes once.
+    models_checked: bool,
     /// This month's credits, read with `search`.
     credits: Option<CreditUsage>,
     /// The project's web search switch (ctrl+s), once read.
@@ -1491,6 +1395,7 @@ impl App {
             edit_round: 0,
             early: Vec::new(),
             window: None,
+            enabled_models: None,
             kept: None,
             commands: None,
             ask: None,
@@ -1506,6 +1411,8 @@ impl App {
             agent_asked: Some(Instant::now() - AGENT_EVERY),
             sync: None,
             search: None,
+            update: None,
+            models_checked: false,
             credits: None,
             web_search: None,
             quit: false,
@@ -1757,6 +1664,18 @@ impl App {
     /// of each turn, which may have spent a search.
     fn load_usage(&self) {
         self.spawn(|client, tx| send_usage(&client, &tx));
+    }
+
+    /// Ask GitHub whether a newer release is out, once a session.
+    fn check_update(&self) {
+        if cfg!(test) {
+            return;
+        }
+        self.spawn(|_, tx| {
+            if let Some(version) = crate::update::newer_release() {
+                let _ = tx.send(AppEvent::Update(version));
+            }
+        });
     }
 
     fn load_models(&self) {
@@ -2551,6 +2470,10 @@ impl App {
                 self.phase = Phase::Connecting;
                 self.load_projects();
                 self.load_usage();
+                self.check_update();
+                if let Some(tip) = home_tip().filter(|_| !cfg!(test)) {
+                    self.entries.push(Entry::Warning(tip));
+                }
             }
             AppEvent::SetupDone(Err(e)) => self.setup.failure = Some(e),
             AppEvent::Projects(result) => self.projects_loaded(result),
@@ -2558,6 +2481,12 @@ impl App {
             AppEvent::Models(result) => {
                 if let Ok(list) = &result {
                     self.window = list.iter().filter(|m| m.enabled).filter_map(|m| m.context).max();
+                    self.enabled_models = Some(list.iter().filter(|m| m.enabled).map(|m| m.name.clone()).collect());
+                    if !std::mem::replace(&mut self.models_checked, true)
+                        && let Some(nudge) = model_nudge(list)
+                    {
+                        self.entries.push(Entry::Warning(nudge));
+                    }
                 }
                 if let Overlay::Models { rows, selected } = &mut self.overlay {
                     if let Ok(list) = &result {
@@ -2660,6 +2589,7 @@ impl App {
                 }
             }
             AppEvent::Usage(usage) => self.search = usage,
+            AppEvent::Update(version) => self.update = Some(version),
             AppEvent::Credits(credits) => {
                 self.credits = credits;
                 if let Overlay::Usage { loading, .. } = &mut self.overlay {
@@ -2768,6 +2698,8 @@ impl App {
                 // Its folder keeps syncing, wherever it is, until `/sync stop`.
                 self.follow_project();
                 self.load_web_search();
+                // Read now, so a project with no model enabled says so at once.
+                self.load_models();
                 self.load_skills();
                 self.load_connections();
                 self.load_account();
@@ -2872,6 +2804,8 @@ impl App {
         self.scroll_back = 0;
         self.web_search = None;
         self.window = None;
+        self.enabled_models = None;
+        self.models_checked = false;
         self.skills.clear();
         self.connections = None;
         // What the last project's documents were doing isn't this one's.
@@ -3965,7 +3899,7 @@ impl App {
             Constraint::Min(3),
             Constraint::Length(1),
             Constraint::Length(status.len().max(1) as u16),
-            Constraint::Length(self.input_rows() + 2),
+            Constraint::Length(self.input_rows(frame.area().width) + 2),
             Constraint::Length(under),
         ])
         .areas(frame.area());
@@ -4034,13 +3968,24 @@ impl App {
         };
         // Indexing isn't shown: it runs in the background.
         match (&self.phase, &self.turn) {
-            (Phase::Setup, _) if self.setup.failure.is_none() => {
-                let (what, took) = match self.setup.active() {
-                    Some(step) => (step.label.clone(), step.started.map_or(Duration::ZERO, |t| t.elapsed())),
-                    None => ("Connecting to the agent".to_string(), self.setup.started.elapsed()),
-                };
-                lines.push(working(what, format_duration(took)));
-            }
+            // Setup says one step at a time, as a turn says what it's doing:
+            // the step running, with its download's bar while there is one.
+            (Phase::Setup, _) if self.setup.failure.is_none() => match self.setup.active() {
+                Some(step) => {
+                    let took = format_duration(step.started.map_or(Duration::ZERO, |t| t.elapsed()));
+                    match step.bytes {
+                        Some((done, total)) => {
+                            let mut spans = vec![spinner.clone(), Span::styled(format!("{}… ", step.label), dim())];
+                            spans.extend(bar_spans(done, total, 20));
+                            spans.push(Span::styled(format!(" ({})", took), dim()));
+                            lines.push(Line::from(spans));
+                        }
+                        None if step.detail.is_empty() => lines.push(working(step.label.clone(), took)),
+                        None => lines.push(working(step.label.clone(), format!("{} · {}", step.detail, took))),
+                    }
+                }
+                None => lines.push(working("Connecting to the agent".to_string(), format_duration(self.setup.started.elapsed()))),
+            },
             (Phase::Connecting, _) => {
                 let took = format_duration(self.setup.started.elapsed());
                 lines.push(working("Connecting".to_string(), took));
@@ -4078,15 +4023,15 @@ impl App {
     /// │                                                                           │
     /// │ █▀▀▀▄ ▄▀▀▀▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀    project  notes                     │
     /// │ █   █ █   █ █     █▀▀▀  █ ▀▄█   █               5 docs · 2 connections    │
-    /// │ ▀▀▀▀   ▀▀▀   ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀      agent    ▰▰▰▱▱▱▱▱▱▱ 31% memory     │
-    /// │ Frontier quality. Local first.         account  mehfuz@smartloop.ai       │
-    /// │ by Smartloop · ? for shortcuts                  CLI 1.0.42 · agent 1.2.10 │
+    /// │ ▀▀▀▀   ▀▀▀   ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀      model    qwen3.5-2b +1 more        │
+    /// │ Frontier quality. Local first.         agent    ▰▰▰▱▱▱▱▱▱▱ 31% memory     │
+    /// │ by Smartloop · ? for shortcuts         account  mehfuz@smartloop.ai       │
+    /// │                                                 CLI 1.0.42 · agent 1.2.10 │
     /// │                                                                           │
     /// │ Here are some commands to get you started                                 │
     /// │   /login     sign in for web search and more models                       │
-    /// │   /models    enable, download or turn off models                          │
+    /// │   /models    pick a model; the one for your system is marked              │
     /// │   /status    account, model, agent and versions                           │
-    /// │                                                                           │
     /// ╰───────────────────────────────────────────────────────────────────────────╯
     /// ```
     /// The agent's state at a glance: a green square when it's healthy, the
@@ -4139,9 +4084,21 @@ impl App {
             Some(None) => vec![Span::styled("not signed in · /login", dim())],
         };
         let versions = format!("CLI {} · agent {}", env!("CARGO_PKG_VERSION"), framework::VERSION);
+        let model = match self.enabled_models.as_deref() {
+            None => vec![Span::styled("…", dim())],
+            Some([]) => {
+                let warn = Style::new().fg(Color::Yellow);
+                let mut spans = vec![Span::styled("⚠ none enabled · ", warn), Span::styled("ctrl+o", key_style())];
+                spans.push(Span::styled(" to pick one", warn));
+                spans
+            }
+            Some([one]) => vec![Span::raw(one.clone())],
+            Some([first, rest @ ..]) => vec![Span::raw(first.clone()), Span::styled(format!(" +{} more", rest.len()), dim())],
+        };
         vec![
             ("project", project),
             ("", holds),
+            ("model", model),
             ("agent", agent),
             ("account", account),
             ("", vec![Span::styled(versions, dim())]),
@@ -4203,7 +4160,7 @@ impl App {
         let rule = "─".repeat(inner + 2);
         let mut lines = vec![Line::styled(format!("╭{}╮", rule), border)];
         let blank = Line::default();
-        for line in std::iter::once(&blank).chain(body.iter()).chain(std::iter::once(&blank)) {
+        for line in std::iter::once(&blank).chain(body.iter()) {
             let used = line.width().min(inner);
             let mut spans = vec![Span::styled("│ ", border)];
             spans.extend(line.spans.iter().cloned());
@@ -4271,10 +4228,6 @@ impl App {
     /// and scrolls away with it, with the setup's card and failure.
     fn head_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = self.welcome(width);
-        if !self.setup.steps.is_empty() {
-            lines.push(Line::default());
-            lines.extend(self.setup.card(self.ticks));
-        }
         if let Some(e) = &self.setup.failure {
             lines.push(Line::default());
             lines.push(error_line(e));
@@ -4347,9 +4300,13 @@ impl App {
         frame.render_widget(paragraph.scroll(((top - start).min(u16::MAX as usize) as u16, 0)), area);
     }
 
-    /// Lines the prompt shows: one per line typed, up to `PROMPT_LINES`.
-    fn input_rows(&self) -> u16 {
-        (self.input.split('\n').count() as u16).clamp(1, PROMPT_LINES)
+    /// Rows the prompt shows at `width`: each line typed, wrapped, up to
+    /// `PROMPT_LINES`.
+    fn input_rows(&self, width: u16) -> u16 {
+        let label = if self.token_entry { "token: " } else if self.input.starts_with('!') { "! " } else { "> " };
+        let input = if !self.token_entry && self.input.starts_with('!') { &self.input[1..] } else { self.input.as_str() };
+        let room = width.saturating_sub(label.len() as u16 + 1) as usize;
+        (prompt_rows(input, room).len() as u16).clamp(1, PROMPT_LINES)
     }
 
     fn draw_input(&self, frame: &mut Frame, area: Rect) {
@@ -4380,22 +4337,24 @@ impl App {
             // A shell command runs with no agent, so `!` isn't held up.
             Line::from(vec![prompt, Span::styled("waiting for setup…", dim())])
         } else {
-            // One row per line typed. The cursor's line shows its tail when
-            // it's too long, so the cursor stays in view; and when there are
-            // more lines than rows, the rows follow the cursor.
+            // Each line typed wraps at the prompt's width, under the text
+            // rather than the mark; when there are more rows than room, the
+            // rows follow the cursor.
             let indent = label.len() as u16;
             let room = inner.width.saturating_sub(indent + 1) as usize;
-            let before: String = input.chars().take(cursor).collect();
-            let row = before.matches('\n').count();
-            let col_text = before.rsplit('\n').next().unwrap_or_default();
-            let lines: Vec<&str> = input.split('\n').collect();
+            let rows = prompt_rows(&input, room);
+            let chars: Vec<char> = input.chars().collect();
+            let row = cursor_row(&rows, cursor);
+            let col: usize = chars[rows[row].0..cursor.min(chars.len())]
+                .iter()
+                .map(|c| unicode_width::UnicodeWidthChar::width(*c).unwrap_or(0))
+                .sum();
             let first = (row + 1).saturating_sub(inner.height as usize);
             let mut shown = Vec::new();
-            for (i, text) in lines.iter().enumerate().skip(first).take(inner.height as usize) {
+            for (i, &(start, end)) in rows.iter().enumerate().skip(first).take(inner.height as usize) {
                 let mark = if i == 0 { prompt.clone() } else { Span::raw(" ".repeat(indent as usize)) };
-                let offset = if i == row { Span::raw(col_text).width().saturating_sub(room) } else { 0 };
-                let visible: String = text.chars().skip(offset).collect();
-                let mut spans = vec![mark, Span::raw(visible)];
+                let text: String = chars[start..end].iter().collect();
+                let mut spans = vec![mark, Span::raw(text)];
                 // Until something's typed, say what the prompt takes.
                 if input.is_empty() && shell {
                     spans.push(Span::styled("a command to run in the folder; & at its end runs it in the background", dim()));
@@ -4404,7 +4363,7 @@ impl App {
                 }
                 shown.push(Line::from(spans));
                 if i == row && matches!(self.overlay, Overlay::None) {
-                    let x = inner.x + indent + Span::raw(col_text).width().saturating_sub(offset) as u16;
+                    let x = inner.x + indent + col as u16;
                     let y = inner.y + (i - first) as u16;
                     frame.set_cursor_position((x.min(inner.right().saturating_sub(1)), y));
                 }
@@ -4556,6 +4515,8 @@ impl App {
         } else if let Some(warning) = self.search_warning(area.width.saturating_sub(2) as usize) {
             // Takes the key hints' place, so a narrow terminal can't hide it.
             hints.extend(warning);
+        } else if let Some(notice) = self.update_notice(area.width.saturating_sub(2) as usize) {
+            hints.extend(notice);
         } else {
             // The rest live under help, as in Claude Code.
             let mut keys = vec![("enter", "send"), ("esc", "interrupt")];
@@ -4606,6 +4567,26 @@ impl App {
         Some(spans)
     }
 
+    /// A newer release asks to be installed, in place of the key hints:
+    /// the longest wording that fits `width`, down to the version alone.
+    fn update_notice(&self, width: usize) -> Option<Vec<Span<'static>>> {
+        let version = self.update.as_ref()?;
+        let command = crate::update::upgrade_command();
+        let wordings = [
+            (format!("docent {} is available (you have {}) · upgrade: ", version, env!("CARGO_PKG_VERSION")), Some(command)),
+            (format!("docent {} is available · upgrade: ", version), Some(command)),
+            (format!("docent {} is available · rerun the installer to upgrade", version), None),
+            (format!("docent {} available", version), None),
+        ];
+        let size = |(text, command): &(String, Option<&str>)| 2 + text.chars().count() + command.map_or(0, |c| c.chars().count());
+        let (text, command) = wordings.iter().find(|w| size(w) <= width).unwrap_or(&wordings[wordings.len() - 1]).clone();
+        let mut spans = vec![Span::styled("↑ ", Style::new().fg(Color::Yellow)), Span::styled(text, Style::new().fg(Color::Yellow))];
+        if let Some(command) = command {
+            spans.push(Span::styled(command, key_style()));
+        }
+        Some(spans)
+    }
+
     /// The project's models as a list, like Claude Code's model picker:
     /// the selected one marked, each with its state and what it can do.
     fn draw_models(&self, frame: &mut Frame, area: Rect, rows: &Option<Result<Vec<ModelRow>, String>>, selected: usize) {
@@ -4647,6 +4628,9 @@ impl App {
                 spans.push(Span::styled(m.capabilities.clone(), dim()));
                 if m.overridden {
                     spans.push(Span::styled(" · set here", dim()));
+                }
+                if m.recommended && !m.cloud {
+                    spans.push(Span::styled("  · recommended", Style::new().fg(Color::Green)));
                 }
                 if !m.accessible {
                     spans.push(Span::styled("  · sign in to use", Style::new().fg(Color::Yellow)));
@@ -4988,6 +4972,78 @@ fn reply_lines(reply: &Reply, width: u16, lines: &mut Vec<Line<'static>>) {
 }
 
 /// The model in the agent's "Selected sl-mini for the response".
+/// The prompt's rows: each line of `text` wrapped to `room` cells, at the
+/// last space that fits when there is one, as `(start, end)` char offsets
+/// into `text`. A line break is a char of its own, on no row.
+fn prompt_rows(text: &str, room: usize) -> Vec<(usize, usize)> {
+    let room = room.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    let mut rows = Vec::new();
+    let mut start = 0;
+    loop {
+        let end = chars[start..].iter().position(|c| *c == '\n').map_or(chars.len(), |i| start + i);
+        // This line, cut into rows.
+        let mut at = start;
+        loop {
+            let mut width = 0;
+            let mut cut = at;
+            while cut < end {
+                let w = unicode_width::UnicodeWidthChar::width(chars[cut]).unwrap_or(0);
+                if width + w > room {
+                    break;
+                }
+                width += w;
+                cut += 1;
+            }
+            if cut >= end {
+                rows.push((at, end));
+                break;
+            }
+            // Back to just after the last space, so a word isn't split.
+            if let Some(space) = chars[at..cut].iter().rposition(|c| *c == ' ').filter(|i| *i > 0) {
+                cut = at + space + 1;
+            }
+            rows.push((at, cut));
+            at = cut;
+        }
+        if end >= chars.len() {
+            return rows;
+        }
+        start = end + 1;
+    }
+}
+
+/// The row `cursor` (a char offset) is on. At a wrap, the cursor goes to
+/// the start of the next row.
+fn cursor_row(rows: &[(usize, usize)], cursor: usize) -> usize {
+    rows.iter().rposition(|(start, _)| *start <= cursor).unwrap_or(0)
+}
+
+/// With no model enabled, which to pick: the one the agent recommends for
+/// this machine's RAM, a reasoning model first since it resolves tool calls
+/// and plans. `None` when one is enabled already.
+fn recommended_pick(models: &[ModelRow]) -> Option<&ModelRow> {
+    let recommended: Vec<&ModelRow> = models.iter().filter(|m| m.recommended && m.accessible).collect();
+    recommended
+        .iter()
+        .find(|m| m.capabilities.split(", ").any(|c| c == "reasoning"))
+        .or(recommended.first())
+        .copied()
+}
+
+fn model_nudge(models: &[ModelRow]) -> Option<String> {
+    if models.is_empty() || models.iter().any(|m| m.enabled) {
+        return None;
+    }
+    Some(match recommended_pick(models) {
+        Some(m) => format!(
+            "No model selected. Recommended for your system: {} · enable it in /models (ctrl+o)",
+            m.name
+        ),
+        None => "No model selected · open /models (ctrl+o) to enable one".to_string(),
+    })
+}
+
 fn selected_model(message: &str) -> Option<String> {
     let name = message.strip_prefix("Selected ")?.split_whitespace().next()?;
     Some(name.to_string())
@@ -5519,9 +5575,21 @@ fn getting_started() -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled("Here are some commands to get you started", key_style())),
         command("/login", "sign in for web search and more models"),
-        command("/models", "enable, download or turn off models"),
+        command("/models", "pick a model; the one for your system is marked"),
         command("/status", "account, model, agent and versions"),
     ]
+}
+
+/// Said on start in the home folder: a project wants a folder of its own,
+/// where its files are written, its commands run, and it can sync.
+fn home_tip() -> Option<String> {
+    let here = std::env::current_dir().ok()?;
+    docent::refusal(&here)?;
+    let start = if cfg!(windows) { "mkdir my-app; cd my-app; docent" } else { "mkdir my-app && cd my-app && docent" };
+    Some(format!(
+        "You're in your home folder. Start docent in a folder for your project so it can write files and run commands there: {}",
+        start
+    ))
 }
 
 /// A file dropped on the prompt.
@@ -6534,6 +6602,7 @@ mod tests {
             downloaded: true,
             enabled: true,
             cloud: false,
+            recommended: false,
         }];
         app.overlay = Overlay::Models { rows: Some(Ok(rows)), selected: 0 };
         let text = screen(&app, 100, 24);
@@ -6849,11 +6918,12 @@ mod tests {
         let banner = rows.iter().position(|r| r.contains("█▀▀▀▄ ▄▀▀▀▄")).expect(&text);
         assert!(rows[banner].contains("project  Default"), "{}", text);
         assert!(rows[banner + 1].contains("         0 docs · 0 connections"), "{}", text);
-        assert!(rows[banner + 2].contains(&format!("agent    {}", app.spinner())), "{}", text);
-        assert!(rows[banner + 3].contains("account  …"), "{}", text);
+        assert!(rows[banner + 2].contains("model    …"), "{}", text);
+        assert!(rows[banner + 3].contains(&format!("agent    {}", app.spinner())), "{}", text);
+        assert!(rows[banner + 4].contains("account  …"), "{}", text);
         let versions = format!("         CLI {} · agent {}", env!("CARGO_PKG_VERSION"), framework::VERSION);
         assert!(rows[banner + 3].contains("Frontier quality. Local first."), "{}", text);
-        assert!(rows[banner + 4].contains("by Smartloop") && rows[banner + 4].contains(&versions), "{}", text);
+        assert!(rows[banner + 4].contains("by Smartloop") && rows[banner + 5].contains(&versions), "{}", text);
 
         // Filled in as the agent and the platform answer.
         let state = |state: &str| crate::AgentState { state: state.into(), memory: Some(31), documents: 5, pending: 0 };
@@ -6880,11 +6950,11 @@ mod tests {
         app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), None));
         assert!(screen(&app, 80, 30).contains("agent    ■ not responding"));
         // Only as wide as what it holds, not the screen.
-        let wide = screen(&app, 120, 24);
+        let wide = screen(&app, 120, 30);
         let top = wide.lines().find(|r| r.starts_with('╭')).expect(&wide);
         assert!(top.ends_with('╮') && top.chars().count() < 100, "{}", wide);
-        assert!(rows[banner + 6].contains("Here are some commands to get you started"), "{}", text);
-        assert!(rows[banner + 7].contains("/login"), "{}", text);
+        assert!(rows[banner + 7].contains("Here are some commands to get you started"), "{}", text);
+        assert!(rows[banner + 8].contains("/login"), "{}", text);
         assert!(!text.contains("search the web"), "{}", text);
         assert!(rows[banner - 2].starts_with('╭') && rows[banner + 11].starts_with('╰'), "{}", text);
         for i in 0..40 {
@@ -7324,6 +7394,94 @@ mod tests {
     }
 
     #[test]
+    fn with_no_model_enabled_the_recommended_one_is_named() {
+        let model = |name: &str, caps: &str, recommended, enabled| ModelRow {
+            name: name.into(),
+            capabilities: caps.into(),
+            overridden: false,
+            context: None,
+            access: "free".into(),
+            accessible: true,
+            downloaded: false,
+            enabled,
+            cloud: false,
+            recommended,
+        };
+        let list = vec![
+            model("big", "general, reasoning", false, false),
+            model("small", "general", true, false),
+            model("thinker", "general, reasoning", true, false),
+        ];
+        let nudge = model_nudge(&list).unwrap();
+        assert!(nudge.contains("Recommended for your system: thinker"), "{}", nudge);
+        let none_recommended = vec![model("big", "general", false, false)];
+        assert_eq!(model_nudge(&none_recommended).as_deref(), Some("No model selected · open /models (ctrl+o) to enable one"));
+        let enabled = vec![model("big", "general", false, true), model("small", "general", true, false)];
+        assert_eq!(model_nudge(&enabled), None);
+    }
+
+    #[test]
+    fn with_no_model_enabled_the_card_says_how_to_pick_one() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        let row = |name: &str, recommended, enabled| ModelRow {
+            name: name.into(),
+            capabilities: "general, reasoning".into(),
+            overridden: false,
+            context: None,
+            access: "free".into(),
+            accessible: true,
+            downloaded: false,
+            enabled,
+            cloud: false,
+            recommended,
+        };
+        app.apply(AppEvent::Models(Ok(vec![row("big", false, false), row("small", true, false)])));
+        let text = screen(&app, 120, 30);
+        assert!(text.contains("model    ⚠ none enabled · ctrl+o to pick one"), "{}", text);
+        assert!(text.contains("Recommended for your system: small"), "{}", text);
+        assert!(text.contains("Ask anything"), "{}", text);
+        app.apply(AppEvent::Models(Ok(vec![row("big", false, true), row("small", true, true)])));
+        let text = screen(&app, 120, 30);
+        assert!(text.contains("model    big +1 more"), "{}", text);
+        assert!(text.contains("Ask anything"), "{}", text);
+    }
+
+    #[test]
+    fn a_long_prompt_wraps_onto_the_next_row() {
+        assert_eq!(prompt_rows("", 10), [(0, 0)]);
+        // At the last space that fits, the space kept on the row.
+        assert_eq!(prompt_rows("hello world again", 12), [(0, 12), (12, 17)]);
+        // A word longer than the row is cut.
+        assert_eq!(prompt_rows("abcdefghij", 4), [(0, 4), (4, 8), (8, 10)]);
+        // A line break starts a row of its own.
+        assert_eq!(prompt_rows("ab\ncd", 10), [(0, 2), (3, 5)]);
+        assert_eq!(cursor_row(&prompt_rows("hello world again", 12), 13), 1);
+
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.input = "make a python script that renames my photos by the date they were taken".into();
+        app.cursor = app.input.chars().count();
+        assert_eq!(app.input_rows(40), 2);
+        let text = screen(&app, 40, 24);
+        assert!(text.contains("> make a python script that renames my"), "{}", text);
+        assert!(text.contains("  photos by the date they were taken"), "{}", text);
+    }
+
+    #[test]
+    fn a_newer_release_asks_for_an_upgrade_in_the_footer() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.apply(AppEvent::Update("9.9.9".into()));
+        let text = screen(&app, 140, 24);
+        assert!(text.contains("docent 9.9.9 is available"), "{}", text);
+        let narrow = screen(&app, 30, 24);
+        assert!(narrow.contains("docent 9.9.9 available"), "{}", narrow);
+    }
+
+    #[test]
     fn models_show_as_a_list() {
         let mut app = app();
         app.phase = Phase::Ready;
@@ -7338,6 +7496,7 @@ mod tests {
             downloaded,
             enabled,
             cloud: false,
+            recommended: false,
         };
         let cloud = ModelRow { cloud: true, ..model("sonnet", false, false) };
         app.overlay = Overlay::Models {
@@ -7452,7 +7611,7 @@ mod tests {
         press(&mut app, KeyCode::Enter, KeyModifiers::ALT);
         press(&mut app, KeyCode::Char('j'), KeyModifiers::CONTROL);
         assert_eq!(app.input, "[Doc 1] \nwhat does it conclude?\n\n");
-        assert_eq!(app.input_rows(), 4);
+        assert_eq!(app.input_rows(80), 4);
 
         let text = screen(&app, 80, 24);
         let rows: Vec<&str> = text.lines().collect();
@@ -7647,29 +7806,25 @@ mod tests {
     }
 
     #[test]
-    fn setup_shows_a_box_with_a_bar_per_step() {
+    fn setup_says_the_step_running_on_the_status_line() {
         let mut app = app();
         for event in [
-            StepEvent::Add("Agent 1.2.7".into()),
-            StepEvent::Done(0),
             StepEvent::Add("Start agent".into()),
-            StepEvent::Detail(1, "port 38540".into()),
-            StepEvent::Done(1),
-            StepEvent::Add("Decision model".into()),
-            StepEvent::Add("Default project".into()),
-            StepEvent::Name(2, "sl-mini".into()),
-            StepEvent::Progress(2, 377 << 20, 769 << 20),
+            StepEvent::Detail(0, "port 38540".into()),
+            StepEvent::Done(0),
+            StepEvent::Add("Load model".into()),
+            StepEvent::Start(1),
         ] {
             app.apply(AppEvent::Setup(event));
         }
         let text = screen(&app, 80, 30);
-        let rows: Vec<&str> = text.lines().collect();
-        let top = rows.iter().position(|r| r.starts_with("╭ Booting up…")).expect(&text);
-        assert!(rows[top + 2].contains("■ Agent 1.2.7") && rows[top + 2].contains("▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰"), "{}", text);
-        assert!(rows[top + 3].contains("■ Start agent") && rows[top + 3].contains("port 38540"), "{}", text);
-        assert!(rows[top + 4].contains("■ Decision model sl-mini") && rows[top + 4].contains("▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱  49%"), "{}", text);
-        assert!(rows[top + 5].contains("□ Default project") && rows[top + 5].contains("▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱"), "{}", text);
-        assert!(rows[top + 7].starts_with('╰') && rows[top + 7].contains("377 MB of 769 MB"), "{}", text);
+        assert!(text.contains("Load model… (0s)"), "{}", text);
+        assert!(!text.contains("Booting up") && !text.contains("Start agent"), "{}", text);
+        app.apply(AppEvent::Setup(StepEvent::Add("Decision model".into())));
+        app.apply(AppEvent::Setup(StepEvent::Done(1)));
+        app.apply(AppEvent::Setup(StepEvent::Progress(2, 377 << 20, 769 << 20)));
+        let text = screen(&app, 100, 30);
+        assert!(text.contains("Decision model… ") && text.contains("49%"), "{}", text);
     }
 
     #[test]

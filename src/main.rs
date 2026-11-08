@@ -17,6 +17,7 @@ mod lsp;
 mod mcp;
 mod progress;
 mod tui;
+mod update;
 mod usage;
 
 /// The Docent wordmark: `--help`, the setup checklist and the welcome card.
@@ -490,6 +491,8 @@ pub struct ModelRow {
     pub enabled: bool,
     /// A cloud (remote) model: nothing to download, only on or off.
     pub cloud: bool,
+    /// Light enough for this machine, as the agent judges by its RAM.
+    pub recommended: bool,
 }
 
 /// The catalog (`/v1/models`) joined with the project's state. A model the
@@ -518,6 +521,7 @@ pub fn model_rows(client: &Client, project_id: &str) -> Result<Vec<ModelRow>, St
                 downloaded: flag("downloaded"),
                 enabled: flag("enabled"),
                 cloud: model["type"].as_str() == Some("remote"),
+                recommended: model["recommended"].as_bool().unwrap_or_default(),
                 name,
             }
         })
