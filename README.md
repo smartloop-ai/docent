@@ -6,8 +6,6 @@ Ask for a change and docent writes it: new files whole, changes to the files the
 
 It's a document assistant too: chat with your PDFs and Office files, search the web, and connect MCP servers. If no local agent is running, the CLI downloads the framework and models it needs and starts one itself.
 
-It installs as `docent`, and as `smartloop` (its old name) so existing commands keep working; the two are the same binary.
-
 <img width="822" alt="docent run: a reply with its sources, the status line and the prompt" src="docs/tui.png" />
 
 More at:
