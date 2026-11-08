@@ -658,9 +658,42 @@ struct Reply {
     /// The files the agent was shown whole: a reply giving back less of
     /// one is still all of it.
     whole: Vec<String>,
+    /// Its blocks done and dealt with as it streams.
+    applied: usize,
+    /// The files written as their blocks were done, before the reply was.
+    written: Vec<String>,
 }
 
 impl Reply {
+    /// Write each file whose block is done since the last call, as soon as
+    /// it is, rather than when the reply is: a new file, one this reply
+    /// made, or, `always` allowed, one that's there. A change to a file
+    /// that's there waits to be asked about once the reply's in.
+    fn write_done(&mut self, root: &std::path::Path, always: bool) {
+        let blocks = files::blocks(&self.text);
+        while let Some(block) = blocks.get(self.applied).filter(|b| b.closed) {
+            self.applied += 1;
+            // The reply up to this block, as edits and appends are made on
+            // the files as they were before it, and on its blocks before.
+            let upto: Vec<&str> = self.text.lines().take(block.end).collect();
+            let found = files::extract_with(&upto.join("\n"), |p| self.old(p));
+            let Some(file) = found.files.into_iter().find(|f| f.path == block.file.path) else { continue };
+            let ours = self.old(&file.path).is_none() || self.written.contains(&file.path);
+            let mut whole = self.whole.clone();
+            whole.extend(found.edited);
+            let plan = files::plan(root, vec![file], &whole);
+            let mut ready = plan.new;
+            if ours || always {
+                ready.extend(plan.changed);
+            }
+            for path in files::write(root, &ready).0 {
+                if !self.written.contains(&path) {
+                    self.written.push(path);
+                }
+            }
+        }
+    }
+
     /// `text` rendered as markdown at `width`, its links and bare web
     /// addresses clickable, and its code blocks drawn as blocks: see
     /// `code_lines`.
@@ -1312,6 +1345,10 @@ struct App {
     check: Option<Check>,
     /// Rounds of fixing a failed check since the user's last prompt.
     fix_round: u32,
+    /// The files the last reply wrote as it streamed, each with whether
+    /// it made it and the lines added and removed: reported and checked
+    /// with the rest once it's in.
+    early: Vec<(String, bool, usize, usize)>,
     /// Rounds the agent's been asked again for edits that didn't apply,
     /// since the user last asked something.
     edit_round: u32,
@@ -1409,6 +1446,7 @@ impl App {
             check: None,
             fix_round: 0,
             edit_round: 0,
+            early: Vec::new(),
             window: None,
             kept: None,
             commands: None,
@@ -1897,7 +1935,9 @@ impl App {
     /// agent wasn't shown `whole` when the reply gives back less of it.
     /// The files written.
     fn reply_files(&mut self, root: &std::path::Path, found: Vec<files::File>, whole: &[String]) -> Vec<String> {
-        if found.is_empty() {
+        // Those written as the reply streamed, against the files before it.
+        let early = std::mem::take(&mut self.early);
+        if found.is_empty() && early.is_empty() {
             return Vec::new();
         }
         let plan = files::plan(root, found, whole);
@@ -1923,13 +1963,25 @@ impl App {
                 (f, false, files::line_changes(&old, &f.content))
             }))
             .collect();
-        let (written, failed) = files::write(root, &[plan.new.as_slice(), plan.changed.as_slice()].concat());
-        if !written.is_empty() {
+        let (mut written, failed) = files::write(root, &[plan.new.as_slice(), plan.changed.as_slice()].concat());
+        if !written.is_empty() || !early.is_empty() {
             self.entries.push(Entry::Notice(format!("Changed in {}:", root.display())));
         }
-        for (file, created, (added, removed)) in changes.iter().filter(|(f, ..)| written.contains(&f.path)) {
-            let what = if *created { "created" } else { "updated" };
-            self.entries.push(Entry::Notice(format!("  {} {} (+{} −{})", what, file.path, added, removed)));
+        let mine = |path: &String| early.iter().any(|(p, ..)| p == path);
+        let reported = early.iter().map(|(path, created, added, removed)| (path.as_str(), *created, *added, *removed)).chain(
+            changes
+                .iter()
+                .filter(|(f, ..)| written.contains(&f.path) && !mine(&f.path))
+                .map(|(f, created, (added, removed))| (f.path.as_str(), *created, *added, *removed)),
+        );
+        for (path, created, added, removed) in reported {
+            let what = if created { "created" } else { "updated" };
+            self.entries.push(Entry::Notice(format!("  {} {} (+{} −{})", what, path, added, removed)));
+        }
+        for (path, ..) in &early {
+            if !written.contains(path) {
+                written.push(path.clone());
+            }
         }
         for failure in failed {
             self.entries.push(Entry::Error(format!("Failed to write {}", failure)));
@@ -2181,7 +2233,9 @@ impl App {
         // An edited file is the file there with the edits made: all of it.
         whole.extend(found.edited);
         let (found, failed) = (found.files, found.failed);
-        let plan = files::plan(&root, found.clone(), &whole);
+        let mut plan = files::plan(&root, found.clone(), &whole);
+        // A file the reply wrote already, as it streamed, is its own.
+        plan.changed.retain(|f| !self.early.iter().any(|(p, ..)| *p == f.path));
         if plan.changed.is_empty() || self.always_run {
             return self.apply_reply(root, found, &whole, commands, failed);
         }
@@ -2491,8 +2545,23 @@ impl App {
                         Ok(stats) => {
                             reply.stats = Some(stats);
                             if let Some(root) = turn.files_dir {
-                                let found = files::extract_in(&root, &reply.text);
+                                if reply.root.is_none() {
+                                    reply.root = Some(root.clone());
+                                }
+                                // The files as they were before the reply,
+                                // some of its own being written already.
+                                let found = files::extract_with(&reply.text, |p| reply.old(p));
                                 let commands = files::commands(&reply.text);
+                                self.early = reply
+                                    .written
+                                    .iter()
+                                    .map(|path| {
+                                        let old = reply.old(path);
+                                        let new = found.files.iter().find(|f| f.path == *path).map_or("", |f| f.content.as_str());
+                                        let (added, removed) = files::line_changes(old.as_deref().unwrap_or(""), new);
+                                        (path.clone(), old.is_none(), added, removed)
+                                    })
+                                    .collect();
                                 self.reply_done(root, found, turn.whole, commands);
                             }
                         }
@@ -2790,12 +2859,20 @@ impl App {
     }
 
     fn chat_event(&mut self, event: ChatEvent) {
+        let always = self.always_run;
         let Some(turn) = self.turn.as_mut() else { return };
         let Some(Entry::Reply(reply)) = self.entries.get_mut(turn.entry) else { return };
         match event {
             ChatEvent::Content(content) => {
                 turn.tokens += 1;
                 reply.text.push_str(&content);
+                // A file's written once its block is done, not when the
+                // reply is.
+                if content.contains('\n')
+                    && let Some(root) = &turn.files_dir
+                {
+                    reply.write_done(root, always);
+                }
             }
             ChatEvent::Citations(list) => {
                 reply.citations = list.iter().filter_map(chat::citation_label).collect();
@@ -6509,6 +6586,63 @@ mod tests {
         app.apply(AppEvent::Diagnostics(2, vec!["clangd"], Vec::new()));
         assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "clangd: no errors in main.c")));
         assert!(app.check.as_ref().is_none_or(|c| c.servers.is_none()));
+    }
+
+    #[test]
+    fn a_replys_files_are_written_as_their_blocks_are_done() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(dir.path().join("log.txt"), "first\n").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let start = |app: &mut App| {
+            app.entries.push(Entry::Reply(Reply { root: Some(dir.path().to_path_buf()), ..Default::default() }));
+            app.turn = Some(Turn {
+                started: Instant::now(),
+                task: runtime.spawn(async {}),
+                entry: app.entries.len() - 1,
+                tokens: 0,
+                activity: None,
+                files_dir: Some(dir.path().to_path_buf()),
+                whole: Vec::new(),
+            });
+        };
+        let chunk = |app: &mut App, text: &str| app.apply(AppEvent::Chat(ChatEvent::Content(text.into())));
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).ok();
+        start(&mut app);
+        chunk(&mut app, "Here:\n\n```sh\ncat > new.txt <<'EOF'\nhello\n");
+        assert_eq!(read("new.txt"), None, "not while it's coming");
+        chunk(&mut app, "EOF\ncat >> new.txt <<'EOF'\nmore\nEOF\n");
+        // A new file, as soon as its heredoc's done; and added to after.
+        assert_eq!(read("new.txt").as_deref(), Some("hello\nmore\n"));
+        chunk(&mut app, "```\n\n```edit a.txt\n<<<<<<< SEARCH\ntwo\n=======\n2\n>>>>>>> REPLACE\n```\n");
+        // A change to a file that's there waits to be asked about.
+        assert_eq!(read("a.txt").as_deref(), Some("one\ntwo\n"));
+        app.apply(AppEvent::TurnDone(Ok(TurnStats::default())));
+        assert!(matches!(app.entries.last(), Some(Entry::AskWrite(c)) if c.len() == 1 && c[0].0 == "a.txt"));
+        app.answer_write(true, false);
+        // Nothing made twice, the reply's own file not asked about, and
+        // each change reported once.
+        assert_eq!(read("new.txt").as_deref(), Some("hello\nmore\n"));
+        assert_eq!(read("a.txt").as_deref(), Some("one\n2\n"));
+        let notices: Vec<&String> = app.entries.iter().filter_map(|e| match e { Entry::Notice(n) => Some(n), _ => None }).collect();
+        assert!(notices.iter().any(|n| n.as_str() == "  created new.txt (+2 −0)"), "{notices:?}");
+        assert!(notices.iter().any(|n| n.as_str() == "  updated a.txt (+1 −1)"), "{notices:?}");
+        // Allowed for the session, a change to a file there is written as
+        // soon as it's done too, and made once.
+        app.always_run = true;
+        start(&mut app);
+        chunk(&mut app, "```sh\ncat >> log.txt <<'EOF'\nsecond\nEOF\n```\n");
+        assert_eq!(read("log.txt").as_deref(), Some("first\nsecond\n"));
+        chunk(&mut app, "```edit a.txt\n<<<<<<< SEARCH\n2\n=======\n3\n>>>>>>> REPLACE\n```\n");
+        assert_eq!(read("a.txt").as_deref(), Some("one\n3\n"));
+        app.apply(AppEvent::TurnDone(Ok(TurnStats::default())));
+        assert_eq!(read("log.txt").as_deref(), Some("first\nsecond\n"));
+        assert_eq!(read("a.txt").as_deref(), Some("one\n3\n"));
+        assert!(!app.entries.iter().any(|e| matches!(e, Entry::Warning(w) if w.starts_with("Not changed"))));
     }
 
     #[test]

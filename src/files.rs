@@ -498,8 +498,15 @@ pub fn extract(reply: &str) -> Vec<File> {
 /// `extract` for a reply about the folder `root`: a heredoc written with
 /// `>>` adds to the file there when the reply hasn't given it before, and
 /// an edit block changes it, or what the reply gave of it before.
+#[cfg(test)]
 pub fn extract_in(root: &Path, reply: &str) -> Extracted {
     gather(reply, |path| fs::read_to_string(root.join(path)).ok())
+}
+
+/// `extract` for a reply about files as `before` gives them, by path, as
+/// they were before any of its files were written.
+pub fn extract_with(reply: &str, before: impl Fn(&str) -> Option<String>) -> Extracted {
+    gather(reply, before)
 }
 
 fn gather(reply: &str, on_disk: impl Fn(&str) -> Option<String>) -> Extracted {
