@@ -64,8 +64,13 @@ pub fn new_session_id() -> String {
 /// server (or a proxy in front of it) to drop it, which surfaces as a stream
 /// error before any content has streamed. Retry once in that case since a
 /// fresh connection usually succeeds.
+///
+/// `system`, when given, goes as a system message ahead of `message`: the
+/// agent adds it to its own system prompt, so instructions there are
+/// followed, where in the user's message they'd be read as data.
 pub async fn stream_turn(
     client: &OpenAIClient<OpenAIConfig>,
+    system: Option<&str>,
     message: &str,
     attachments: &[String],
     project_id: &str,
@@ -73,11 +78,11 @@ pub async fn stream_turn(
     session_id: &str,
     on: &mut (dyn FnMut(ChatEvent) + Send),
 ) -> Result<TurnStats, String> {
-    match stream_turn_once(client, message, attachments, project_id, cwd, session_id, on).await {
+    match stream_turn_once(client, system, message, attachments, project_id, cwd, session_id, on).await {
         Ok(stats) => Ok(stats),
         Err((e, tokens)) if tokens == 0 => {
             on(ChatEvent::Retrying(e));
-            stream_turn_once(client, message, attachments, project_id, cwd, session_id, on)
+            stream_turn_once(client, system, message, attachments, project_id, cwd, session_id, on)
                 .await
                 .map_err(|(e, _)| e)
         }
@@ -87,6 +92,7 @@ pub async fn stream_turn(
 
 async fn stream_turn_once(
     client: &OpenAIClient<OpenAIConfig>,
+    system: Option<&str>,
     message: &str,
     attachments: &[String],
     project_id: &str,
@@ -106,7 +112,10 @@ async fn stream_turn_once(
     let cwd = cwd.map(|dir| dir.to_string_lossy().into_owned());
     let body = serde_json::json!({
         "model": "sl-mini",
-        "messages": [user],
+        "messages": system.map_or_else(
+            || vec![user.clone()],
+            |system| vec![serde_json::json!({"role": "system", "content": system}), user.clone()],
+        ),
         "session_id": session_id,
         "project_id": project_id,
         "cwd": cwd,
@@ -310,7 +319,7 @@ async fn print_turn(
         }
     };
     let cwd = turn_dir(project_id);
-    let stats = stream_turn(client, message, &[], project_id, cwd.as_deref(), session_id, &mut on).await?;
+    let stats = stream_turn(client, None, message, &[], project_id, cwd.as_deref(), session_id, &mut on).await?;
 
     let mut out = std::io::stdout().lock();
     if !at_line_start {

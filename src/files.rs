@@ -16,12 +16,13 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 /// Told to the agent with a prompt that asks for something to be made.
-pub const HINT: &str = "If your answer creates or changes files, start with a short summary of what you \
-changed and why. To change a file that's there, don't give it whole: give an edit block, a fenced block \
-marked `edit` with the file's path, as ```` ```edit src/main.rs ````, holding one or more changes, each as a \
+pub const HINT: &str = "If your answer creates or changes files, start with a line or two on what the \
+files below do and why, then give every one of them: a file you only describe isn't written. To change a file that's there, don't give it whole: give an edit block, a fenced block \
+marked `edit` with the file's path, as ```` ```edit path/to/file ````, holding one or more changes, each as a \
 line `<<<<<<< SEARCH`, the lines to change copied exactly from the file, a line `=======`, the lines to put in \
 their place, then a line `>>>>>>> REPLACE`; never leave out any of those three lines, and never split one change over two \
-blocks. Each SEARCH must be found in the file once: give a few unchanged \
+blocks. Give an edit block only for a file I've shown you or you've already written; any other file is new, \
+so write it whole. Each SEARCH must be found in the file once: give a few unchanged \
 lines around a change when a line alone could be found twice, and keep it short otherwise. A new file you write \
 whole with a shell heredoc in a fenced block marked `sh`: a line `cat > path/to/file <<'EOF'`, with the path \
 relative to the working folder, then the file's complete contents, then `EOF` alone on its line. When a file's \
@@ -91,6 +92,23 @@ pub fn budget_for(window: Option<u64>) -> usize {
 /// The kind of code project `root` is, from the files at its top.
 pub fn project_kind(root: &Path) -> Option<&'static str> {
     MARKERS.iter().find(|(marker, _)| root.join(marker).is_file()).map(|(_, kind)| *kind)
+}
+
+/// Languages whose source doesn't build without a manifest beside it:
+/// `(extension, manifest, language)`.
+const NEEDS_MANIFEST: [(&str, &str, &str); 2] = [("rs", "Cargo.toml", "Rust"), ("go", "go.mod", "Go")];
+
+/// The manifest `written` needs and `root` hasn't, with its language: Rust
+/// or Go source written into a folder that isn't a project yet, as a small
+/// model leaves it.
+pub fn missing_manifest(root: &Path, written: &[String]) -> Option<(&'static str, &'static str)> {
+    if project_kind(root).is_some() {
+        return None;
+    }
+    written.iter().find_map(|path| {
+        let ext = Path::new(path).extension()?.to_str()?;
+        NEEDS_MANIFEST.iter().find(|(e, _, _)| *e == ext).map(|(_, manifest, lang)| (*manifest, *lang))
+    })
 }
 
 /// Source files, by extension: where a change most often goes, so shown
@@ -419,6 +437,32 @@ const MAKING: [&str; 14] = [
 const BARE_NAMES: [&str; 8] =
     ["Makefile", "Dockerfile", "Justfile", "Procfile", "Gemfile", "Rakefile", "LICENSE", "Containerfile"];
 
+/// The working folder `root`, said to be the project's root: a small model
+/// otherwise makes a project folder inside it (`cargo new name`) and `cd`s
+/// about, expecting that to move where files go.
+pub fn folder_note(root: &Path) -> String {
+    format!(
+        "The working folder is `{}`, and it is the project's root: every path is relative to it, as `Cargo.toml` \
+         and `src/main.rs` for a Rust program. Don't make a project folder inside it (no `cargo new <name>`, \
+         `cargo init <name>` or `npm create <name>`), and don't `cd`: commands always run in this folder, and a \
+         `cd` doesn't change where files are written.",
+        root.display()
+    )
+}
+
+/// Told to the agent when the folder it works in has no files yet, so it
+/// doesn't take an edit block's example path for a file that's there.
+pub const EMPTY_FOLDER: &str = "The working folder is empty: there are no files to change, so write every file \
+whole as a heredoc, with no edit blocks.";
+
+/// Whether `root` has no files of its own: nothing but hidden entries,
+/// such as docent's `.docent/`.
+pub fn is_empty_folder(root: &Path) -> bool {
+    fs::read_dir(root).map_or(false, |entries| {
+        entries.flatten().all(|e| e.file_name().to_string_lossy().starts_with('.'))
+    })
+}
+
 /// Whether `message` asks for something to be made, so the reply should
 /// come as files.
 pub fn wants_files(message: &str) -> bool {
@@ -732,6 +776,9 @@ pub fn blocks(reply: &str) -> Vec<Block> {
     let lines: Vec<&str> = reply.lines().collect();
     let mut blocks: Vec<Block> = Vec::new();
     let mut above: Option<(usize, &str)> = None;
+    // A heading naming a path since the last block: it names the next code
+    // block even with a paragraph about the file between them.
+    let mut heading: Option<String> = None;
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -765,9 +812,15 @@ pub fn blocks(reply: &str) -> Vec<Block> {
             }
             if !line.trim().is_empty() {
                 above = Some((at, line));
+                if line.trim_start().starts_with('#')
+                    && let Some(path) = label_path(line)
+                {
+                    heading = Some(path);
+                }
             }
             continue;
         };
+        let heading = heading.take();
         let start = i;
         let close = close_of(&lines, at, &fence, info);
         let mut body: Vec<&str> = lines[start..close.unwrap_or(lines.len())].to_vec();
@@ -805,6 +858,11 @@ pub fn blocks(reply: &str) -> Vec<Block> {
             if body.first().is_some_and(|l| opening_fence(l).is_some()) {
                 body.remove(0);
             }
+        }
+        // Last, a heading a paragraph or so up; never for a shell block,
+        // whose heredocs name their own files.
+        if path.is_none() && !heredoc_lang(info) {
+            path = heading;
         }
         above = None;
         let Some(path) = path else {
@@ -1513,6 +1571,18 @@ fn build_script(root: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_heading_names_the_block_after_a_paragraph_about_it() {
+        let reply = "Here is the app.\n\n### File: `main.rs`\nThis file reads a line and prints it.\n\n```rust\nfn main() {}\n```\n";
+        assert_eq!(paths(reply), ["main.rs"]);
+        // Named once: a second block under no heading of its own is no file.
+        let twice = format!("{reply}\nRun it:\n\n```rust\nfn other() {{}}\n```\n");
+        assert_eq!(paths(&twice), ["main.rs"]);
+        // A shell block under it is commands; its heredoc names the file.
+        let shell = "### File: `main.rs`\nWrite it with:\n\n```sh\ncat > src/main.rs <<'EOF'\nfn main() {}\nEOF\n```\n";
+        assert_eq!(paths(shell), ["src/main.rs"]);
+    }
+
     fn paths(reply: &str) -> Vec<String> {
         extract(reply).into_iter().map(|f| f.path).collect()
     }
@@ -1655,6 +1725,36 @@ mod tests {
         // Near its size, it's taken as the whole file.
         let most = long.lines().skip(5).map(|l| format!("{}\n", l)).collect::<String>();
         assert_eq!(plan(dir.path(), vec![file(&most)], &[]).changed.len(), 1);
+    }
+
+    #[test]
+    fn rust_or_go_source_outside_a_project_needs_its_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(missing_manifest(dir.path(), &w(&["src/main.rs"])), Some(("Cargo.toml", "Rust")));
+        assert_eq!(missing_manifest(dir.path(), &w(&["README.md", "main.go"])), Some(("go.mod", "Go")));
+        assert_eq!(missing_manifest(dir.path(), &w(&["app.py", "index.html"])), None);
+        fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(missing_manifest(dir.path(), &w(&["src/main.rs"])), None);
+    }
+
+    #[test]
+    fn the_folder_note_names_the_folder_as_the_projects_root() {
+        let note = folder_note(Path::new("/home/me/small-app"));
+        assert!(note.starts_with("The working folder is `/home/me/small-app`, and it is the project's root"), "{note}");
+        assert!(note.contains("don't `cd`"), "{note}");
+    }
+
+    #[test]
+    fn a_folder_with_only_hidden_entries_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(is_empty_folder(dir.path()));
+        fs::create_dir_all(dir.path().join(".docent")).unwrap();
+        fs::write(dir.path().join(".docentignore"), "").unwrap();
+        assert!(is_empty_folder(dir.path()));
+        fs::write(dir.path().join("notes.md"), "hi").unwrap();
+        assert!(!is_empty_folder(dir.path()));
+        assert!(!is_empty_folder(&dir.path().join("missing")));
     }
 
     #[test]
