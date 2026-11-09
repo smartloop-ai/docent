@@ -217,8 +217,6 @@ On exit it prints the session id, to resume with `docent -s <session-id>` (or `-
 | `/status` | account, model, agent and versions |
 | `/usage` | credits used this month (cloud models and web search) |
 | `/upgrade` | Pro or Plus plan: more credits a month |
-| `/code [on\|off\|auto]` | whether prompts in this folder are answered with code (see [Coding](#coding)); `on` and `off` mark the folder over what its files say, `auto` unmarks it |
-| `/write [path]` | write the last reply's files that were left unwritten, or one of them |
 | `/clear` | clear the chat and start a new session |
 | `/<skill> [prompt]` | run one of the project's skills; `/` lists them with the commands |
 | `!<command>` | run a shell command in the working directory, its output shown as it comes, each command of a script on a `$` line over what it printed; the output goes to the agent with your next prompt, so it stays in the session. The prompt turns pink with `!` ahead as it's typed, and the footer says shell mode, as in Claude Code |
@@ -374,8 +372,6 @@ What happens on each prompt:
 
 | Command | Does |
 | --- | --- |
-| `/code on\|off\|auto` | treat this folder as a code project, or not |
-| `/write [path]` | write files a reply left unwritten |
 | `!<command> [&]` | run a shell command yourself, in the background with `&` |
 | `/tasks` or `ctrl+b`, `/stop` | see, expand or stop running commands |
 | `Tab` on an empty prompt | turn auto-approve on or off |

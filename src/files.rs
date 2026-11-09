@@ -1386,8 +1386,7 @@ pub struct Plan {
     /// Paths that lead outside the folder, left alone.
     pub refused: Vec<String>,
     /// There, and not shown to the agent whole: a reply shorter than the
-    /// file can't be all of it, so it's left as it is, unless `/write`
-    /// says otherwise.
+    /// file can't be all of it, so it's left as it is.
     pub kept: Vec<File>,
 }
 

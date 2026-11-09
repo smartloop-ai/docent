@@ -78,7 +78,7 @@ pub enum Kind {
 struct Manifest {
     #[serde(default)]
     project: Option<String>,
-    /// Set by `/code on` or `/code off`; none reads it off the files.
+    /// A mark made by hand in an earlier version; none reads it off the files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<Kind>,
     /// Set by `/sync stop`: the chat leaves the folder alone until `/sync`.
@@ -931,16 +931,6 @@ pub fn kind(root: &Path) -> Option<Kind> {
     Manifest::load(root).ok()?.kind
 }
 
-/// Mark `root` as holding `kind`, over what its files say; none goes back
-/// to what they say. Waits out a sync of the folder, which saves the
-/// manifest itself.
-pub fn mark(root: &Path, kind: Option<Kind>) -> Result<(), String> {
-    let _held = lock();
-    let mut manifest = Manifest::load(root)?;
-    manifest.kind = kind;
-    manifest.save(root)
-}
-
 /// Stop syncing `root` until it's linked again, waiting for a sync still
 /// running to finish its save.
 pub fn pause(root: &Path) -> Result<(), String> {
@@ -1019,23 +1009,16 @@ pub fn follow(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_folder_is_marked_code_or_documents_by_hand_only() {
+    fn linking_a_folder_marks_no_kind() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(super::kind(dir.path()), None);
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
-        super::mark(dir.path(), Some(super::Kind::Documents)).unwrap();
-        assert_eq!(super::kind(dir.path()), Some(super::Kind::Documents));
+        assert_eq!(super::kind(dir.path()), None);
         // Not a link: no project yet.
         assert!(super::linked(dir.path()).is_none());
-        // Linking keeps a mark made by hand, and makes none: a folder
-        // scaffolded after it's linked is read as it is now.
+        // Linking makes no mark: a folder scaffolded after it's linked is
+        // read as it is now.
         super::link(dir.path(), "p1").unwrap();
-        assert_eq!(super::kind(dir.path()), Some(super::Kind::Documents));
-        super::mark(dir.path(), None).unwrap();
         assert_eq!(super::kind(dir.path()), None);
-        let other = tempfile::tempdir().unwrap();
-        super::link(other.path(), "p2").unwrap();
-        assert_eq!(super::kind(other.path()), None);
     }
 
     #[test]
