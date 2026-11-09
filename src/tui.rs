@@ -422,12 +422,17 @@ enum Entry {
     Shell(Shell),
     /// The last reply's shell commands, waiting to be allowed or skipped.
     Ask(Vec<String>),
-    /// The files there the last reply changes, with lines added and
-    /// removed, waiting to be allowed or skipped.
-    AskWrite(Vec<(String, usize, usize)>),
     Notice(String),
     Warning(String),
     Error(String),
+}
+
+/// A file a reply wrote as it streamed: what it was before (`None`, new)
+/// and what the reply made it, reported once the reply's in.
+struct Early {
+    path: String,
+    old: Option<String>,
+    new: String,
 }
 
 /// A `!command`, a reply's script or a check run in the working directory,
@@ -562,10 +567,8 @@ struct Reply {
 
 impl Reply {
     /// Write each file whose block is done since the last call, as soon as
-    /// it is, rather than when the reply is: a new file, one this reply
-    /// made, or, `always` allowed, one that's there. A change to a file
-    /// that's there waits to be asked about once the reply's in.
-    fn write_done(&mut self, root: &std::path::Path, always: bool) {
+    /// it is, rather than when the reply is, new or there already.
+    fn write_done(&mut self, root: &std::path::Path) {
         let blocks = files::blocks(&self.text);
         while let Some(block) = blocks.get(self.applied).filter(|b| b.closed) {
             self.applied += 1;
@@ -574,14 +577,13 @@ impl Reply {
             let upto: Vec<&str> = self.text.lines().take(block.end).collect();
             let found = files::extract_with(&upto.join("\n"), |p| self.old(p));
             let Some(file) = found.files.into_iter().find(|f| f.path == block.file.path) else { continue };
-            let ours = self.old(&file.path).is_none() || self.written.contains(&file.path);
+            // Read as it was before it's written over: the reply's diffs and
+            // its report are against that.
+            let _ = self.old(&file.path);
             let mut whole = self.whole.clone();
             whole.extend(found.edited);
             let plan = files::plan(root, vec![file], &whole);
-            let mut ready = plan.new;
-            if ours || always {
-                ready.extend(plan.changed);
-            }
+            let ready = [plan.new, plan.changed].concat();
             for path in files::write(root, &ready).0 {
                 if !self.written.contains(&path) {
                     self.written.push(path);
@@ -762,14 +764,15 @@ impl Reply {
     /// it can't be made.
     fn edit_part(&self, block: &files::Block, blocks: &[files::Block], pending: bool, segment: &str, width: u16) -> Vec<Line<'static>> {
         let path = &block.file.path;
+        // Still coming, its SEARCH/REPLACE text is held back: the change
+        // shows as a diff once the block's done.
         if pending {
-            let mut part = vec![Line::from(vec![
+            let received = segment.lines().count().saturating_sub(1);
+            return vec![Line::from(vec![
                 Span::styled("● ", dim()),
                 Span::styled(path.clone(), Style::new().bold()),
-                Span::styled(" · editing", dim()),
+                Span::styled(format!(" · editing… {} line{}", received, if received == 1 { "" } else { "s" }), dim()),
             ])];
-            part.extend(code_lines(segment, width));
-            return part;
         }
         // The file as the blocks before this one leave it.
         let mut before = self.old(path);
@@ -1112,18 +1115,6 @@ enum Phase {
     Ready,
 }
 
-/// A reply's files and commands, held while it's asked whether to write
-/// over the files that are there.
-struct WriteAsk {
-    root: std::path::PathBuf,
-    found: Vec<files::File>,
-    whole: Vec<String>,
-    commands: Vec<String>,
-    /// The files there it changes.
-    changed: Vec<String>,
-    /// Its edits that couldn't be made, by path, with why.
-    failed: Vec<(String, String)>,
-}
 
 struct Turn {
     started: Instant,
@@ -1246,7 +1237,7 @@ struct App {
     scroll_limit: std::cell::Cell<u16>,
     /// Each entry's height as last laid out, by index: the width and the
     /// entry's version it was measured at, and its rows.
-    heights: std::cell::RefCell<Vec<Option<(u16, usize, usize)>>>,
+    heights: std::cell::RefCell<Vec<Option<(u16, u64, usize)>>>,
     /// The conversation pane as last drawn, row by row, for copying a
     /// selection out of it, and the link under each cell, for clicking.
     shown: std::cell::RefCell<Shown>,
@@ -1268,6 +1259,10 @@ struct App {
     /// Files dropped on the prompt, each shown there as a chip such as
     /// `[Image 1]` until the message is sent.
     attachments: Vec<Attachment>,
+    /// Prompts sent while a turn (or what follows it) was still going, in
+    /// order: each goes once everything before it is done. Esc takes the
+    /// last one back before it interrupts.
+    queued: Vec<Queued>,
     /// `!command` runs not yet sent: the next prompt carries them to the
     /// agent, so they stay in the session's history.
     shell_context: Vec<String>,
@@ -1287,7 +1282,7 @@ struct App {
     /// The files the last reply wrote as it streamed, each with whether
     /// it made it and the lines added and removed: reported and checked
     /// with the rest once it's in.
-    early: Vec<(String, bool, usize, usize)>,
+    early: Vec<Early>,
     /// Rounds the agent's been asked again for edits that didn't apply,
     /// since the user last asked something.
     edit_round: u32,
@@ -1298,9 +1293,6 @@ struct App {
     /// The project's enabled models, once read; empty asks for one on the
     /// card.
     enabled_models: Option<Vec<String>>,
-    /// The last reply's files left unwritten, as the agent wasn't shown
-    /// them whole, with their folder: `/write` writes them after all.
-    kept: Option<(std::path::PathBuf, Vec<files::File>)>,
     /// What the check said when it last failed, to tell a round that fixed
     /// nothing.
     last_failure: Option<String>,
@@ -1310,11 +1302,7 @@ struct App {
     /// Those commands once checked, waiting to be allowed: Enter runs
     /// them, Tab runs them and every later reply's too, Esc skips them.
     ask: Option<(std::path::PathBuf, Vec<String>)>,
-    /// The last reply's files, waiting to be allowed: it changes files
-    /// that are there, which aren't written over without asking.
-    write_ask: Option<WriteAsk>,
-    /// Allowed for the session: a reply's changes are written and its
-    /// commands run without asking.
+    /// Allowed for the session: a reply's commands run without asking.
     always_run: bool,
     /// Rounds of fixing a reply's failed command since the user's last
     /// prompt, so a command that keeps failing doesn't go on forever.
@@ -1385,6 +1373,7 @@ impl App {
             ticks: 0,
             token_entry: false,
             attachments: Vec::new(),
+            queued: Vec::new(),
             shell_context: Vec::new(),
             shell_runs: 0,
             lsp: Arc::default(),
@@ -1396,10 +1385,8 @@ impl App {
             early: Vec::new(),
             window: None,
             enabled_models: None,
-            kept: None,
             commands: None,
             ask: None,
-            write_ask: None,
             always_run: false,
             command_round: 0,
             last_failure: None,
@@ -1426,6 +1413,7 @@ impl App {
         let mut keys = EventStream::new();
         let mut tick = tokio::time::interval(TICK);
         while !self.quit {
+            self.send_queued();
             terminal
                 .draw(|frame| self.draw(frame))
                 .map_err(|e| format!("Failed to draw: {}", e))?;
@@ -1803,94 +1791,6 @@ impl App {
                 .is_some_and(|dir| code_kind(&dir).is_some() || files::mentions_file(&dir, prompt))
     }
 
-    /// `/write [path]`: write the last reply's files left unwritten, all of
-    /// them or the one named, replacing what's there.
-    fn write_command(&mut self, path: Option<&str>) {
-        let Some((root, kept)) = self.kept.take() else {
-            return self.entries.push(Entry::Notice("Nothing left unwritten from the last reply".to_string()));
-        };
-        let (chosen, rest): (Vec<files::File>, Vec<files::File>) =
-            kept.into_iter().partition(|f| path.is_none_or(|p| p.trim_start_matches("./") == f.path));
-        if chosen.is_empty() {
-            let paths: Vec<&str> = rest.iter().map(|f| f.path.as_str()).collect();
-            self.entries.push(Entry::Error(format!("Nothing by that name left unwritten; there's {}", paths.join(", "))));
-            self.kept = Some((root, rest));
-            return;
-        }
-        let (written, failed) = files::write(&root, &chosen);
-        if !written.is_empty() {
-            self.entries.push(Entry::Notice(format!("Written in {}: {}", root.display(), written.join(", "))));
-        }
-        for failure in failed {
-            self.entries.push(Entry::Error(format!("Failed to write {}", failure)));
-        }
-        if !rest.is_empty() {
-            self.kept = Some((root.clone(), rest));
-        }
-        if !written.is_empty() {
-            if let Some(sync) = &self.sync {
-                sync.nudge.store(true, Ordering::Relaxed);
-            }
-            self.run_check(&root, &written);
-        }
-        self.scroll_back = 0;
-    }
-
-    /// `/code`: whether this folder is taken as a code project, so prompts
-    /// here are answered with code; `on` and `off` mark it so, over what
-    /// its files say.
-    fn code_command(&mut self, word: Option<&str>) {
-        let Some(root) = sync_root().filter(|root| docent::refusal(root).is_none()) else {
-            return self.entries.push(Entry::Error("This folder can't be a project".to_string()));
-        };
-        let mark = match word {
-            None => None,
-            Some("on") => Some(Some(docent::Kind::Code)),
-            Some("off") => Some(Some(docent::Kind::Documents)),
-            Some("auto") => Some(None),
-            Some(other) => {
-                return self.entries.push(Entry::Error(format!("Unknown /code {}; try /code on, off or auto", other)));
-            }
-        };
-        if let Some(kind) = mark {
-            // A sync of the folder saves the manifest itself: it stops for
-            // the mark, and goes on after.
-            let syncing = self.sync.is_some();
-            self.stop_sync();
-            if let Err(e) = docent::mark(&root, kind) {
-                return self.entries.push(Entry::Error(e));
-            }
-            if syncing {
-                self.follow_project();
-            }
-        }
-        let found = files::project_kind(&root);
-        let text = match (docent::kind(&root), found) {
-            (Some(docent::Kind::Code), _) => format!(
-                "{} is marked a code project{}: prompts here are answered with code; /code off changes that",
-                root.display(),
-                found.map_or(String::new(), |k| format!(" ({})", k))
-            ),
-            (Some(docent::Kind::Documents), _) => {
-                format!("{} is marked a documents project; /code on answers prompts here with code", root.display())
-            }
-            (None, Some(kind)) => format!(
-                "{} looks like a {} project, so prompts here are answered with code; /code off changes that",
-                root.display(),
-                kind
-            ),
-            (None, None) => {
-                format!("{} looks like a documents project; /code on answers prompts here with code", root.display())
-            }
-        };
-        let text = match mark {
-            Some(Some(_)) => text,
-            Some(None) => format!("{} (read off its files again)", text),
-            None => text,
-        };
-        self.entries.push(Entry::Notice(text));
-    }
-
     /// Write the files a reply gave into the turn's folder, new and changed
     /// alike, as the reply is the edit, then say what changed in each, by
     /// lines; those already as given are left be, and so is a file the
@@ -1910,10 +1810,9 @@ impl App {
             let paths: Vec<&str> = plan.kept.iter().map(|f| f.path.as_str()).collect();
             self.entries.push(Entry::Warning(format!(
                 "Not written, as the reply holds less than the file and the agent wasn't shown it whole: {}; the change \
-                 shows above, and /write writes it anyway",
+                 shows above",
                 paths.join(", ")
             )));
-            self.kept = Some((root.to_path_buf(), plan.kept.clone()));
         }
         // Each file's lines added and removed, against what's there now.
         let changes: Vec<(&files::File, bool, (usize, usize))> = plan
@@ -1929,20 +1828,26 @@ impl App {
         if !written.is_empty() || !early.is_empty() {
             self.entries.push(Entry::Notice(format!("Changed in {}:", root.display())));
         }
-        let mine = |path: &String| early.iter().any(|(p, ..)| p == path);
-        let reported = early.iter().map(|(path, created, added, removed)| (path.as_str(), *created, *added, *removed)).chain(
-            changes
-                .iter()
-                .filter(|(f, ..)| written.contains(&f.path) && !mine(&f.path))
-                .map(|(f, created, (added, removed))| (f.path.as_str(), *created, *added, *removed)),
-        );
+        let mine = |path: &String| early.iter().any(|e| e.path == *path);
+        let reported = early
+            .iter()
+            .map(|e| {
+                let (added, removed) = files::line_changes(e.old.as_deref().unwrap_or(""), &e.new);
+                (e.path.as_str(), e.old.is_none(), added, removed)
+            })
+            .chain(
+                changes
+                    .iter()
+                    .filter(|(f, ..)| written.contains(&f.path) && !mine(&f.path))
+                    .map(|(f, created, (added, removed))| (f.path.as_str(), *created, *added, *removed)),
+            );
         for (path, created, added, removed) in reported {
             let what = if created { "created" } else { "updated" };
             self.entries.push(Entry::Notice(format!("  {} {} (+{} −{})", what, path, added, removed)));
         }
-        for (path, ..) in &early {
-            if !written.contains(path) {
-                written.push(path.clone());
+        for e in &early {
+            if !written.contains(&e.path) {
+                written.push(e.path.clone());
             }
         }
         for failure in failed {
@@ -2187,54 +2092,13 @@ impl App {
         self.scroll_back = 0;
     }
 
-    /// A reply's files `found` and `commands`, in `root`: a reply changing
-    /// files that are there asks first, as a coding harness asks before an
-    /// edit, unless allowed for the session; else they're written, checked,
-    /// and the commands asked about.
+    /// A reply's files `found` and `commands`, in `root`: written and
+    /// checked, as a coding harness writes its edits, then the commands
+    /// asked about.
     fn reply_done(&mut self, root: std::path::PathBuf, found: files::Extracted, mut whole: Vec<String>, commands: Vec<String>) {
         // An edited file is the file there with the edits made: all of it.
         whole.extend(found.edited);
-        let (found, failed) = (found.files, found.failed);
-        let mut plan = files::plan(&root, found.clone(), &whole);
-        // A file the reply wrote already, as it streamed, is its own.
-        plan.changed.retain(|f| !self.early.iter().any(|(p, ..)| *p == f.path));
-        if plan.changed.is_empty() || self.always_run {
-            return self.apply_reply(root, found, &whole, commands, failed);
-        }
-        let shown: Vec<(String, usize, usize)> = plan
-            .changed
-            .iter()
-            .map(|f| {
-                let old = std::fs::read_to_string(root.join(&f.path)).unwrap_or_default();
-                let (added, removed) = files::line_changes(&old, &f.content);
-                (f.path.clone(), added, removed)
-            })
-            .collect();
-        let changed = plan.changed.into_iter().map(|f| f.path).collect();
-        self.entries.retain(|e| !matches!(e, Entry::AskWrite(_)));
-        self.entries.push(Entry::AskWrite(shown));
-        self.write_ask = Some(WriteAsk { root, found, whole, commands, changed, failed });
-        self.scroll_back = 0;
-    }
-
-    /// The files asked about, answered: `write` writes them all, else
-    /// only the new ones, and the files there are left as they are;
-    /// `always` writes from now on without asking.
-    fn answer_write(&mut self, write: bool, always: bool) {
-        let Some(ask) = self.write_ask.take() else { return };
-        self.entries.retain(|e| !matches!(e, Entry::AskWrite(_)));
-        let mut found = ask.found;
-        if !write {
-            found.retain(|f| !ask.changed.contains(&f.path));
-            self.entries.push(Entry::Notice(format!("Not written: {}", ask.changed.join(", "))));
-        }
-        if always {
-            self.always_run = true;
-            self.entries.push(Entry::Notice(
-                "Auto-approve on: a reply's changes are written and its commands run without asking (tab turns it off)".to_string(),
-            ));
-        }
-        self.apply_reply(ask.root, found, &ask.whole, ask.commands, ask.failed);
+        self.apply_reply(root, found.files, &whole, commands, found.failed);
     }
 
     /// Write a reply's files, check them, then ask about its commands.
@@ -2529,11 +2393,10 @@ impl App {
                                 self.early = reply
                                     .written
                                     .iter()
-                                    .map(|path| {
-                                        let old = reply.old(path);
-                                        let new = found.files.iter().find(|f| f.path == *path).map_or("", |f| f.content.as_str());
-                                        let (added, removed) = files::line_changes(old.as_deref().unwrap_or(""), new);
-                                        (path.clone(), old.is_none(), added, removed)
+                                    .map(|path| Early {
+                                        path: path.clone(),
+                                        old: reply.old(path),
+                                        new: found.files.iter().find(|f| f.path == *path).map_or(String::new(), |f| f.content.clone()),
                                     })
                                     .collect();
                                 self.reply_done(root, found, turn.whole, commands);
@@ -2838,7 +2701,6 @@ impl App {
     }
 
     fn chat_event(&mut self, event: ChatEvent) {
-        let always = self.always_run;
         let Some(turn) = self.turn.as_mut() else { return };
         let Some(Entry::Reply(reply)) = self.entries.get_mut(turn.entry) else { return };
         match event {
@@ -2850,7 +2712,7 @@ impl App {
                 if content.contains('\n')
                     && let Some(root) = &turn.files_dir
                 {
-                    reply.write_done(root, always);
+                    reply.write_done(root);
                 }
             }
             ChatEvent::Citations(list) => {
@@ -3414,19 +3276,17 @@ impl App {
         let last_esc = self.last_esc.take();
         let esc_again = key.code == KeyCode::Esc && last_esc.is_some_and(|t| t.elapsed() < DOUBLE_ESC);
         let asked = self.ask.is_some() && self.input.is_empty() && self.turn.is_none() && !self.token_entry;
-        let asked_write = self.write_ask.is_some() && self.input.is_empty() && self.turn.is_none() && !self.token_entry;
         match key.code {
             KeyCode::Esc if self.token_entry => {
                 self.token_entry = false;
                 self.input.clear();
                 self.cursor = 0;
             }
+            // Esc takes back the last queued prompt first, then interrupts.
+            KeyCode::Esc if self.turn.is_some() && !self.queued.is_empty() => {
+                self.queued.pop();
+            }
             KeyCode::Esc if self.turn.is_some() => self.stop_turn(),
-            // The reply's changes to files there, asked about: write, write
-            // from now on, or leave those files be.
-            KeyCode::Enter if asked_write && key.modifiers.is_empty() => self.answer_write(true, false),
-            KeyCode::Tab if asked_write => self.answer_write(true, true),
-            KeyCode::Esc if asked_write => self.answer_write(false, false),
             // The reply's commands, asked about: run, run from now on, or skip.
             KeyCode::Enter if asked && key.modifiers.is_empty() => self.answer_ask(true, false),
             KeyCode::Tab if asked => self.answer_ask(true, true),
@@ -3436,9 +3296,9 @@ impl App {
             KeyCode::Tab if self.input.is_empty() && !self.token_entry => {
                 self.always_run = !self.always_run;
                 let state = if self.always_run {
-                    "on: a reply's changes are written and its commands run without asking"
+                    "on: a reply's commands run without asking"
                 } else {
-                    "off: a reply's changes to files and its commands are asked about"
+                    "off: a reply's commands are asked about"
                 };
                 self.entries.push(Entry::Notice(format!("Auto-approve {}", state)));
                 self.scroll_back = 0;
@@ -3683,8 +3543,6 @@ impl App {
                 }
             }
             "/sync" => self.sync_command(&words.collect::<Vec<_>>()),
-            "/code" => self.code_command(words.next()),
-            "/write" => self.write_command(words.next()),
             "/stop" => self.stop_command(&words.collect::<Vec<_>>().join(" ")),
             "/tasks" => self.open_jobs(),
             "/help" | "/?" => self.overlay = Overlay::Help,
@@ -3697,13 +3555,13 @@ impl App {
             // A clean slate: the conversation goes, and so does the agent's
             // memory of it, with a new session.
             "/clear" => {
+                self.queued.clear();
                 self.stop_turn();
                 self.entries.clear();
                 self.attachments.clear();
                 self.shell_context.clear();
                 self.commands = None;
                 self.ask = None;
-                self.write_ask = None;
                 self.session = chat::new_session_id();
                 self.scroll_back = 0;
             }
@@ -3715,27 +3573,19 @@ impl App {
                 self.entries.push(Entry::Error(format!("Unknown command {}; try /help", command)));
             }
             _ => {
-                // One turn at a time, and only once there's a project.
-                if self.turn.is_some() || self.project.is_none() {
+                // Only once there's a project.
+                if self.project.is_none() {
                     return;
                 }
-                // The chips still in the prompt are the files to send; the
-                // agent reads each chip as its file's name.
+                // The chips still in the prompt are the files to send.
                 let files: Vec<Attachment> =
                     std::mem::take(&mut self.attachments).into_iter().filter(|a| input.contains(&a.label)).collect();
-                let mut message = input.clone();
-                for file in &files {
-                    message = message.replace(&file.label, &file.name());
+                // One turn at a time: the rest wait their turn, in order.
+                if !self.idle() || !self.queued.is_empty() {
+                    self.queued.push(Queued { input: input.clone(), attachments: files });
+                } else {
+                    self.send_prompt(input.clone(), files);
                 }
-                if !self.shell_context.is_empty() {
-                    message = format!("{}\n\n{}", std::mem::take(&mut self.shell_context).join("\n\n"), message);
-                }
-                let making = self.making(&input);
-                self.fix_round = 0;
-                self.edit_round = 0;
-                self.command_round = 0;
-                self.last_failure = None;
-                self.send_turn(input.clone(), message, files, making);
             }
         }
         // Never keep a pasted token in the history.
@@ -3744,6 +3594,44 @@ impl App {
         self.history_at = None;
         self.input.clear();
         self.cursor = 0;
+    }
+
+    /// Send a prompt typed in the chat as a new turn.
+    fn send_prompt(&mut self, input: String, files: Vec<Attachment>) {
+        // The agent reads each chip as its file's name.
+        let mut message = input.clone();
+        for file in &files {
+            message = message.replace(&file.label, &file.name());
+        }
+        if !self.shell_context.is_empty() {
+            message = format!("{}\n\n{}", std::mem::take(&mut self.shell_context).join("\n\n"), message);
+        }
+        let making = self.making(&input);
+        self.fix_round = 0;
+        self.edit_round = 0;
+        self.command_round = 0;
+        self.last_failure = None;
+        self.send_turn(input, message, files, making);
+    }
+
+    /// Nothing between the last prompt and the next: no reply streaming,
+    /// no question about its files or commands open, no check or command
+    /// of its running (fix rounds start from those).
+    fn idle(&self) -> bool {
+        self.turn.is_none()
+            && self.ask.is_none()
+            && self.commands.is_none()
+            && self.check.is_none()
+            && !self.entries.iter().any(|e| matches!(e, Entry::Shell(s) if !s.background && s.ended.is_none()))
+    }
+
+    /// Send the next queued prompt once the one before it is all done.
+    fn send_queued(&mut self) {
+        if self.queued.is_empty() || self.project.is_none() || !self.idle() {
+            return;
+        }
+        let next = self.queued.remove(0);
+        self.send_prompt(next.input, next.attachments);
     }
 
     /// Sign in with `token`, then refresh the models panel: models behind a
@@ -3796,13 +3684,15 @@ impl App {
                     return true;
                 };
                 let row = row.clone();
-                if !row.accessible {
-                    self.entries.push(Entry::Error(format!(
-                        "{} needs a sign-in; /login first",
-                        row.name
-                    )));
-                } else if row.enabled {
+                if row.enabled {
+                    // Always allowed, even for a model the plan no longer covers.
                     self.disable_model(row.name);
+                } else if !row.accessible {
+                    self.entries.push(Entry::Error(if self.search.is_some() {
+                        format!("{} needs the pro plan; /upgrade to use it", row.name)
+                    } else {
+                        format!("{} needs a sign-in; /login first", row.name)
+                    }));
                 } else {
                     self.enable_model(row.name);
                 }
@@ -3894,11 +3784,13 @@ impl App {
         };
         // A blank row at the top, and one between the conversation and the
         // status line, so neither sits cramped against its neighbor.
-        let [_, body, _, status_area, input, footer] = Layout::vertical([
+        let queued = self.queued_lines(frame.area().width as usize);
+        let [_, body, _, status_area, queued_area, input, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(1),
             Constraint::Length(status.len().max(1) as u16),
+            Constraint::Length(queued.len() as u16),
             Constraint::Length(self.input_rows(frame.area().width) + 2),
             Constraint::Length(under),
         ])
@@ -3906,6 +3798,7 @@ impl App {
 
         self.draw_conversation(frame, body);
         frame.render_widget(Paragraph::new(status), status_area);
+        frame.render_widget(Paragraph::new(queued), queued_area);
         self.draw_input(frame, input);
         match &self.overlay {
             Overlay::None if hints.is_empty() => self.draw_footer(frame, footer),
@@ -3930,6 +3823,34 @@ impl App {
         }
         // After the footer, whose actions it keeps.
         self.keep_shown(frame, body, footer);
+    }
+
+    /// The queued prompts, one row each over the prompt: the first line,
+    /// cut to the width, the last few only when there are many.
+    fn queued_lines(&self, width: usize) -> Vec<Line<'static>> {
+        const SHOWN: usize = 4;
+        let mut lines = Vec::new();
+        let hidden = self.queued.len().saturating_sub(SHOWN);
+        if hidden > 0 {
+            lines.push(Line::from(Span::styled(format!("  … {} more queued", hidden), dim())));
+        }
+        for q in &self.queued[hidden..] {
+            let first = q.input.lines().next().unwrap_or_default();
+            let room = width.saturating_sub(13);
+            let text: String = if first.chars().count() > room {
+                format!("{}…", first.chars().take(room.saturating_sub(1)).collect::<String>())
+            } else {
+                first.to_string()
+            };
+            // Tagged apart, so it doesn't read as part of the prompt below.
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("[queued]", Style::new().fg(Color::Yellow)),
+                Span::raw(" "),
+                Span::styled(text, dim()),
+            ]));
+        }
+        lines
     }
 
     /// Rows an open panel needs under the prompt, border included.
@@ -4212,7 +4133,6 @@ impl App {
             Entry::Reply(reply) => reply_lines(reply, width, lines),
             Entry::Shell(shell) => shell_lines(shell, self.spinner(), SHELL_SHOWN, lines),
             Entry::Ask(commands) => ask_lines(commands, lines),
-            Entry::AskWrite(changed) => ask_write_lines(changed, lines),
             Entry::Notice(text) => {
                 lines.push(Line::from(vec![Span::styled("■ ", Style::new().fg(Color::Green)), Span::raw(text.clone())]))
             }
@@ -4503,8 +4423,6 @@ impl App {
         } else if self.input.starts_with('!') {
             // Shell mode, said as Claude Code says it, in the rules' color.
             hints.push(Span::styled("! for shell mode", Style::new().fg(pink())));
-        } else if self.write_ask.is_some() && self.input.is_empty() && self.turn.is_none() {
-            hints.extend(key_hints(&[("enter", "write"), ("tab", "always this session"), ("esc", "keep the files")]));
         } else if self.ask.is_some() && self.input.is_empty() && self.turn.is_none() {
             hints.extend(key_hints(&[("enter", "run"), ("tab", "always this session"), ("esc", "skip")]));
         } else if self.input.trim() == "/project import" {
@@ -4519,7 +4437,8 @@ impl App {
             hints.extend(notice);
         } else {
             // The rest live under help, as in Claude Code.
-            let mut keys = vec![("enter", "send"), ("esc", "interrupt")];
+            let esc = if self.turn.is_some() && !self.queued.is_empty() { "unqueue" } else { "interrupt" };
+            let mut keys = vec![("enter", if self.turn.is_some() { "queue" } else { "send" }), ("esc", esc)];
             if self.always_run {
                 keys.push(("tab", "auto-approve on"));
             }
@@ -4618,7 +4537,7 @@ impl App {
                     }
                     Some(_) => Span::styled(format!("downloading {}", self.spinner()), Style::new().fg(pink())),
                     None if m.enabled => Span::styled("✓ enabled", Style::new().fg(Color::Green)),
-                    None if m.cloud => Span::styled("disabled", dim()),
+                    None if m.cloud || !m.accessible => Span::styled("disabled", dim()),
                     None if m.downloaded => Span::styled("downloaded", dim()),
                     None => Span::styled("not downloaded", dim()),
                 };
@@ -4633,7 +4552,9 @@ impl App {
                     spans.push(Span::styled("  · recommended", Style::new().fg(Color::Green)));
                 }
                 if !m.accessible {
-                    spans.push(Span::styled("  · sign in to use", Style::new().fg(Color::Yellow)));
+                    // Signed in but still locked: the plan, not the sign-in, is what's missing.
+                    let why = if self.search.is_some() { "  · pro plan" } else { "  · sign in to use" };
+                    spans.push(Span::styled(why, Style::new().fg(Color::Yellow)));
                 }
                 Line::from(spans)
             })
@@ -4873,15 +4794,25 @@ fn adopted(folder: &str, taken: &[(String, String)], has_folder: impl Fn(&str) -
 /// What of an entry its height depends on: a reply's text as last laid
 /// out, with its warnings, citations and end; a shell entry's output
 /// having come. The rest never change.
-fn entry_version(entry: &Entry) -> usize {
+///
+/// Heights are kept by the entry's place in the list, and entries come
+/// out of it (an answered question, a finished run): what's in a place
+/// changes, so the version tells entries apart by kind and content, not
+/// only by how far they've come.
+fn entry_version(entry: &Entry) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::mem::discriminant(entry).hash(&mut h);
     match entry {
         Entry::Reply(reply) => {
             let laid_out = reply.rendered.borrow().as_ref().map_or(0, |(len, ..)| *len);
-            laid_out * 8 + reply.warnings.len() + reply.citations.len() * 2 + usize::from(reply.stats.is_some() || reply.ended.is_some()) * 4 + 1
+            (laid_out, reply.text.len(), reply.warnings.len(), reply.citations.len(), reply.stats.is_some(), reply.ended.is_some()).hash(&mut h);
         }
-        Entry::Shell(shell) => shell.output.len() * 2 + usize::from(shell.ended.is_some()) + 1,
-        _ => 1,
+        Entry::Shell(shell) => (shell.id, shell.output.len(), shell.ended.is_some()).hash(&mut h),
+        Entry::Ask(commands) => commands.hash(&mut h),
+        Entry::User(text) | Entry::Notice(text) | Entry::Warning(text) | Entry::Error(text) => text.hash(&mut h),
     }
+    h.finish()
 }
 
 /// The capabilities a `/models <name> caps` list names: `auto` for none
@@ -4898,8 +4829,8 @@ fn capability_list(list: &str) -> Result<Vec<String>, String> {
 }
 
 /// The kind of code project at `root`, as in "Rust", when prompts there are
-/// answered with code: by its mark when it has one (`/code`, or set when it
-/// was linked), else by its files.
+/// answered with code: by its mark when it has one (set when it was
+/// linked), else by its files.
 fn code_kind(root: &std::path::Path) -> Option<&'static str> {
     match docent::kind(root) {
         Some(docent::Kind::Code) => Some(files::project_kind(root).unwrap_or("code")),
@@ -5450,20 +5381,6 @@ fn ask_lines(commands: &[String], lines: &mut Vec<Line<'static>>) {
     }
 }
 
-fn ask_write_lines(changed: &[(String, usize, usize)], lines: &mut Vec<Line<'static>>) {
-    lines.push(Line::from(vec![
-        Span::styled("? ", Style::new().fg(Color::Yellow).bold()),
-        Span::styled("Write these changes over the files there?", Style::new().bold()),
-    ]));
-    for (path, added, removed) in changed {
-        lines.push(Line::from(vec![
-            Span::styled("  ", dim()),
-            Span::styled(path.clone(), key_style()),
-            Span::styled(format!("  +{} −{}", added, removed), dim()),
-        ]));
-    }
-}
-
 fn error_line(text: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled("■ ", Style::new().fg(Color::Red)),
@@ -5592,6 +5509,12 @@ fn home_tip() -> Option<String> {
     ))
 }
 
+/// A prompt waiting for the turn before it, with the files its chips name.
+struct Queued {
+    input: String,
+    attachments: Vec<Attachment>,
+}
+
 /// A file dropped on the prompt.
 #[derive(Debug, Clone)]
 struct Attachment {
@@ -5663,7 +5586,7 @@ fn is_document(path: &std::path::Path) -> bool {
 
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
-const COMMANDS: [(&str, &str); 16] = [
+const COMMANDS: [(&str, &str); 14] = [
     ("/help", "shortcuts and commands"),
     ("/login", "sign in in the browser (--token to paste one)"),
     ("/logout", "log out"),
@@ -5672,8 +5595,6 @@ const COMMANDS: [(&str, &str); 16] = [
     ("/project", "switch, create, import and delete projects"),
     ("/status", "account, model, agent and versions"),
     ("/sync", "sync this folder's documents to the project"),
-    ("/code", "answer prompts here with code: on, off, or how it stands"),
-    ("/write", "write the last reply's files left unwritten"),
     ("/tasks", "the commands still running: pick one to see its output or stop it"),
     ("/stop", "stop the shell commands still running; /stop <word> those with word in them"),
     ("/usage", "credits used this month"),
@@ -5738,10 +5659,11 @@ fn help_lines() -> Vec<Line<'static>> {
         ("[?] /help", "these shortcuts"),
         ("[enter]", "send the prompt"),
         ("[shift+enter] [alt+enter]", "new line (also [ctrl+j])"),
-        ("[esc]", "interrupt the reply"),
+        ("[enter] while it replies", "queue the prompt: it goes once the reply and what follows are done"),
+        ("[esc]", "take back the last queued prompt, else interrupt the reply"),
         ("[esc] [esc]", "clear the prompt"),
         ("[enter] [tab] [esc]", "a reply's commands, asked about: run, always this session, skip"),
-        ("[tab]", "on an empty prompt: auto-approve on or off, so they run without asking"),
+        ("[tab]", "on an empty prompt: auto-approve on or off, so a reply's commands run without asking"),
         ("[↑] [↓]", "earlier prompts, past the prompt's first or last line"),
         ("wheel [pgup] [pgdn]", "scroll the conversation"),
         ("drag", "select and copy to the clipboard"),
@@ -5758,11 +5680,6 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/sync status", "what's synced, and what's waiting"),
         ("/sync --move", "sync this folder instead of the project's other one"),
         ("/sync stop", "stop syncing the project's folder"),
-        ("/code", "whether prompts here are answered with code"),
-        ("/code on", "mark this folder a code project"),
-        ("/code off", "mark this folder a documents project"),
-        ("/code auto", "read the folder's kind off its files again"),
-        ("/write [path]", "write the last reply's files left unwritten, or one of them"),
         ("/models <name> caps <list|auto>", "set a model's capabilities here, over the catalog's"),
         ("/status", "account, model, agent and versions"),
         ("/login", "sign in in the browser (--token to paste one)"),
@@ -6519,8 +6436,6 @@ mod tests {
         assert!(matches!(app.entries.last(), Some(Entry::Warning(w)) if w.starts_with("Still failing after 3 round(s)")));
         // A check that fails for good drops them, and says so.
         turn(&mut app, "`src/main.rs`\n```rust\nfn main() { 1 }\n```\n\n```sh\ngit push\n```\n");
-        // It changes a file that's there: asked first.
-        app.answer_write(true, false);
         let id = app.check.as_ref().unwrap().id;
         app.fix_round = 10;
         app.last_failure = Some("err".into());
@@ -6550,7 +6465,7 @@ mod tests {
     }
 
     #[test]
-    fn write_puts_down_a_file_the_guard_left() {
+    fn a_reply_shorter_than_an_unseen_file_is_not_written() {
         let dir = tempfile::tempdir().unwrap();
         let long: String = (1..=100).map(|i| format!("line {}\n", i)).collect();
         std::fs::write(dir.path().join("big.rs"), &long).unwrap();
@@ -6561,17 +6476,7 @@ mod tests {
         assert_eq!(written, ["b.rs"]);
         assert_eq!(std::fs::read_to_string(dir.path().join("big.rs")).unwrap(), long);
         let text = screen(&app, 120, 24);
-        assert!(text.contains("/write writes it anyway"), "{}", text);
-        app.input = "/write other.rs".into();
-        app.submit();
-        assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("there's big.rs")));
-        app.input = "/write big.rs".into();
-        app.submit();
-        assert_eq!(std::fs::read_to_string(dir.path().join("big.rs")).unwrap(), "fn short() {}\n");
-        assert!(app.kept.is_none());
-        app.input = "/write".into();
-        app.submit();
-        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n.starts_with("Nothing left unwritten")));
+        assert!(text.contains("Not written, as the reply holds less than the file"), "{}", text);
     }
 
     #[test]
@@ -6607,24 +6512,6 @@ mod tests {
         app.overlay = Overlay::Models { rows: Some(Ok(rows)), selected: 0 };
         let text = screen(&app, 100, 24);
         assert!(text.contains("general, coding · set here"), "{}", text);
-    }
-
-    #[test]
-    fn code_tells_how_prompts_here_are_answered() {
-        let mut app = app();
-        app.phase = Phase::Ready;
-        let last = |app: &App| match app.entries.last() {
-            Some(Entry::Error(e) | Entry::Notice(e)) => e.clone(),
-            _ => String::new(),
-        };
-        app.input = "/code".into();
-        app.submit();
-        // This repository: a Rust project, however it's marked.
-        assert!(last(&app).contains("project"), "{}", last(&app));
-        assert!(last(&app).contains("/code o"), "{}", last(&app));
-        app.input = "/code maybe".into();
-        app.submit();
-        assert_eq!(last(&app), "Unknown /code maybe; try /code on, off or auto");
     }
 
     #[test]
@@ -6689,7 +6576,8 @@ mod tests {
         let rows = |reply: &Reply| -> Vec<String> { reply.body(60).iter().map(|l| l.to_string().trim_end().to_string()).collect() };
         reply.text = "```edit a.txt\n<<<<<<< SEARCH\ntwo\n=======\n2".into();
         let shown = rows(&reply);
-        assert!(shown.contains(&"● a.txt · editing".to_string()), "{:?}", shown);
+        // Its SEARCH/REPLACE text is held back while it comes.
+        assert_eq!(shown, ["● a.txt · editing… 4 lines"]);
         reply.text.push_str("\n>>>>>>> REPLACE\n```\n");
         reply.rendered_at.set(None);
         let shown = rows(&reply);
@@ -6777,21 +6665,18 @@ mod tests {
         // A new file, as soon as its heredoc's done; and added to after.
         assert_eq!(read("new.txt").as_deref(), Some("hello\nmore\n"));
         chunk(&mut app, "```\n\n```edit a.txt\n<<<<<<< SEARCH\ntwo\n=======\n2\n>>>>>>> REPLACE\n```\n");
-        // A change to a file that's there waits to be asked about.
-        assert_eq!(read("a.txt").as_deref(), Some("one\ntwo\n"));
+        // A change to a file that's there is written as soon as it's done
+        // too, without asking.
+        assert_eq!(read("a.txt").as_deref(), Some("one\n2\n"));
         app.apply(AppEvent::TurnDone(Ok(TurnStats::default())));
-        assert!(matches!(app.entries.last(), Some(Entry::AskWrite(c)) if c.len() == 1 && c[0].0 == "a.txt"));
-        app.answer_write(true, false);
-        // Nothing made twice, the reply's own file not asked about, and
-        // each change reported once.
+        assert!(app.ask.is_none());
+        // Nothing made twice, and each change reported once.
         assert_eq!(read("new.txt").as_deref(), Some("hello\nmore\n"));
         assert_eq!(read("a.txt").as_deref(), Some("one\n2\n"));
         let notices: Vec<&String> = app.entries.iter().filter_map(|e| match e { Entry::Notice(n) => Some(n), _ => None }).collect();
         assert!(notices.iter().any(|n| n.as_str() == "  created new.txt (+2 −0)"), "{notices:?}");
         assert!(notices.iter().any(|n| n.as_str() == "  updated a.txt (+1 −1)"), "{notices:?}");
-        // Allowed for the session, a change to a file there is written as
-        // soon as it's done too, and made once.
-        app.always_run = true;
+        // And again, made once.
         start(&mut app);
         chunk(&mut app, "```sh\ncat >> log.txt <<'EOF'\nsecond\nEOF\n```\n");
         assert_eq!(read("log.txt").as_deref(), Some("first\nsecond\n"));
@@ -6825,40 +6710,26 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_asks_before_writing_over_files_there() {
+    fn a_replys_files_are_written_without_asking_and_only_its_commands_are_asked() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.rs"), "old\n").unwrap();
         let file = |path: &str, content: &str| files::File { path: path.into(), content: content.into() };
-        let found = || vec![file("main.rs", "new\n"), file("a.rs", "a\n")];
         let mut app = app();
         app.phase = Phase::Ready;
-        // Asked: nothing written yet, the change named.
-        app.reply_done(dir.path().into(), files::Extracted { files: found(), ..Default::default() }, Vec::new(), vec!["git add -A".into()]);
-        assert!(matches!(app.entries.last(), Some(Entry::AskWrite(c)) if c == &[("main.rs".to_string(), 1, 1)]));
-        assert!(!dir.path().join("a.rs").exists());
-        assert!(app.commands.is_none() && app.ask.is_none());
-        let text = screen(&app, 80, 24);
-        assert!(text.contains("Write these changes over the files there?"), "{}", text);
-        assert!(text.contains("keep the files"), "{}", text);
-        // Esc: the file there is kept, the new one written, the commands asked.
-        app.key_edit(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "old\n");
-        assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "a\n");
-        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "Not written: main.rs")));
-        assert!(!app.entries.iter().any(|e| matches!(e, Entry::AskWrite(_))));
-        assert!(app.ask.is_some());
-        app.ask = None;
-        // Enter writes it.
-        app.reply_done(dir.path().into(), files::Extracted { files: found(), ..Default::default() }, Vec::new(), Vec::new());
-        app.key_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.reply_done(
+            dir.path().into(),
+            files::Extracted { files: vec![file("main.rs", "new\n"), file("a.rs", "a\n")], ..Default::default() },
+            Vec::new(),
+            vec!["git add -A".into()],
+        );
         assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "new\n");
-        // Tab writes from now on without asking.
-        app.reply_done(dir.path().into(), files::Extracted { files: vec![file("main.rs", "newer\n")], ..Default::default() }, Vec::new(), Vec::new());
-        app.key_edit(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(app.always_run);
-        app.reply_done(dir.path().into(), files::Extracted { files: vec![file("main.rs", "newest\n")], ..Default::default() }, Vec::new(), Vec::new());
-        assert!(app.write_ask.is_none());
-        assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "newest\n");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "a\n");
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "  updated main.rs (+1 −1)")));
+        // Checked first in a code folder, then the commands are asked about.
+        if let Some(check) = app.check.as_ref().map(|c| c.id) {
+            app.apply(AppEvent::Check(check, String::new(), Ended::Exited(0)));
+        }
+        assert!(app.ask.is_some());
     }
 
     #[test]
@@ -7710,7 +7581,7 @@ mod tests {
         assert_eq!(names, ["/mcp", "/Meeting_Notes", "/models", "/morning"]);
         app.input = "/".into();
         let names: Vec<String> = app.command_hints().into_iter().map(|(name, _)| name).collect();
-        assert_eq!(names.last().map(String::as_str), Some("/write"));
+        assert_eq!(names.last().map(String::as_str), Some("/usage"));
         assert!(names.windows(2).all(|w| w[0].to_lowercase() <= w[1].to_lowercase()), "{:?}", names);
         assert!(!app.command_hints().iter().any(|(_, what)| what.contains("shadowed")));
         app.input = "/mor".into();
@@ -8107,6 +7978,90 @@ mod tests {
         assert!(rows[status].ends_with("(0s · 40 tokens)"), "{}", text);
         assert!(rows[status + 1].starts_with("────"), "{}", text);
         assert!(rows[status + 2].starts_with('>'), "{}", text);
-        assert!(rows[23].contains("[enter] send  [esc] interrupt  [?] shortcuts"), "{}", text);
+        assert!(rows[23].contains("[enter] queue  [esc] interrupt  [?] shortcuts"), "{}", text);
+    }
+
+    #[test]
+    fn answering_a_command_question_keeps_the_conversation_scrollable() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        for i in 0..30 {
+            app.entries.push(Entry::Notice(format!("line {i}")));
+        }
+        let commands: Vec<String> = (0..12).map(|i| format!("echo step {i}")).collect();
+        app.entries.push(Entry::Ask(commands.clone()));
+        app.ask = Some((std::path::PathBuf::from("."), commands));
+        screen(&app, 80, 24);
+        // Skipped: the question goes, a one-line notice takes its place.
+        app.answer_ask(false, false);
+        screen(&app, 80, 24);
+        let limit = app.scroll_limit.get();
+        // Measured afresh, the conversation is just as long.
+        app.heights.borrow_mut().clear();
+        screen(&app, 80, 24);
+        assert_eq!(app.scroll_limit.get(), limit);
+        // And scrolling up shows what's above.
+        app.scroll(i32::MAX / 2);
+        assert!(screen(&app, 80, 24).contains("line 0"));
+    }
+
+    #[test]
+    fn prompts_sent_during_a_turn_queue_and_esc_takes_the_last_back_first() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _inside = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "notes".into()));
+        app.input = "first".into();
+        app.submit();
+        assert!(app.turn.is_some());
+
+        // While it replies, the next prompts wait, shown over the prompt.
+        for prompt in ["second", "third"] {
+            app.input = prompt.into();
+            app.submit();
+        }
+        assert!(app.input.is_empty());
+        let queued: Vec<&str> = app.queued.iter().map(|q| q.input.as_str()).collect();
+        assert_eq!(queued, ["second", "third"]);
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("[queued] second") && text.contains("[queued] third"), "{}", text);
+        assert!(text.contains("[esc] unqueue"), "{}", text);
+
+        // Esc takes back the last one, then the next, and only then interrupts.
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.queued.len(), 1);
+        assert!(app.turn.is_some());
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.queued.is_empty() && app.turn.is_some());
+        app.input = "fourth".into();
+        app.submit();
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.turn.is_none());
+
+        // Once nothing runs, the next queued prompt goes as its own turn.
+        app.queued.push(Queued { input: "fifth".into(), attachments: Vec::new() });
+        app.send_queued();
+        assert!(app.queued.is_empty() && app.turn.is_some());
+        assert!(screen(&app, 80, 24).contains("> fifth"));
+    }
+
+    #[test]
+    fn a_queued_prompt_waits_for_the_question_about_the_reply() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _inside = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "notes".into()));
+        app.ask = Some((std::path::PathBuf::from("."), vec!["ls".into()]));
+        app.input = "next".into();
+        app.submit();
+        app.send_queued();
+        assert_eq!(app.queued.len(), 1);
+        assert!(app.turn.is_none());
+        app.ask = None;
+        app.send_queued();
+        assert!(app.queued.is_empty() && app.turn.is_some());
     }
 }
