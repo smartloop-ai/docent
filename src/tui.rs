@@ -1286,6 +1286,12 @@ struct App {
     /// Rounds the agent's been asked again for edits that didn't apply,
     /// since the user last asked something.
     edit_round: u32,
+    /// Whether the agent's been asked again for the files a reply only
+    /// described, in a folder still empty, since the user last asked.
+    files_asked: bool,
+    /// Whether the agent's been asked for the manifest its source needs,
+    /// such as `Cargo.toml`, since the user last asked.
+    manifest_asked: bool,
     /// The widest context window among the project's enabled models, in
     /// tokens, once the models are known: how much of the project a prompt
     /// may carry.
@@ -1382,6 +1388,8 @@ impl App {
             check: None,
             fix_round: 0,
             edit_round: 0,
+            files_asked: false,
+            manifest_asked: false,
             early: Vec::new(),
             window: None,
             enabled_models: None,
@@ -1704,12 +1712,17 @@ impl App {
     /// what the agent gets. Attached files are uploaded first. A turn that's
     /// `making` files works in the folder the chat was opened in, and the
     /// files its reply gives are written there.
-    fn send_turn(&mut self, shown: String, mut message: String, files: Vec<Attachment>, making: bool) {
+    fn send_turn(&mut self, shown: String, message: String, files: Vec<Attachment>, making: bool) {
         let Some((project, _)) = self.project.clone() else { return };
         let files_dir = if making { chat::making_dir(&project) } else { None };
         // Asked to make something, the reply comes as files to write; in a
         // code project, as code that fits the files already there.
         let mut whole = Vec::new();
+        // The machine, the folder and how to give files go as the system
+        // message, the request alone as the user's: the agent repeats the
+        // user's message in its prompt and reads what's around it as data,
+        // and a small model then describes files instead of giving them.
+        let mut system = None;
         if let Some(root) = &files_dir {
             let context = match code_kind(root) {
                 Some(kind) => {
@@ -1720,8 +1733,14 @@ impl App {
                 None if files::is_empty_folder(root) => format!("{}\n\n", files::EMPTY_FOLDER),
                 None => String::new(),
             };
-            // The machine first: a prompt cut to a model's window keeps its head.
-            message = format!("{}\n{}{}\n\n{}\n\n{}", files::system_context(), context, message, files::HINT, files::EDIT_EXAMPLE);
+            system = Some(format!(
+                "{}\n{}\n\n{}{}\n\n{}",
+                files::system_context(),
+                files::folder_note(root),
+                context,
+                files::HINT,
+                files::EDIT_EXAMPLE
+            ));
             // Its language server starts now, indexing while the reply comes,
             // to be ready for the files it gives.
             if !cfg!(test)
@@ -1769,7 +1788,7 @@ impl App {
                     Err(e) => return drop(tx.send(AppEvent::TurnDone(Err(format!("Upload failed: {}", e))))),
                 }
             }
-            let result = chat::stream_turn(&chat, &message, &ids, &project, cwd.as_deref(), &session, &mut on).await;
+            let result = chat::stream_turn(&chat, system.as_deref(), &message, &ids, &project, cwd.as_deref(), &session, &mut on).await;
             let _ = tx.send(AppEvent::TurnDone(result));
         });
         self.turn = Some(Turn {
@@ -2100,6 +2119,12 @@ impl App {
     /// checked, as a coding harness writes its edits, then the commands
     /// asked about.
     fn reply_done(&mut self, root: std::path::PathBuf, found: files::Extracted, mut whole: Vec<String>, commands: Vec<String>) {
+        // Asked to make something in an empty folder, a small model may say
+        // what it made without giving the files: asked once more for them.
+        if found.files.is_empty() && found.failed.is_empty() && !self.files_asked && files::is_empty_folder(&root) {
+            self.files_asked = true;
+            return self.ask_for_files();
+        }
         // An edited file is the file there with the edits made: all of it.
         whole.extend(found.edited);
         self.apply_reply(root, found.files, &whole, commands, found.failed);
@@ -2135,6 +2160,14 @@ impl App {
                 EDIT_ROUNDS
             )));
         }
+        // Source with no manifest won't build, nor can it be checked: the
+        // manifest is asked for first, and the check runs on its reply.
+        if !self.manifest_asked
+            && let Some((manifest, lang)) = files::missing_manifest(&root, &written)
+        {
+            self.manifest_asked = true;
+            return self.ask_for_manifest(manifest, lang, &written);
+        }
         if !written.is_empty() {
             self.run_check(&root, &written);
         } else if self.fix_round > 0 {
@@ -2143,6 +2176,36 @@ impl App {
         if self.check.is_none() {
             self.run_commands();
         }
+    }
+
+    /// Ask the agent for the `manifest` the `lang` files it `wrote` need.
+    fn ask_for_manifest(&mut self, manifest: &str, lang: &str, wrote: &[String]) {
+        self.entries.push(Entry::Notice(format!("No {manifest} came with that reply; asking the agent for it")));
+        let layout = if manifest == "Cargo.toml" {
+            " A program's code goes in `src/main.rs`: if you wrote it elsewhere, give it again whole at that path."
+        } else {
+            ""
+        };
+        let message = format!(
+            "You wrote {}, but the folder has no `{manifest}`, so the {lang} project can't build. Give `{manifest}` \
+             now, whole, in a fenced block marked `sh`: a line `cat > {manifest} <<'EOF'`, its complete contents with \
+             every dependency the code uses, then `EOF` alone on its line.{layout}",
+            wrote.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+        );
+        self.send_turn(format!("Add {manifest}"), message, Vec::new(), true);
+    }
+
+    /// Ask the agent for the files its last reply described but didn't give;
+    /// the folder is still empty.
+    fn ask_for_files(&mut self) {
+        self.entries.push(Entry::Notice("No files came with that reply; asking the agent for them".to_string()));
+        let message = format!(
+            "Your last reply gave no files, so nothing was written and the working folder is still empty. Give \
+             every file it needs now, each whole in a fenced block marked `sh`: a line `cat > path/to/file <<'EOF'`, \
+             the file's complete contents, then `EOF` alone on its line.\n\n{}",
+            files::EMPTY_FOLDER
+        );
+        self.send_turn("Write the files".to_string(), message, Vec::new(), true);
     }
 
     /// Ask the agent again for the edits that `failed` in `root`, with
@@ -3613,6 +3676,8 @@ impl App {
         let making = self.making(&input);
         self.fix_round = 0;
         self.edit_round = 0;
+        self.files_asked = false;
+        self.manifest_asked = false;
         self.command_round = 0;
         self.last_failure = None;
         self.send_turn(input, message, files, making);
@@ -6714,9 +6779,57 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_with_no_files_for_an_empty_folder_asks_for_them_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        let asked = |app: &App| {
+            app.entries.iter().filter(|e| matches!(e, Entry::Notice(n) if n.starts_with("No files came with that reply"))).count()
+        };
+        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), vec!["which cargo".into()]);
+        assert_eq!(asked(&app), 1);
+        // The reply's commands wait for the files rather than run alone.
+        assert!(app.commands.is_none() && app.ask.is_none());
+        // Still none: asked once only, and its commands go ahead.
+        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), vec!["which cargo".into()]);
+        assert_eq!(asked(&app), 1);
+        assert!(app.ask.is_some());
+    }
+
+    #[test]
+    fn rust_source_with_no_cargo_toml_asks_for_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |path: &str, content: &str| files::File { path: path.into(), content: content.into() };
+        let mut app = app();
+        app.phase = Phase::Ready;
+        let asked = |app: &App| {
+            app.entries.iter().filter(|e| matches!(e, Entry::Notice(n) if n.starts_with("No Cargo.toml came"))).count()
+        };
+        let main = files::Extracted { files: vec![file("main.rs", "fn main() {}\n")], ..Default::default() };
+        app.reply_done(dir.path().into(), main, Vec::new(), Vec::new());
+        assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "fn main() {}\n");
+        assert_eq!(asked(&app), 1);
+        // Asked once: a second reply without it isn't asked about again.
+        let again = files::Extracted { files: vec![file("src/main.rs", "fn main() {}\n")], ..Default::default() };
+        app.reply_done(dir.path().into(), again, Vec::new(), Vec::new());
+        assert_eq!(asked(&app), 1);
+    }
+
+    #[test]
+    fn a_reply_with_no_files_for_a_folder_with_files_asks_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "hi").unwrap();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), Vec::new());
+        assert!(!app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n.starts_with("No files came"))));
+    }
+
+    #[test]
     fn a_replys_files_are_written_without_asking_and_only_its_commands_are_asked() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.rs"), "old\n").unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
         let file = |path: &str, content: &str| files::File { path: path.into(), content: content.into() };
         let mut app = app();
         app.phase = Phase::Ready;
