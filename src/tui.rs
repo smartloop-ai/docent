@@ -1711,11 +1711,15 @@ impl App {
         // code project, as code that fits the files already there.
         let mut whole = Vec::new();
         if let Some(root) = &files_dir {
-            let context = code_kind(root).map_or_else(String::new, |kind| {
-                let c = files::project_context(root, kind, &message, files::budget_for(self.window));
-                whole = c.whole;
-                format!("{}\n\n", c.text)
-            });
+            let context = match code_kind(root) {
+                Some(kind) => {
+                    let c = files::project_context(root, kind, &message, files::budget_for(self.window));
+                    whole = c.whole;
+                    format!("{}\n\n", c.text)
+                }
+                None if files::is_empty_folder(root) => format!("{}\n\n", files::EMPTY_FOLDER),
+                None => String::new(),
+            };
             // The machine first: a prompt cut to a model's window keeps its head.
             message = format!("{}\n{}{}\n\n{}\n\n{}", files::system_context(), context, message, files::HINT, files::EDIT_EXAMPLE);
             // Its language server starts now, indexing while the reply comes,

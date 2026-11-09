@@ -18,10 +18,11 @@ use std::path::{Component, Path, PathBuf};
 /// Told to the agent with a prompt that asks for something to be made.
 pub const HINT: &str = "If your answer creates or changes files, start with a short summary of what you \
 changed and why. To change a file that's there, don't give it whole: give an edit block, a fenced block \
-marked `edit` with the file's path, as ```` ```edit src/main.rs ````, holding one or more changes, each as a \
+marked `edit` with the file's path, as ```` ```edit path/to/file ````, holding one or more changes, each as a \
 line `<<<<<<< SEARCH`, the lines to change copied exactly from the file, a line `=======`, the lines to put in \
 their place, then a line `>>>>>>> REPLACE`; never leave out any of those three lines, and never split one change over two \
-blocks. Each SEARCH must be found in the file once: give a few unchanged \
+blocks. Give an edit block only for a file I've shown you or you've already written; any other file is new, \
+so write it whole. Each SEARCH must be found in the file once: give a few unchanged \
 lines around a change when a line alone could be found twice, and keep it short otherwise. A new file you write \
 whole with a shell heredoc in a fenced block marked `sh`: a line `cat > path/to/file <<'EOF'`, with the path \
 relative to the working folder, then the file's complete contents, then `EOF` alone on its line. When a file's \
@@ -418,6 +419,19 @@ const MAKING: [&str; 14] = [
 /// Names without an extension that are still files a project keeps.
 const BARE_NAMES: [&str; 8] =
     ["Makefile", "Dockerfile", "Justfile", "Procfile", "Gemfile", "Rakefile", "LICENSE", "Containerfile"];
+
+/// Told to the agent when the folder it works in has no files yet, so it
+/// doesn't take an edit block's example path for a file that's there.
+pub const EMPTY_FOLDER: &str = "The working folder is empty: there are no files to change, so write every file \
+whole as a heredoc, with no edit blocks.";
+
+/// Whether `root` has no files of its own: nothing but hidden entries,
+/// such as docent's `.docent/`.
+pub fn is_empty_folder(root: &Path) -> bool {
+    fs::read_dir(root).map_or(false, |entries| {
+        entries.flatten().all(|e| e.file_name().to_string_lossy().starts_with('.'))
+    })
+}
 
 /// Whether `message` asks for something to be made, so the reply should
 /// come as files.
@@ -1655,6 +1669,18 @@ mod tests {
         // Near its size, it's taken as the whole file.
         let most = long.lines().skip(5).map(|l| format!("{}\n", l)).collect::<String>();
         assert_eq!(plan(dir.path(), vec![file(&most)], &[]).changed.len(), 1);
+    }
+
+    #[test]
+    fn a_folder_with_only_hidden_entries_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(is_empty_folder(dir.path()));
+        fs::create_dir_all(dir.path().join(".docent")).unwrap();
+        fs::write(dir.path().join(".docentignore"), "").unwrap();
+        assert!(is_empty_folder(dir.path()));
+        fs::write(dir.path().join("notes.md"), "hi").unwrap();
+        assert!(!is_empty_folder(dir.path()));
+        assert!(!is_empty_folder(&dir.path().join("missing")));
     }
 
     #[test]
