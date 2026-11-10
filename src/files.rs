@@ -17,16 +17,12 @@ use std::path::{Component, Path, PathBuf};
 
 /// Told to the agent with a prompt that asks for something to be made.
 pub const HINT: &str = "If your answer creates or changes files, start with a line or two on what the \
-files below do and why, then give every one of them: a file you only describe isn't written. To change a file that's there, don't give it whole: give an edit block, a fenced block \
-marked `edit` with the file's path, as ```` ```edit path/to/file ````, holding one or more changes, each as a \
-line `<<<<<<< SEARCH`, the lines to change copied exactly from the file, a line `=======`, the lines to put in \
-their place, then a line `>>>>>>> REPLACE`; never leave out any of those three lines, and never split one change over two \
-blocks. Give an edit block only for a file I've shown you or you've already written; any other file is new, \
-so write it whole. Each SEARCH must be found in the file once: give a few unchanged \
-lines around a change when a line alone could be found twice, and keep it short otherwise. A new file you write \
-whole with a shell heredoc in a fenced block marked `sh`: a line `cat > path/to/file <<'EOF'`, with the path \
-relative to the working folder, then the file's complete contents, then `EOF` alone on its line. When a file's \
-contents hold a line of three backticks, open and close its block with four. Include every file the change \
+files below do and why, then give every one of them: a file you only describe isn't written. Give each \
+file whole with a shell heredoc in a fenced block marked `sh`: a line `cat > path/to/file <<'EOF'`, with the path \
+relative to the working folder, then the file's complete contents, then `EOF` alone on its line. Do so to change \
+a file that's there too: give it again whole, every line of it, changed or not, never a comment such as \
+`// ... rest unchanged` in place of lines, or it isn't written. When a file's contents hold a line of three \
+backticks, open and close its block with four. Include every file the change \
 needs, such as the manifest when the code uses a new dependency. I'm shown each change as a diff and the files \
 are written for me from those blocks, so don't tell me to create or edit them by hand. Asked to make \
 or save a skill, write it the same way, to `.docent/skills/<name>/SKILL.md`: frontmatter with its `name` and a \
@@ -40,9 +36,9 @@ a remote that isn't set, ask me for instead. A command that keeps running until 
 server or a watcher, you give with `&` at its end, as `npm run dev &`, in a block of its own: it's started in \
 the background, and what comes after doesn't wait for it.";
 
-/// An edit block as it's to be written, shown to the agent with `HINT`
-/// and again when its edits are asked for over.
-pub const EDIT_EXAMPLE: &str = "For example, to change one line of `src/app.js`:\n\n```edit src/app.js\n<<<<<<< SEARCH\nconst speed = 2;\n=======\nconst speed = 3;\n>>>>>>> REPLACE\n```";
+/// A change to a file as it's to be written, the file given again whole,
+/// shown to the agent with `HINT` and again when a change is asked for over.
+pub const EDIT_EXAMPLE: &str = "For example, to change one line of `src/app.js`, give all of it again:\n\n```sh\ncat > src/app.js <<'EOF'\nconst speed = 3;\n\nfunction tick(x) {\n  return x + speed;\n}\nEOF\n```";
 
 /// Files at a folder's top that say it's a code project, and its kind.
 const MARKERS: [(&str, &str); 14] = [
@@ -522,6 +518,20 @@ pub struct Block {
 pub struct Edit {
     pub search: String,
     pub replace: String,
+    /// Other ways to split the pair, as (search, replace), when it has more
+    /// than one `=======` line, as a markdown heading underlined with one
+    /// gives it: the first whose search is in the file is made.
+    pub splits: Vec<(String, String)>,
+}
+
+impl Edit {
+    /// The edit of the lines `pair`, split at each of `dividers` in turn:
+    /// the first is the edit, the rest are tried after it.
+    fn split(pair: &[&str], dividers: &[usize]) -> Edit {
+        let at = |d: usize| (pair[..d].join("\n"), pair[d + 1..].join("\n"));
+        let (search, replace) = at(dividers[0]);
+        Edit { search, replace, splits: dividers[1..].iter().map(|&d| at(d)).collect() }
+    }
 }
 
 /// What a reply gives: its files, whole, with its edits made; the paths
@@ -599,10 +609,10 @@ fn is_replace(line: &str) -> bool {
     t.starts_with(">>>>>>>") && t.trim_start_matches('>').trim() == "REPLACE"
 }
 
-/// A line between an edit's search and its replacement: `=======`.
+/// A line between an edit's search and its replacement: `=======`, seven
+/// and no more, so a markdown heading's longer underline isn't taken for it.
 fn is_divider(line: &str) -> bool {
-    let t = line.trim();
-    t.len() >= 7 && t.chars().all(|c| c == '=')
+    line.trim() == "======="
 }
 
 /// An edit given bare, its SEARCH/REPLACE pairs outside any fence, as
@@ -627,7 +637,7 @@ pub(crate) fn bare_edit(lines: &[&str], k: usize) -> Option<(usize, bool)> {
 }
 
 /// The pairs of an edit block's `body` given with no SEARCH lines: each
-/// runs to a REPLACE line or the body's end and has one `=======`. None
+/// runs to a REPLACE line or the body's end and has an `=======`. None
 /// when one hasn't.
 fn markerless_edits(body: &[&str]) -> Vec<Edit> {
     let mut out = Vec::new();
@@ -639,10 +649,13 @@ fn markerless_edits(body: &[&str]) -> Vec<Edit> {
         if chunk.iter().all(|l| l.trim().is_empty()) {
             continue;
         }
+        let lead = chunk.iter().take_while(|l| l.trim().is_empty()).count();
+        let chunk = &chunk[lead..];
         let dividers: Vec<usize> = (0..chunk.len()).filter(|&k| is_divider(chunk[k])).collect();
-        let [d] = dividers.as_slice() else { return Vec::new() };
-        let lead = chunk.iter().take_while(|l| l.trim().is_empty()).count().min(*d);
-        out.push(Edit { search: chunk[lead..*d].join("\n"), replace: chunk[d + 1..].join("\n") });
+        if dividers.is_empty() {
+            return Vec::new();
+        }
+        out.push(Edit::split(chunk, &dividers));
     }
     out
 }
@@ -657,9 +670,12 @@ pub fn edits(body: &[&str]) -> Vec<Edit> {
             k += 1;
             continue;
         }
-        let Some(divider) = (k + 1..body.len()).find(|&j| is_divider(body[j])) else { break };
-        let Some(end) = (divider + 1..body.len()).find(|&j| is_replace(body[j])) else { break };
-        out.push(Edit { search: body[k + 1..divider].join("\n"), replace: body[divider + 1..end].join("\n") });
+        let Some(end) = (k + 1..body.len()).find(|&j| is_replace(body[j])) else { break };
+        let pair = &body[k + 1..end];
+        let dividers: Vec<usize> = (0..pair.len()).filter(|&j| is_divider(pair[j])).collect();
+        if !dividers.is_empty() {
+            out.push(Edit::split(pair, &dividers));
+        }
         k = end + 1;
     }
     out
@@ -685,7 +701,25 @@ pub fn apply_edits(old: Option<&str>, edits: &[Edit]) -> Result<String, String> 
         if edit.search.trim().is_empty() {
             return Err(format!("{which} has an empty SEARCH, and the file is there"));
         }
-        text = replace_once(&text, edit).map_err(|why| format!("{which}: {why}"))?;
+        // Split more than one way, the split made is the one with the
+        // most search text found in the file; if none is, why the first
+        // couldn't be made.
+        let first = replace_once(&text, edit);
+        let best = edit
+            .splits
+            .iter()
+            .filter(|(search, _)| !search.trim().is_empty())
+            .filter_map(|(search, replace)| {
+                let other = Edit { search: search.clone(), replace: replace.clone(), splits: Vec::new() };
+                replace_once(&text, &other).ok().map(|t| (search.len(), t))
+            })
+            .chain(first.clone().ok().map(|t| (edit.search.len(), t)))
+            .max_by_key(|(len, _)| *len);
+        // The first split made, it's among them: none found, it failed.
+        text = match best {
+            Some((_, t)) => t,
+            None => return Err(format!("{which}: {}", first.unwrap_err())),
+        };
     }
     Ok(text)
 }
@@ -1034,8 +1068,23 @@ fn heredoc_target(line: &str) -> Option<(String, bool)> {
 pub(crate) fn close_of(lines: &[&str], open: usize, fence: &str, info: &str) -> Option<usize> {
     let shell = heredoc_lang(info);
     let mut doc: Option<String> = None;
+    // Inside a SEARCH/REPLACE pair: a fence there is the edited file's,
+    // as a README's code block is, so long as a REPLACE line is to come.
+    let mut pair = false;
     for i in open + 1..lines.len() {
         let line = lines[i];
+        if pair {
+            if is_replace(line) {
+                pair = false;
+            } else if closes(line, fence) && !lines[i + 1..].iter().any(|l| is_replace(l)) {
+                return Some(i);
+            }
+            continue;
+        }
+        if is_search(line) {
+            pair = true;
+            continue;
+        }
         if let Some(word) = &doc {
             if ends_heredoc(line, word) {
                 doc = None;
@@ -1167,6 +1216,29 @@ impl std::fmt::Display for Diff {
         Ok(())
     }
 }
+
+/// Words that, in a comment of a file a reply gives with `...` in it, say
+/// lines were left out: `// ... rest of the file unchanged`.
+const LEFT_OUT: &[&str] =
+    &["rest", "unchanged", "existing", "same as", "remain", "previous", "omitted", "as before", "other", "more", "etc"];
+
+/// Whether a reply's `new` contents of a file leave lines out, a comment
+/// such as `// ... rest unchanged` standing in for them, where the `old`
+/// file there has no such line: so not a file to write over it.
+pub fn elides(old: &str, new: &str) -> bool {
+    let had: std::collections::HashSet<&str> = old.lines().map(str::trim).collect();
+    new.lines().map(str::trim).filter(|l| !had.contains(l)).any(|line| {
+        let Some(said) = ["//", "#", "/*", "<!--", "--", ";", "*", "{/*"].iter().find_map(|c| line.strip_prefix(c)) else {
+            return false;
+        };
+        let said = said.to_lowercase();
+        (said.contains("...") || said.contains('…')) && LEFT_OUT.iter().any(|w| said.contains(w))
+    })
+}
+
+/// Why a file `elides` lines, as told to the agent when it's asked for
+/// the file again.
+pub const ELIDED: &str = "it leaves lines out, a comment standing in for them, so it wasn't written over the file";
 
 /// Whether a reply's `new` contents of a file hold less than the `old`
 /// file there: not all of it, so not a file to write over it.
@@ -1454,6 +1526,9 @@ pub struct Plan {
     /// There, and not shown to the agent whole: a reply shorter than the
     /// file can't be all of it, so it's left as it is.
     pub kept: Vec<File>,
+    /// There, and a comment in the reply stands in for lines of it: see
+    /// `elides`. Left as it is.
+    pub elided: Vec<File>,
 }
 
 /// Sort `files` against what's under `root`, `whole` being the files the
@@ -1466,6 +1541,7 @@ pub fn plan(root: &Path, files: Vec<File>, whole: &[String]) -> Plan {
             None => plan.refused.push(file.path),
             Some(path) => match fs::read_to_string(&path) {
                 Ok(text) if text == file.content => {}
+                Ok(text) if elides(&text, &file.content) => plan.elided.push(file),
                 Ok(text) if !whole.contains(&file.path) && partial(&text, &file.content) => plan.kept.push(file),
                 Ok(_) => plan.changed.push(file),
                 Err(_) if path.exists() => plan.changed.push(file),
@@ -1961,8 +2037,47 @@ mod tests {
         assert!(!blocks[0].closed);
     }
 
+    #[test]
+    fn a_fence_inside_an_edit_is_the_files() {
+        let readme = "# App\n\n```sh\nnpm start\n```\n";
+        let reply = "```edit README.md\n<<<<<<< SEARCH\n```sh\nnpm start\n```\n=======\n```sh\nnpm run dev\n```\n>>>>>>> REPLACE\n```\n\nDone.\n";
+        let got = extract_with(reply, |_| Some(readme.to_string()));
+        assert!(got.failed.is_empty(), "{:?}", got.failed);
+        assert_eq!(got.files[0].content, "# App\n\n```sh\nnpm run dev\n```\n");
+        assert!(blocks(reply)[0].closed);
+        assert!(commands(reply).is_empty());
+        // Its REPLACE line not come, the fence still closes the block.
+        let cut = "```edit README.md\n<<<<<<< SEARCH\n```sh\nnpm start\n```\nmore prose";
+        assert!(blocks(cut)[0].closed);
+    }
+
+    #[test]
+    fn an_edit_block_opened_with_four_backticks_holds_three() {
+        let readme = "# App\n\n```sh\nnpm start\n```\n";
+        let reply = "````edit README.md\n<<<<<<< SEARCH\n```sh\nnpm start\n```\n=======\n```sh\nnpm run dev\n```\n>>>>>>> REPLACE\n````\n";
+        let got = extract_with(reply, |_| Some(readme.to_string()));
+        assert!(got.failed.is_empty(), "{:?}", got.failed);
+        assert_eq!(got.files[0].content, "# App\n\n```sh\nnpm run dev\n```\n");
+    }
+
+    #[test]
+    fn a_heading_underline_in_an_edit_isnt_its_divider() {
+        // Underlined with seven: the split whose search is in the file.
+        let readme = "Docent\n=======\n\nOld intro.\n";
+        let reply = "```edit README.md\n<<<<<<< SEARCH\nDocent\n=======\n\nOld intro.\n=======\nDocent\n=======\n\nNew intro.\n>>>>>>> REPLACE\n```\n";
+        let got = extract_with(reply, |_| Some(readme.to_string()));
+        assert!(got.failed.is_empty(), "{:?}", got.failed);
+        assert_eq!(got.files[0].content, "Docent\n=======\n\nNew intro.\n");
+        // Underlined with more than seven: never a divider.
+        let readme = "Smartloop\n=========\n\nOld.\n";
+        let reply = "```edit README.md\n<<<<<<< SEARCH\nSmartloop\n=========\n\nOld.\n=======\nSmartloop\n=========\n\nNew.\n>>>>>>> REPLACE\n```\n";
+        let got = extract_with(reply, |_| Some(readme.to_string()));
+        assert!(got.failed.is_empty(), "{:?}", got.failed);
+        assert_eq!(got.files[0].content, "Smartloop\n=========\n\nNew.\n");
+    }
+
     fn edit(search: &str, replace: &str) -> Edit {
-        Edit { search: search.into(), replace: replace.into() }
+        Edit { search: search.into(), replace: replace.into(), splits: Vec::new() }
     }
 
     #[test]
@@ -1991,12 +2106,48 @@ mod tests {
         std::fs::create_dir(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/main.js"), "a();\nold();\nb();\n").unwrap();
         assert_eq!(extract_in(dir.path(), reply).files[0].content, "a();\nnew();\nb();\n");
-        // No divider, or more than one: no edit, and nothing written.
-        for body in ["new();", "a\n=======\nb\n=======\nc"] {
+        // No divider, or none splitting it into lines that are in the file:
+        // no edit, and nothing written.
+        for body in ["new();", "p\n=======\nq\n=======\nr"] {
             let found = extract_in(dir.path(), &format!("```edit src/main.js\n{body}\n```\n"));
             assert!(found.files.is_empty(), "{body}");
             assert_eq!(found.failed.len(), 1, "{body}");
         }
+    }
+
+    #[test]
+    fn a_comment_standing_in_for_lines_is_found() {
+        let old = "fn a() {}\nfn b() {}\nfn c() {}\n";
+        for new in [
+            "fn a() { 1 }\n// ... rest unchanged\n",
+            "fn a() { 1 }\n    // ... existing code ...\n",
+            "fn a() { 1 }\n/* … other functions as before */\n",
+            "def a(): pass\n# ... rest of the file\n",
+            "<p>hi</p>\n<!-- ... same as before -->\n",
+        ] {
+            assert!(elides(old, new), "{new}");
+        }
+        // Lines that aren't such a comment, or that the file had already.
+        for new in [
+            "fn a() { 1 }\nfn b() {}\nfn c() {}\n",
+            "def stub(): ...\n",
+            "// Loading...\nfn a() {}\n",
+            "// see the rest of the docs\nfn a() {}\n",
+        ] {
+            assert!(!elides(old, new), "{new}");
+        }
+        let had = "x\n// ... rest unchanged\n";
+        assert!(!elides(had, "y\n// ... rest unchanged\n"));
+    }
+
+    #[test]
+    fn a_file_leaving_lines_out_isnt_planned_to_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        let file = File { path: "a.rs".into(), content: "fn a() { 1 }\n// ... rest unchanged\nfn b() {}\n".into() };
+        let sorted = plan(dir.path(), vec![file.clone()], &["a.rs".to_string()]);
+        assert_eq!(sorted.elided, [file]);
+        assert!(sorted.changed.is_empty());
     }
 
     #[test]
