@@ -1374,7 +1374,15 @@ fn label_path(line: &str) -> Option<String> {
         .iter()
         .find_map(|label| text.strip_prefix(label))
         .unwrap_or(text);
-    as_path(text.trim_matches(|c: char| matches!(c, '*' | '_' | '`' | ':' | '(' | ')') || c.is_whitespace()))
+    let text = text.trim_matches(|c: char| matches!(c, '*' | '_' | '`' | ':' | '(' | ')') || c.is_whitespace());
+    as_path(text).or_else(|| described_path(text))
+}
+
+/// A path ahead of a note on it, as small models write one: `Cargo.toml -
+/// Edit block`, `src/main.rs (updated)`.
+fn described_path(text: &str) -> Option<String> {
+    let (path, _) = [" - ", " — ", " – ", " ("].iter().filter_map(|sep| text.split_once(sep)).min_by_key(|(p, _)| p.len())?;
+    as_path(path.trim().trim_matches(|c: char| matches!(c, '*' | '_' | '`' | ':')))
 }
 
 /// The path in a "File: src/main.rs" line.
@@ -1393,8 +1401,8 @@ fn comment_path(line: &str) -> Option<String> {
         .or_else(|| text.strip_prefix("<!--").and_then(|t| t.strip_suffix("-->")))
         .or_else(|| text.strip_prefix("/*").and_then(|t| t.strip_suffix("*/")))?;
     let inner = inner.trim();
-    let inner = ["File:", "file:", "Filename:"].iter().find_map(|l| inner.strip_prefix(l)).unwrap_or(inner);
-    as_path(inner.trim())
+    let inner = ["File:", "file:", "Filename:"].iter().find_map(|l| inner.strip_prefix(l)).unwrap_or(inner).trim();
+    as_path(inner).or_else(|| described_path(inner))
 }
 
 /// `text` when it reads as a relative file path: one word of path
@@ -2023,6 +2031,17 @@ mod tests {
         assert!(!super::blocks(open)[0].closed);
         // With no file named, it isn't one.
         assert!(super::blocks("<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n").is_empty());
+    }
+
+    #[test]
+    fn a_path_may_come_with_a_note_on_it() {
+        let reply = "Here are the changes:\n\n```\n# Cargo.toml - Edit block\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```\n\n\
+                     ### src/main.rs (updated)\n\n```rust\n<<<<<<< SEARCH\nc\n=======\nd\n>>>>>>> REPLACE\n```\n";
+        let blocks = blocks(reply);
+        let paths: Vec<&str> = blocks.iter().map(|b| b.file.path.as_str()).collect();
+        assert_eq!(paths, ["Cargo.toml", "src/main.rs"]);
+        assert_eq!(blocks[0].edit.as_deref(), Some(&[edit("a", "b")][..]));
+        assert_eq!(super::label_path("see the docs - e.g. here"), None);
     }
 
     #[test]
