@@ -12,6 +12,7 @@
 //! isn't made a hyperlink.
 
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
@@ -76,10 +77,74 @@ fn id_of(color: Color) -> Option<u32> {
     }
 }
 
-/// Whether a link to `url` is one to open: the web or mail, not a page
-/// anchor or a relative path.
+/// Whether a link to `url` is one to open: the web, mail or a file, not a
+/// page anchor or a relative path.
 pub fn opens(url: &str) -> bool {
-    url.starts_with("https://") || url.starts_with("http://") || url.starts_with("mailto:")
+    url.starts_with("https://") || url.starts_with("http://") || url.starts_with("mailto:") || url.starts_with("file://")
+}
+
+/// What a link to `address` opens, if anything: the web or mail as is, and
+/// a file on this machine, named by a `file://` URL, an absolute path or one
+/// from home, as a `file://` URL. A file that isn't there opens nothing.
+pub fn target(address: &str) -> Option<String> {
+    if address.starts_with("file://") {
+        return file_path(address).is_some_and(|p| p.is_file()).then(|| address.to_string());
+    }
+    if opens(address) {
+        return Some(address.to_string());
+    }
+    let path = match address.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?).join(rest),
+        None if Path::new(address).is_absolute() => PathBuf::from(address),
+        None => return None,
+    };
+    path.is_file().then(|| file_url(&path))
+}
+
+/// The `file://` URL of the absolute `path`, escaped so a terminal or the
+/// OS opener reads spaces and non-ASCII names right.
+pub fn file_url(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    let mut url = String::from("file://");
+    if !path.starts_with('/') {
+        url.push('/');
+    }
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => url.push(byte as char),
+            _ => url.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    url
+}
+
+/// The file a `file://` URL names.
+pub fn file_path(url: &str) -> Option<PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let bytes = rest.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = (bytes[i] == b'%').then(|| rest.get(i + 1..i + 3)).flatten();
+        match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+            Some(byte) => {
+                decoded.push(byte);
+                i += 3;
+            }
+            None => {
+                decoded.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    let path = String::from_utf8(decoded).ok()?;
+    // `/C:/Users/...` on Windows names `C:/Users/...`.
+    let path = match path.as_bytes() {
+        [b'/', _, b':', ..] if cfg!(windows) => path[1..].to_string(),
+        _ => path,
+    };
+    Some(PathBuf::from(path))
 }
 
 /// `text` in `style`, with each bare web address in it made a link.
@@ -175,7 +240,7 @@ pub fn mark_links(markdown: &str) -> (String, Vec<String>) {
             Event::End(TagEnd::Link) => {
                 let Some(OpenLink { range, url, label: Some(label), text }) = link.take() else { continue };
                 skip.push(range.clone());
-                let id = opens(&url).then(|| number(&mut urls, &url));
+                let id = target(&url).map(|to| number(&mut urls, &to));
                 let text = text.trim();
                 let edit = if text == url || text == url.trim_start_matches("mailto:") {
                     marked(LABEL, id, &escape(text))
@@ -455,6 +520,37 @@ mod tests {
         assert_eq!(linkify("", Style::new()).len(), 1);
         let wiki = linkify("(https://en.wikipedia.org/wiki/Rust_(language))", Style::new());
         assert_eq!(wiki[1].content, "https://en.wikipedia.org/wiki/Rust_(language)");
+    }
+
+    #[test]
+    fn file_urls_escape_and_come_back() {
+        let path = Path::new("/Users/me/My Docs/résumé (v2).pdf");
+        let url = file_url(path);
+        assert_eq!(url, "file:///Users/me/My%20Docs/r%C3%A9sum%C3%A9%20%28v2%29.pdf");
+        assert_eq!(file_path(&url).as_deref(), Some(path));
+        assert_eq!(file_path("file://localhost/tmp/a%20b").as_deref(), Some(Path::new("/tmp/a b")));
+        assert_eq!(file_path("https://example.com"), None);
+        assert!(opens(&url));
+    }
+
+    #[test]
+    fn files_open_only_when_they_are_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("report.md");
+        std::fs::write(&file, "done").unwrap();
+        let path = file.to_str().unwrap();
+
+        assert_eq!(target(path), Some(file_url(&file)));
+        assert_eq!(target(&file_url(&file)), Some(file_url(&file)));
+        assert_eq!(target("https://example.com/a").as_deref(), Some("https://example.com/a"));
+        assert_eq!(target(dir.path().join("gone.md").to_str().unwrap()), None);
+        assert_eq!(target("notes.md"), None);
+        assert_eq!(target("#top"), None);
+        // A directory is not a document to open.
+        assert_eq!(target(dir.path().to_str().unwrap()), None);
+
+        let (_, urls) = mark_links(&format!("Saved [report.md]({}) and [gone]({}/gone.md).", path, dir.path().display()));
+        assert_eq!(urls, [file_url(&file)]);
     }
 
     #[test]

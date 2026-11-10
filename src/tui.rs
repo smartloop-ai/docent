@@ -1261,6 +1261,8 @@ struct App {
     copied: Option<(usize, Instant)>,
     /// The link last clicked, flashed in the footer as it opens.
     opened: Option<(String, Instant)>,
+    /// A file last clicked that's gone since its link was made.
+    missing: Option<(String, Instant)>,
     /// Kept for the app's life: on X11 the clipboard empties when its owner
     /// goes away.
     clipboard: Option<arboard::Clipboard>,
@@ -1386,6 +1388,7 @@ impl App {
             pressed: None,
             copied: None,
             opened: None,
+            missing: None,
             clipboard: None,
             ticks: 0,
             token_entry: false,
@@ -2896,8 +2899,15 @@ impl App {
         }
     }
 
-    /// Open a clicked link in the browser.
+    /// Open a clicked link in the browser, or a file in its app, when it's
+    /// still there.
     fn open(&mut self, url: String) {
+        if let Some(path) = crate::links::file_path(&url).filter(|p| !p.is_file()) {
+            self.opened = None;
+            self.missing = Some((path.display().to_string(), Instant::now()));
+            return;
+        }
+        self.missing = None;
         if !cfg!(test) {
             crate::open_browser(&url);
         }
@@ -4498,8 +4508,12 @@ impl App {
             hints.push(Span::styled("✓ ", Style::new().fg(Color::Green)));
             hints.push(Span::styled(format!("Copied {} characters", chars), dim()));
         } else if let Some((url, _)) = opened {
+            let shown = crate::links::file_path(url).map_or_else(|| url.clone(), |p| p.display().to_string());
             hints.push(Span::styled("↗ ", Style::new().fg(Color::Green)));
-            hints.push(Span::styled(format!("Opening {}", url), dim()));
+            hints.push(Span::styled(format!("Opening {}", shown), dim()));
+        } else if let Some((path, _)) = self.missing.as_ref().filter(|(_, at)| recent(at)) {
+            hints.push(Span::styled("✗ ", Style::new().fg(Color::Yellow)));
+            hints.push(Span::styled(format!("File no longer exists: {}", path), dim()));
         } else if self.scroll_back > 0 {
             hints.push(Span::styled(format!("↓ {} lines below  ", self.scroll_back), dim()));
             hints.extend(key_hints(&[("pgdn", "scroll down"), ("end", "latest")]));
