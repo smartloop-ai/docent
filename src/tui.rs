@@ -699,6 +699,17 @@ impl Reply {
             _ => content.to_string(),
         };
         match old.as_deref() {
+            // A comment standing in for lines of the file: not written, see
+            // `apply_reply`, and shown as it is, not as lines taken out.
+            Some(old) if !streaming && files::elides(old, &new) => {
+                let mut part = vec![Line::from(vec![
+                    Span::styled("← ", dim()),
+                    Span::styled(path.to_string(), Style::new().bold()),
+                    Span::styled(" · leaves lines out, so not written over the file", dim()),
+                ])];
+                part.extend(code_lines(code, width));
+                part
+            }
             // Holding less than the file, it isn't all of it: shown as it
             // is, since as a change the rest of the file would read as
             // taken out; and not written, see `reply_files`.
@@ -2091,8 +2102,8 @@ impl App {
                     None => format!("I ran `{}` in the project after your change; it failed", check.command),
                 };
                 let message = format!(
-                    "{what}:\n```\n{}\n```\nFix these errors in the project's files, as before: an edit block for \
-                     a file that's there, a heredoc for a new one.",
+                    "{what}:\n```\n{}\n```\nFix these errors in the project's files, as before: each file you \
+                     change given again whole, every line of it, as a heredoc.",
                     head(&output, SHELL_KEPT)
                 );
                 self.send_turn(shown, message, Vec::new(), true);
@@ -2139,8 +2150,14 @@ impl App {
         found: Vec<files::File>,
         whole: &[String],
         commands: Vec<String>,
-        failed: Vec<(String, String)>,
+        mut failed: Vec<(String, String)>,
     ) {
+        // A file with a comment standing in for lines of it isn't written:
+        // it's asked for again whole, as an edit that couldn't be made is.
+        let (found, elided): (Vec<files::File>, Vec<files::File>) = found.into_iter().partition(|f| {
+            std::fs::read_to_string(root.join(&f.path)).map_or(true, |old| !files::elides(&old, &f.content))
+        });
+        failed.extend(elided.into_iter().map(|f| (f.path, files::ELIDED.to_string())));
         let written = self.reply_files(&root, found, whole);
         // The reply's commands run once its files are in and checked: a
         // fix round's reply has none of its own, so the first reply's wait.
@@ -2223,10 +2240,9 @@ impl App {
             .collect();
         self.entries.push(Entry::Notice(format!("Asking the agent for those edits again (try {} of {})", self.edit_round, EDIT_ROUNDS)));
         let message = format!(
-            "These edits from your last reply couldn't be made, so those files weren't changed:\n{}\n\n{}\n\nGive \
-             just those edits again, as edit blocks whose SEARCH text is copied exactly from the file as it is now \
-             and is found in it once, each with its `<<<<<<< SEARCH`, `=======` and `>>>>>>> REPLACE` lines. Don't \
-             repeat the changes that were made.\n\n{}",
+            "These changes from your last reply couldn't be made, so those files weren't changed:\n{}\n\n{}\n\nGive \
+             just those files again, each whole as a heredoc: every line of it as it is to be, changed or not, with \
+             no comment standing in for lines. Don't repeat the files that were written.\n\n{}",
             reasons.join("\n"),
             files.join("\n\n"),
             files::EDIT_EXAMPLE
@@ -6635,6 +6651,39 @@ mod tests {
         turn(&mut app, reply);
         assert!(app.turn.is_none());
         assert!(app.entries.iter().any(|e| matches!(e, Entry::Warning(w) if w.starts_with("The edits still don't apply"))));
+    }
+
+    #[test]
+    fn a_file_given_with_lines_left_out_is_asked_for_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = "fn a() {}\nfn b() {}\nfn c() {}\n";
+        std::fs::write(dir.path().join("a.rs"), old).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        app.always_run = true;
+        let reply = "```sh\ncat > a.rs <<'EOF'\nfn a() { 1 }\n// ... rest unchanged\nfn c() {}\nEOF\n```\n\n\
+                     ```sh\ncat > b.rs <<'EOF'\nfn b() {}\nEOF\n```\n";
+        app.entries.push(Entry::Reply(Reply { text: reply.into(), ..Default::default() }));
+        app.turn = Some(Turn {
+            started: Instant::now(),
+            task: runtime.spawn(async {}),
+            entry: app.entries.len() - 1,
+            tokens: 0,
+            activity: None,
+            files_dir: Some(dir.path().to_path_buf()),
+            whole: Vec::new(),
+        });
+        app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+        // The whole file is written; the one with a comment for lines isn't.
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), old);
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.rs")).unwrap(), "fn b() {}\n");
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Warning(w) if w.starts_with("Not changed, a.rs: it leaves lines out"))));
+        assert_eq!(app.edit_round, 1);
+        assert!(app.turn.is_some(), "the file was asked for again");
+        app.stop_turn();
     }
 
     #[test]

@@ -17,17 +17,12 @@ use std::path::{Component, Path, PathBuf};
 
 /// Told to the agent with a prompt that asks for something to be made.
 pub const HINT: &str = "If your answer creates or changes files, start with a line or two on what the \
-files below do and why, then give every one of them: a file you only describe isn't written. To change a file that's there, don't give it whole: give an edit block, a fenced block \
-marked `edit` with the file's path, as ```` ```edit path/to/file ````, holding one or more changes, each as a \
-line `<<<<<<< SEARCH`, the lines to change copied exactly from the file, a line `=======`, the lines to put in \
-their place, then a line `>>>>>>> REPLACE`; never leave out any of those three lines, and never split one change over two \
-blocks. Give an edit block only for a file I've shown you or you've already written; any other file is new, \
-so write it whole. Each SEARCH must be found in the file once: give a few unchanged \
-lines around a change when a line alone could be found twice, and keep it short otherwise. A new file you write \
-whole with a shell heredoc in a fenced block marked `sh`: a line `cat > path/to/file <<'EOF'`, with the path \
-relative to the working folder, then the file's complete contents, then `EOF` alone on its line. When the \
-lines you give of a file hold a line of three backticks, as a README's code example does, open and close the edit \
-block or heredoc block that gives them with four backticks, as ````` ````edit README.md `````. Include every file the change \
+files below do and why, then give every one of them: a file you only describe isn't written. Give each \
+file whole with a shell heredoc in a fenced block marked `sh`: a line `cat > path/to/file <<'EOF'`, with the path \
+relative to the working folder, then the file's complete contents, then `EOF` alone on its line. Do so to change \
+a file that's there too: give it again whole, every line of it, changed or not, never a comment such as \
+`// ... rest unchanged` in place of lines, or it isn't written. When a file's contents hold a line of three \
+backticks, open and close its block with four. Include every file the change \
 needs, such as the manifest when the code uses a new dependency. I'm shown each change as a diff and the files \
 are written for me from those blocks, so don't tell me to create or edit them by hand. Asked to make \
 or save a skill, write it the same way, to `.docent/skills/<name>/SKILL.md`: frontmatter with its `name` and a \
@@ -41,9 +36,9 @@ a remote that isn't set, ask me for instead. A command that keeps running until 
 server or a watcher, you give with `&` at its end, as `npm run dev &`, in a block of its own: it's started in \
 the background, and what comes after doesn't wait for it.";
 
-/// An edit block as it's to be written, shown to the agent with `HINT`
-/// and again when its edits are asked for over.
-pub const EDIT_EXAMPLE: &str = "For example, to change one line of `src/app.js`:\n\n```edit src/app.js\n<<<<<<< SEARCH\nconst speed = 2;\n=======\nconst speed = 3;\n>>>>>>> REPLACE\n```";
+/// A change to a file as it's to be written, the file given again whole,
+/// shown to the agent with `HINT` and again when a change is asked for over.
+pub const EDIT_EXAMPLE: &str = "For example, to change one line of `src/app.js`, give all of it again:\n\n```sh\ncat > src/app.js <<'EOF'\nconst speed = 3;\n\nfunction tick(x) {\n  return x + speed;\n}\nEOF\n```";
 
 /// Files at a folder's top that say it's a code project, and its kind.
 const MARKERS: [(&str, &str); 14] = [
@@ -1222,6 +1217,29 @@ impl std::fmt::Display for Diff {
     }
 }
 
+/// Words that, in a comment of a file a reply gives with `...` in it, say
+/// lines were left out: `// ... rest of the file unchanged`.
+const LEFT_OUT: &[&str] =
+    &["rest", "unchanged", "existing", "same as", "remain", "previous", "omitted", "as before", "other", "more", "etc"];
+
+/// Whether a reply's `new` contents of a file leave lines out, a comment
+/// such as `// ... rest unchanged` standing in for them, where the `old`
+/// file there has no such line: so not a file to write over it.
+pub fn elides(old: &str, new: &str) -> bool {
+    let had: std::collections::HashSet<&str> = old.lines().map(str::trim).collect();
+    new.lines().map(str::trim).filter(|l| !had.contains(l)).any(|line| {
+        let Some(said) = ["//", "#", "/*", "<!--", "--", ";", "*", "{/*"].iter().find_map(|c| line.strip_prefix(c)) else {
+            return false;
+        };
+        let said = said.to_lowercase();
+        (said.contains("...") || said.contains('…')) && LEFT_OUT.iter().any(|w| said.contains(w))
+    })
+}
+
+/// Why a file `elides` lines, as told to the agent when it's asked for
+/// the file again.
+pub const ELIDED: &str = "it leaves lines out, a comment standing in for them, so it wasn't written over the file";
+
 /// Whether a reply's `new` contents of a file hold less than the `old`
 /// file there: not all of it, so not a file to write over it.
 pub fn partial(old: &str, new: &str) -> bool {
@@ -1508,6 +1526,9 @@ pub struct Plan {
     /// There, and not shown to the agent whole: a reply shorter than the
     /// file can't be all of it, so it's left as it is.
     pub kept: Vec<File>,
+    /// There, and a comment in the reply stands in for lines of it: see
+    /// `elides`. Left as it is.
+    pub elided: Vec<File>,
 }
 
 /// Sort `files` against what's under `root`, `whole` being the files the
@@ -1520,6 +1541,7 @@ pub fn plan(root: &Path, files: Vec<File>, whole: &[String]) -> Plan {
             None => plan.refused.push(file.path),
             Some(path) => match fs::read_to_string(&path) {
                 Ok(text) if text == file.content => {}
+                Ok(text) if elides(&text, &file.content) => plan.elided.push(file),
                 Ok(text) if !whole.contains(&file.path) && partial(&text, &file.content) => plan.kept.push(file),
                 Ok(_) => plan.changed.push(file),
                 Err(_) if path.exists() => plan.changed.push(file),
@@ -2091,6 +2113,41 @@ mod tests {
             assert!(found.files.is_empty(), "{body}");
             assert_eq!(found.failed.len(), 1, "{body}");
         }
+    }
+
+    #[test]
+    fn a_comment_standing_in_for_lines_is_found() {
+        let old = "fn a() {}\nfn b() {}\nfn c() {}\n";
+        for new in [
+            "fn a() { 1 }\n// ... rest unchanged\n",
+            "fn a() { 1 }\n    // ... existing code ...\n",
+            "fn a() { 1 }\n/* … other functions as before */\n",
+            "def a(): pass\n# ... rest of the file\n",
+            "<p>hi</p>\n<!-- ... same as before -->\n",
+        ] {
+            assert!(elides(old, new), "{new}");
+        }
+        // Lines that aren't such a comment, or that the file had already.
+        for new in [
+            "fn a() { 1 }\nfn b() {}\nfn c() {}\n",
+            "def stub(): ...\n",
+            "// Loading...\nfn a() {}\n",
+            "// see the rest of the docs\nfn a() {}\n",
+        ] {
+            assert!(!elides(old, new), "{new}");
+        }
+        let had = "x\n// ... rest unchanged\n";
+        assert!(!elides(had, "y\n// ... rest unchanged\n"));
+    }
+
+    #[test]
+    fn a_file_leaving_lines_out_isnt_planned_to_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        let file = File { path: "a.rs".into(), content: "fn a() { 1 }\n// ... rest unchanged\nfn b() {}\n".into() };
+        let sorted = plan(dir.path(), vec![file.clone()], &["a.rs".to_string()]);
+        assert_eq!(sorted.elided, [file]);
+        assert!(sorted.changed.is_empty());
     }
 
     #[test]
