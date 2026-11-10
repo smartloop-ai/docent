@@ -911,6 +911,16 @@ fn bind(root: &Path, project: &str) -> Result<(), String> {
     folders.save()
 }
 
+/// The file under `root` that went to the project as `remote`: its path
+/// relative to `root`, and where it is. None when nothing synced went by
+/// that name, or the file's gone since.
+pub fn synced_file(root: &Path, remote: &str) -> Option<(String, PathBuf)> {
+    let manifest = Manifest::load(root).ok()?;
+    let (key, _) = manifest.documents.iter().find(|(_, entry)| entry.remote == remote)?;
+    let path = root.join(key);
+    path.is_file().then(|| (key.clone(), path))
+}
+
 /// Sync `root` to `project` from now on; one it synced elsewhere before
 /// starts its map afresh, and the folder `project` synced from before stops.
 pub fn link(root: &Path, project: &str) -> Result<(), String> {
@@ -1172,6 +1182,24 @@ mod tests {
         // The nearest one wins.
         fs::create_dir(nested.join(DIR)).unwrap();
         assert_eq!(root(&nested), nested);
+    }
+
+    #[test]
+    fn finds_a_synced_file_by_its_remote_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("notes/plan.md"), "plan").unwrap();
+        let mut manifest = Manifest::default();
+        let synced = Entry { remote: remote_name("notes/plan.md"), ..entry("h") };
+        manifest.documents.insert("notes/plan.md".into(), synced);
+        manifest.save(root).unwrap();
+
+        assert_eq!(synced_file(root, "notes__plan.md"), Some(("notes/plan.md".into(), root.join("notes/plan.md"))));
+        assert_eq!(synced_file(root, "plan.md"), None);
+        // Deleted since its sync: nothing to open.
+        fs::remove_file(root.join("notes/plan.md")).unwrap();
+        assert_eq!(synced_file(root, "notes__plan.md"), None);
     }
 
     #[test]
