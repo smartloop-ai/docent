@@ -4938,10 +4938,12 @@ impl App {
     /// The project's models as a list, like Claude Code's model picker:
     /// the selected one marked, each with its state and what it can do.
     fn draw_models(&self, frame: &mut Frame, area: Rect, rows: &Option<Result<Vec<ModelRow>, String>>, selected: usize) {
-        let block = panel(&models_footer(match rows {
+        let chosen = match rows {
             Some(Ok(list)) => list.get(selected),
             _ => None,
-        }));
+        };
+        let downloading = chosen.is_some_and(|m| self.downloads.iter().any(|d| d.model == m.name && !d.finished));
+        let block = panel(&models_footer(chosen, downloading));
         frame.render_widget(Clear, area);
         let list = match rows {
             None => return frame.render_widget(Paragraph::new(format!(" Loading models {}", self.spinner())).block(block), area),
@@ -6163,21 +6165,28 @@ fn key_hints(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
 }
 
 /// Key hints for a panel's bottom border, padded off its corner.
-/// The model list's footer: where the selected model runs, and the keys
-/// that apply to it.  Enter turns a model on or off, downloading a local
-/// one it needs; for a model served both ways and not downloaded, Enter
-/// turns on the cloud copy (paid, and said so) and ctrl+d downloads the
-/// local one.
-fn models_footer(selected: Option<&ModelRow>) -> Vec<Span<'static>> {
+/// The model list's footer: where the selected model runs (💻 local, ☁
+/// cloud, both for a model served both ways), and the keys that apply to
+/// it.  Enter turns a model on or off, downloading a local one it needs; for
+/// a model served both ways and not downloaded, Enter turns on the cloud
+/// copy (paid, and said so) and ctrl+d downloads the local one.  While the
+/// selected model downloads, only refresh and close apply.
+fn models_footer(selected: Option<&ModelRow>, downloading: bool) -> Vec<Span<'static>> {
     // No ↑↓ hint: the row the arrows move is plain, and the room goes to
     // where the model runs and what Enter does to it.
     let mut keys: Vec<(&str, &str)> = Vec::new();
     let mut spans = vec![Span::raw(" ")];
     match selected {
         Some(m) => {
-            let place = if m.cloud_option { "local · cloud" } else if m.cloud { "cloud" } else { "local" };
-            spans.push(Span::styled(place, Style::new().fg(if m.cloud { Color::Blue } else { Color::Green })));
+            let place = if m.cloud_option { "💻 ☁" } else if m.cloud { "☁" } else { "💻" };
+            spans.push(Span::raw(place));
             spans.push(Span::raw("  "));
+            if downloading {
+                keys.extend([("ctrl+r", "refresh"), ("esc", "close")]);
+                spans.extend(key_hints(&keys));
+                spans.push(Span::raw(" "));
+                return spans;
+            }
             let enter = if m.enabled {
                 "disable"
             } else if m.cloud_option && !m.downloaded {
@@ -8096,18 +8105,22 @@ mod tests {
         assert!(text.contains("› qwen3.5-2b   ✓ enabled"), "{}", text);
         assert!(text.contains("  sonnet ☁     disabled"), "{}", text);
         // The footer says where the selected model runs, and its keys.
-        assert!(text.contains("local  [enter] disable  [ctrl+r] refresh"), "{}", text);
+        assert!(text.contains("💻") && text.contains("[enter] disable  [ctrl+r] refresh"), "{}", text);
         let select = |app: &mut App, i| {
             if let Overlay::Models { selected, .. } = &mut app.overlay {
                 *selected = i;
             }
         };
         select(&mut app, 2);
-        assert!(screen(&app, 100, 24).contains("cloud  [enter] enable  [ctrl+r]"), "a cloud model only turns on");
+        let text = screen(&app, 100, 24);
+        assert!(text.contains("☁") && text.contains("[enter] enable  [ctrl+r]"), "a cloud model only turns on: {}", text);
         select(&mut app, 3);
         let text = screen(&app, 100, 24);
-        assert!(text.contains("local · cloud"), "{}", text);
-        assert!(text.contains("local · cloud  [enter] use cloud (paid)  [ctrl+d] download"), "{}", text);
+        assert!(text.contains("💻") && text.contains("[enter] use cloud (paid)  [ctrl+d] download"), "{}", text);
+        // While it downloads, only refresh and close apply.
+        app.downloads.push(Download { model: "qwen3.8-27b".into(), list: StepList::new(), finished: false });
+        let text = screen(&app, 100, 24);
+        assert!(!text.contains("[ctrl+d]") && !text.contains("use cloud") && text.contains("[ctrl+r] refresh"), "{}", text);
         assert!(!text.contains("Capabilities") && !text.contains("Models"), "{}", text);
     }
 
