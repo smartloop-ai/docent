@@ -8,6 +8,7 @@ use reqwest::blocking::{Client, Response, multipart};
 use progress::Steps;
 
 mod agent;
+mod askpass;
 mod chat;
 mod docent;
 mod files;
@@ -502,6 +503,23 @@ pub fn patch_project_model(client: &Client, project_id: &str, name: &str, enable
     Ok(())
 }
 
+/// Stop the download of `name` the agent is running, as the studio app's
+/// stop button does: the agent signals the transfer, which discards its
+/// bytes, and the `/v1/init` stream ends with a `cancelled` event. False
+/// when there was nothing to stop, as when it finished just before.
+pub fn cancel_download(client: &Client, name: &str) -> Result<bool, String> {
+    let action = "cancel the download";
+    let response = client
+        .delete(format!("{}/downloads/{}", api_url(), name))
+        .send()
+        .map_err(|e| format!("Failed to {}: {}", action, e))?;
+    if !response.status().is_success() {
+        return Err(error_message(action, response));
+    }
+    let reply: serde_json::Value = response.json().map_err(|e| format!("Failed to {}: {}", action, e))?;
+    Ok(reply["cancelled"].as_bool().unwrap_or_default())
+}
+
 /// Make `project_id` the agent's current project, as the studio app does on
 /// picking one: `/v1/models/load` records the selection (which a client
 /// that names no project gets, and which the next launch opens in) and loads
@@ -877,6 +895,10 @@ pub fn try_delete_project(client: &Client, id: &str) -> Result<(), String> {
 fn main() {
     // The agent and its workers run from this same binary.
     let argv: Vec<String> = std::env::args().collect();
+    // `sudo` in a command asks for its password through the TUI.
+    if argv.get(1).map(String::as_str) == Some(askpass::SUBCOMMAND) {
+        exit(askpass::helper(argv.get(2).map(String::as_str)));
+    }
     if let Some(code) = agent::dispatch(&argv) {
         exit(code);
     }

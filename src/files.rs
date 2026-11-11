@@ -423,10 +423,15 @@ fn cut(text: &str, limit: usize) -> &str {
     &text[..end]
 }
 
-/// Words that ask for something to be made, as the prompt's first concern.
-const MAKING: [&str; 14] = [
+/// Words that ask for something to be made or done in the folder, as the
+/// prompt's first concern. A turn of one works in the folder, where the
+/// reply's commands run: without them, "install terraform" outside a code
+/// project was a chat turn, and the agent wrote out the steps for the user
+/// to run instead of giving them to be run.
+const MAKING: [&str; 23] = [
     "create", "generate", "scaffold", "build", "make", "write", "add", "implement", "bootstrap", "init",
-    "setup", "update", "fix", "save",
+    "setup", "update", "fix", "save", "install", "uninstall", "reinstall", "run", "deploy", "configure",
+    "upgrade", "commit", "push",
 ];
 
 /// Names without an extension that are still files a project keeps.
@@ -2094,6 +2099,10 @@ mod tests {
         assert!(wants_files("Generate a rust project"));
         assert!(wants_files("set up a vite app"));
         assert!(!wants_files("what does the contract say about renewals?"));
+        // Work in the folder that isn't a file is done by its commands.
+        assert!(wants_files("install terraform"));
+        assert!(wants_files("Run ./box.sh up"));
+        assert!(wants_files("deploy it"));
     }
 
     #[test]

@@ -593,6 +593,12 @@ pub fn stream_progress(
         let Some(data) = line.strip_prefix("data:") else { continue };
         let Ok(data) = serde_json::from_str::<serde_json::Value>(data.trim()) else { continue };
 
+        // A download cancelled (`DELETE /v1/downloads/{model}`) ends the
+        // work: what came after it, such as enabling the model, isn't done.
+        if event == "cancelled" || data["status"] == "cancelled" {
+            let message = data["message"].as_str().unwrap_or("Download cancelled").to_string();
+            list.fail(current, message);
+        }
         if event == "error" || data["status"] == "error" {
             let message = data["message"].as_str().unwrap_or("unknown error").to_string();
             list.fail(current, message);
@@ -999,6 +1005,82 @@ mod tests {
         // Served without a version: never this build's.
         assert_eq!(served_cli_version(&args(&["docent", SERVE_SUBCOMMAND])), Some(""));
         assert_eq!(served_cli_version(&args(&["slp", "agent", "start"])), None);
+    }
+
+    /// Steps that remember what happened, a failure ending the work as a
+    /// panic the test catches.
+    #[derive(Default)]
+    struct Recorded {
+        count: usize,
+        done: Vec<usize>,
+        failed: Option<(usize, String)>,
+    }
+
+    impl Steps for Recorded {
+        fn add(&mut self, _: &str) -> usize {
+            self.count += 1;
+            self.count - 1
+        }
+        fn add_name(&mut self, _: usize, _: &str) {}
+        fn set_detail(&mut self, _: usize, _: &str) {}
+        fn start(&mut self, _: usize) {}
+        fn note(&mut self, _: usize, _: &str) {}
+        fn progress(&mut self, _: usize, _: u64, _: u64) {}
+        fn warn(&mut self, _: &str) {}
+        fn done(&mut self, step: usize) {
+            self.done.push(step);
+        }
+        fn fail(&mut self, step: usize, message: String) -> ! {
+            self.failed = Some((step, message));
+            std::panic::resume_unwind(Box::new("failed"));
+        }
+        fn len(&self) -> usize {
+            self.count
+        }
+    }
+
+    /// A download cancelled mid-way ends with the agent's `cancelled`
+    /// event: the step fails with its message, so what follows it (enabling
+    /// the model) isn't done.
+    #[test]
+    fn a_cancelled_download_ends_the_work() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut stream = listener.incoming().next().unwrap().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap();
+                }
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            std::io::Read::read_exact(&mut reader, &mut vec![0; length]).unwrap();
+            let body = "data: {\"status\": \"downloading\", \"message\": \"Downloading model m...\"}\n\n\
+                        data: {\"downloaded\": 10, \"total\": 100, \"filename\": \"m.gguf\"}\n\n\
+                        event: cancelled\ndata: {\"status\": \"cancelled\", \"message\": \"Download of m cancelled.\"}\n\n";
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n", body.len());
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+        });
+
+        let mut list = Recorded::default();
+        let download = list.add("Download m");
+        let enable = list.add("Enable for project");
+        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stream_progress(&base, "/v1/init", serde_json::json!({}), &mut list, download, &|status| match status {
+                "downloading" => Stage::Start(download),
+                _ => Stage::Other,
+            });
+        }));
+        assert!(ended.is_err(), "a cancelled stream ends the work");
+        assert_eq!(list.failed, Some((download, "Download of m cancelled.".to_string())));
+        assert!(!list.done.contains(&enable));
     }
 
     /// A server that stalls halfway through the first response and serves
