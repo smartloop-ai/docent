@@ -5,7 +5,64 @@ use std::time::{Duration, Instant};
 
 use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
 use futures_util::StreamExt;
-use smartloop::api::model::{Citation, CitationSource};
+use serde::Deserialize;
+
+/// What kind of source a [`Citation`] names, and so what opening it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CitationSource {
+    /// A file on this machine, opened from `document_path` or `path`.
+    Document,
+    /// A web page, opened from `url`.
+    Web,
+    /// A connected app's tool call; nothing to open.
+    Mcp,
+}
+
+/// A source an answer drew on, as the agent's `chat.citations` event sends
+/// it.  Docent's own type, not the smartloop crate's: the reply comes over
+/// HTTP, so reading it needn't wait for a smartloop release that carries a
+/// new field (a field this agent doesn't send yet reads as absent), and an
+/// older agent's citations still read.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Citation {
+    /// Absent from an older agent's citation of a document by name alone.
+    #[serde(default)]
+    pub document_id: String,
+    #[serde(default)]
+    pub document_name: Option<String>,
+    /// What kind of source this is; `None` for one docent doesn't know.
+    #[serde(default, deserialize_with = "known_source")]
+    pub source: Option<CitationSource>,
+    /// Where a web citation opens.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// A document's file, relative to its project (`documents/invoice.pdf`).
+    #[serde(default)]
+    pub document_path: Option<String>,
+    /// The pages of a document the answer drew on.
+    #[serde(default)]
+    pub page_numbers: Option<Vec<serde_json::Value>>,
+    /// An explored file's absolute path.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The connected app an MCP citation's tool belongs to.
+    #[serde(default)]
+    pub server_name: Option<String>,
+    /// The tool an MCP citation names.
+    #[serde(default)]
+    pub tool_name: Option<String>,
+}
+
+/// A citation's `source`, read leniently: a kind docent doesn't know reads
+/// as none rather than failing the whole event.
+fn known_source<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<CitationSource>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.as_deref().and_then(|s| match s {
+        "document" => Some(CitationSource::Document),
+        "web" => Some(CitationSource::Web),
+        "mcp" => Some(CitationSource::Mcp),
+        _ => None,
+    }))
+}
 
 /// What one chat turn reports while it streams.
 #[derive(Debug, Clone)]
@@ -712,5 +769,16 @@ mod tests {
         let remote = reference(&sent("document", json!({"document_name": "upload.pdf"})), None, None).unwrap();
         assert_eq!(remote, Reference { label: "upload.pdf".into(), target: None });
         assert_eq!(open(json!({"document_name": "missing.pdf"})).target, None);
+    }
+
+    #[test]
+    fn an_older_agents_citation_and_an_unknown_source_still_read() {
+        let old: Citation = serde_json::from_value(serde_json::json!({"document_id": "d1", "document_name": "invoice.pdf"})).unwrap();
+        assert_eq!(old.document_name.as_deref(), Some("invoice.pdf"));
+        assert_eq!(old.source, None);
+        let newer: Citation =
+            serde_json::from_value(serde_json::json!({"source": "spreadsheet", "path": "/tmp/a.csv", "added_later": 1})).unwrap();
+        assert_eq!(newer.source, None, "a kind docent doesn't know reads as none");
+        assert_eq!(newer.path.as_deref(), Some("/tmp/a.csv"));
     }
 }
