@@ -47,6 +47,15 @@ unicode-width = "0.2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# mupdf's system-font lookup (via font-kit) links libfontconfig.so.1, which
+# minimal Linux images (cloud VMs, containers) lack -- and without it the
+# binary fails to start at all. Turn on fontconfig's dlopen mode so it loads
+# at runtime instead: when absent, mupdf's font callback catches the failure
+# and falls back to its built-in fonts. Only here to enable the feature (it
+# must be font-kit's: it switches font-kit's calls to the dlopened table).
+[target.'cfg(target_os = "linux")'.dependencies]
+font-kit = { version = "0.14", default-features = false, features = ["source-fontconfig-dlopen"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
