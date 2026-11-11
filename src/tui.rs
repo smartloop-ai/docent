@@ -2793,6 +2793,11 @@ impl App {
             ChatEvent::Content(content) => {
                 turn.tokens += 1;
                 reply.text.push_str(&content);
+                // A tool call the model wrote as text runs as a shell
+                // block, and its control tokens never show.
+                if files::has_tool_call_markup(&reply.text) {
+                    reply.text = files::tool_calls_as_blocks(&reply.text);
+                }
                 // A file's written once its block is done, not when the
                 // reply is.
                 if content.contains('\n')
