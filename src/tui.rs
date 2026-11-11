@@ -3366,11 +3366,16 @@ impl App {
                 self.input.clear();
                 self.cursor = 0;
             }
-            // Esc takes back the last queued prompt first, then interrupts.
-            KeyCode::Esc if self.turn.is_some() && !self.queued.is_empty() => {
-                self.queued.pop();
-            }
+            // Esc interrupts the reply: the next queued prompt goes at once.
             KeyCode::Esc if self.turn.is_some() => self.stop_turn(),
+            // Up on an empty prompt takes back the last queued one, to edit.
+            KeyCode::Up if self.input.is_empty() && !self.queued.is_empty() => {
+                let last = self.queued.pop().expect("queued is not empty");
+                self.input = last.input;
+                self.cursor = self.input.len();
+                self.attachments = last.attachments;
+                self.history_at = None;
+            }
             // The reply's commands, asked about: run, run from now on, or skip.
             KeyCode::Enter if asked && key.modifiers.is_empty() => self.answer_ask(true, false),
             KeyCode::Tab if asked => self.answer_ask(true, true),
@@ -4523,8 +4528,10 @@ impl App {
             hints.extend(notice);
         } else {
             // The rest live under help, as in Claude Code.
-            let esc = if self.turn.is_some() && !self.queued.is_empty() { "unqueue" } else { "interrupt" };
-            let mut keys = vec![("enter", if self.turn.is_some() { "queue" } else { "send" }), ("esc", esc)];
+            let mut keys = vec![("enter", if self.turn.is_some() { "queue" } else { "send" }), ("esc", "interrupt")];
+            if !self.queued.is_empty() && self.input.is_empty() {
+                keys.push(("↑", "unqueue"));
+            }
             if self.always_run {
                 keys.push(("tab", "auto-approve on"));
             }
@@ -5746,7 +5753,8 @@ fn help_lines() -> Vec<Line<'static>> {
         ("[enter]", "send the prompt"),
         ("[shift+enter] [alt+enter]", "new line (also [ctrl+j])"),
         ("[enter] while it replies", "queue the prompt: it goes once the reply and what follows are done"),
-        ("[esc]", "take back the last queued prompt, else interrupt the reply"),
+        ("[esc]", "interrupt the reply; the next queued prompt goes at once"),
+        ("[↑] with prompts queued", "take back the last queued prompt to edit it"),
         ("[esc] [esc]", "clear the prompt"),
         ("[enter] [tab] [esc]", "a reply's commands, asked about: run, always this session, skip"),
         ("[tab]", "on an empty prompt: auto-approve on or off, so a reply's commands run without asking"),
@@ -8173,7 +8181,7 @@ mod tests {
     }
 
     #[test]
-    fn prompts_sent_during_a_turn_queue_and_esc_takes_the_last_back_first() {
+    fn prompts_sent_during_a_turn_queue_and_esc_lets_the_next_in() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _inside = runtime.enter();
         let mut app = app();
@@ -8184,34 +8192,36 @@ mod tests {
         assert!(app.turn.is_some());
 
         // While it replies, the next prompts wait, shown over the prompt.
-        for prompt in ["second", "third"] {
+        for prompt in ["second", "third", "fourth"] {
             app.input = prompt.into();
             app.submit();
         }
         assert!(app.input.is_empty());
         let queued: Vec<&str> = app.queued.iter().map(|q| q.input.as_str()).collect();
-        assert_eq!(queued, ["second", "third"]);
-        let text = screen(&app, 80, 24);
+        assert_eq!(queued, ["second", "third", "fourth"]);
+        let text = screen(&app, 100, 24);
         assert!(text.contains("[queued] second") && text.contains("[queued] third"), "{}", text);
-        assert!(text.contains("[esc] unqueue"), "{}", text);
+        assert!(text.contains("[esc] interrupt") && text.contains("[↑] unqueue"), "{}", text);
 
-        // Esc takes back the last one, then the next, and only then interrupts.
-        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.queued.len(), 1);
-        assert!(app.turn.is_some());
-        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.queued.is_empty() && app.turn.is_some());
-        app.input = "fourth".into();
-        app.submit();
-        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        // Up on the empty prompt takes back the last one, to edit.
+        app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input, "fourth");
+        assert_eq!(app.queued.len(), 2);
+        app.input.clear();
+        app.cursor = 0;
+
+        // Esc interrupts the reply even with prompts queued, and the next
+        // one goes at once, as its own turn.
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.turn.is_none());
-
-        // Once nothing runs, the next queued prompt goes as its own turn.
-        app.queued.push(Queued { input: "fifth".into(), attachments: Vec::new() });
+        app.send_queued();
+        assert!(app.turn.is_some());
+        assert_eq!(app.queued.len(), 1);
+        assert!(screen(&app, 80, 24).contains("> second"));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.send_queued();
         assert!(app.queued.is_empty() && app.turn.is_some());
-        assert!(screen(&app, 80, 24).contains("> fifth"));
+        assert!(screen(&app, 80, 24).contains("> third"));
     }
 
     #[test]
