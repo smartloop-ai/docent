@@ -818,23 +818,20 @@ impl Reply {
     }
 }
 
-/// A file a reply is still giving: its name, then its code as it streams
-/// in. Nothing is written yet; once its block is done it shows as its
-/// change, and it's written when the reply is in.
-fn streaming_part(path: &str, content: &str, append: bool, width: u16) -> Vec<Line<'static>> {
+/// A file a reply is still giving: its name and how many lines have come,
+/// not its code. Once its block is done it's written, and it shows as its
+/// change against the file there; a whole file streaming in line by line
+/// would scroll hundreds of lines past for a change of a few.
+fn streaming_part(path: &str, content: &str, append: bool, _width: u16) -> Vec<Line<'static>> {
     let lines = content.lines().count();
-    let mut part = vec![Line::from(vec![
+    vec![Line::from(vec![
         Span::styled("● ", dim()),
         Span::styled(path.to_string(), Style::new().bold()),
         Span::styled(
             format!(" · {}{} line{}", if append { "adding " } else { "" }, lines, if lines == 1 { "" } else { "s" }),
             dim(),
         ),
-    ])];
-    let lang = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
-    let fence = if content.lines().any(|l| l.trim_start().starts_with("```")) { "````" } else { "```" };
-    part.extend(code_lines(&format!("{fence}{lang}\n{}\n{fence}", content.trim_end_matches('\n')), width));
-    part
+    ])]
 }
 
 /// `text` split into its prose and its fenced code blocks, in order, each
@@ -8490,7 +8487,7 @@ mod tests {
         std::fs::write(dir.path().join("main.rs"), "fn main() {\n    old();\n}\n").unwrap();
         let mut reply = Reply { root: Some(dir.path().to_path_buf()), ..Default::default() };
         let shown = |reply: &Reply| reply.body(40).iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
-        // While the reply comes in, the file is named, with its lines.
+        // While the reply comes in, the file is named, with its line count.
         reply.text = "Here:\n\n`main.rs`\n```rust\nfn main() {\n    ne".into();
         assert!(shown(&reply).contains("● main.rs · 2 lines"), "{}", shown(&reply));
         // More of the same line: it isn't laid out again.
@@ -8501,8 +8498,8 @@ mod tests {
         reply.text.push_str("\n}\n");
         reply.rendered_at.set(None);
         assert!(shown(&reply).contains("· 3 lines"), "{}", shown(&reply));
-        // Its code streams in; it isn't a change yet.
-        assert!(shown(&reply).contains("new();"), "{}", shown(&reply));
+        // Its code isn't drawn while it comes, and it isn't a change yet.
+        assert!(!shown(&reply).contains("new();"), "{}", shown(&reply));
         assert!(!shown(&reply).contains("← main.rs"), "{}", shown(&reply));
         // The reply in, its change shows.
         reply.text.push_str("```\n");
@@ -8820,4 +8817,14 @@ mod tests {
         app.send_queued();
         assert!(app.queued.is_empty() && app.turn.is_some());
     }
+    #[test]
+    fn a_file_still_coming_shows_only_its_name_and_line_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reply = Reply { root: Some(dir.path().to_path_buf()), ..Default::default() };
+        reply.text = "It's in `src/render.js`.\n```sh\ncat > src/render.js <<'EOF'\nconst A = 1;\nconst B = 2;\nconst C = 3;\n".into();
+        let rows: Vec<String> = reply.body(60).iter().map(|l| l.to_string()).collect();
+        assert!(rows.iter().any(|r| r.contains("● src/render.js · 3 lines")), "{:?}", rows);
+        assert!(!rows.iter().any(|r| r.contains("const B")), "its code isn't drawn while it streams: {:?}", rows);
+    }
+
 }
