@@ -7054,6 +7054,7 @@ mod tests {
             downloaded: true,
             enabled: true,
             cloud: false,
+            local: false,
             recommended: false,
         }];
         app.overlay = Overlay::Models { rows: Some(Ok(rows)), selected: 0 };
@@ -7908,6 +7909,7 @@ mod tests {
             downloaded: false,
             enabled,
             cloud: false,
+            local: false,
             recommended,
         };
         let list = vec![
@@ -7938,6 +7940,7 @@ mod tests {
             downloaded: false,
             enabled,
             cloud: false,
+            local: false,
             recommended,
         };
         app.apply(AppEvent::Models(Ok(vec![row("big", false, false), row("small", true, false)])));
@@ -7999,6 +8002,7 @@ mod tests {
             downloaded,
             enabled,
             cloud: false,
+            local: false,
             recommended: false,
         };
         let cloud = ModelRow { cloud: true, ..model("sonnet", false, false) };
