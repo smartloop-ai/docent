@@ -534,7 +534,7 @@ struct Reply {
     warnings: Vec<String>,
     model: Option<String>,
     text: String,
-    citations: Vec<String>,
+    citations: Vec<chat::Reference>,
     stats: Option<TurnStats>,
     /// Why it ended early: stopped by the user, or an error.
     ended: Option<String>,
@@ -1261,6 +1261,8 @@ struct App {
     copied: Option<(usize, Instant)>,
     /// The link last clicked, flashed in the footer as it opens.
     opened: Option<(String, Instant)>,
+    /// A file last clicked that's gone since its link was made.
+    missing: Option<(String, Instant)>,
     /// Kept for the app's life: on X11 the clipboard empties when its owner
     /// goes away.
     clipboard: Option<arboard::Clipboard>,
@@ -1386,6 +1388,7 @@ impl App {
             pressed: None,
             copied: None,
             opened: None,
+            missing: None,
             clipboard: None,
             ticks: 0,
             token_entry: false,
@@ -2799,7 +2802,7 @@ impl App {
                 }
             }
             ChatEvent::Citations(list) => {
-                reply.citations = list.iter().filter_map(chat::citation_label).collect();
+                reply.citations = chat::references(&list, self.project.as_ref().map(|(id, _)| id.as_str()));
             }
             ChatEvent::Status { step, message } => {
                 if step == "model"
@@ -2896,8 +2899,15 @@ impl App {
         }
     }
 
-    /// Open a clicked link in the browser.
+    /// Open a clicked link in the browser, or a file in its app, when it's
+    /// still there.
     fn open(&mut self, url: String) {
+        if let Some(path) = crate::links::file_path(&url).filter(|p| !p.is_file()) {
+            self.opened = None;
+            self.missing = Some((path.display().to_string(), Instant::now()));
+            return;
+        }
+        self.missing = None;
         if !cfg!(test) {
             crate::open_browser(&url);
         }
@@ -4498,8 +4508,12 @@ impl App {
             hints.push(Span::styled("✓ ", Style::new().fg(Color::Green)));
             hints.push(Span::styled(format!("Copied {} characters", chars), dim()));
         } else if let Some((url, _)) = opened {
+            let shown = crate::links::file_path(url).map_or_else(|| url.clone(), |p| p.display().to_string());
             hints.push(Span::styled("↗ ", Style::new().fg(Color::Green)));
-            hints.push(Span::styled(format!("Opening {}", url), dim()));
+            hints.push(Span::styled(format!("Opening {}", shown), dim()));
+        } else if let Some((path, _)) = self.missing.as_ref().filter(|(_, at)| recent(at)) {
+            hints.push(Span::styled("✗ ", Style::new().fg(Color::Yellow)));
+            hints.push(Span::styled(format!("File no longer exists: {}", path), dim()));
         } else if self.scroll_back > 0 {
             hints.push(Span::styled(format!("↓ {} lines below  ", self.scroll_back), dim()));
             hints.extend(key_hints(&[("pgdn", "scroll down"), ("end", "latest")]));
@@ -4965,9 +4979,12 @@ fn reply_lines(reply: &Reply, width: u16, lines: &mut Vec<Line<'static>>) {
     if !reply.citations.is_empty() {
         lines.push(Line::default());
         lines.push(Line::styled("  References", dim()));
-        for (i, label) in reply.citations.iter().enumerate() {
+        for (i, reference) in reply.citations.iter().enumerate() {
             let mut spans = vec![Span::styled(format!("  [{}] ", i + 1), dim())];
-            spans.extend(crate::links::linkify(label, Style::new()));
+            match &reference.target {
+                Some(target) => spans.push(Span::styled(reference.label.clone(), crate::links::style(target))),
+                None => spans.extend(crate::links::linkify(&reference.label, Style::new())),
+            }
             lines.push(Line::from(spans));
         }
     }
@@ -7150,6 +7167,38 @@ mod tests {
         app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), (x, y)));
         app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), (x, y)));
         assert!(screen(&app, 80, 24).contains("Opening https://smartloop.ai/docs"));
+    }
+
+    #[test]
+    fn clicking_a_document_reference_opens_its_file_while_it_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plan.md");
+        std::fs::write(&file, "plan").unwrap();
+        let target = crate::links::file_url(&file);
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.entries.push(Entry::Reply(Reply {
+            text: "The plan ships in May.".into(),
+            citations: vec![chat::Reference { label: "notes/plan.md, p. 2".into(), target: Some(target.clone()) }],
+            ..Default::default()
+        }));
+        let text = screen(&app, 80, 24);
+        let y = text.lines().position(|r| r.contains("notes/plan.md")).expect(&text);
+        let x = text.lines().nth(y).unwrap().find("notes/plan.md").unwrap() as u16;
+        let click = |app: &mut App| {
+            let at = |kind| MouseEvent { kind, column: x + 2, row: y as u16, modifiers: KeyModifiers::NONE };
+            app.mouse(at(MouseEventKind::Down(MouseButton::Left)));
+            app.mouse(at(MouseEventKind::Up(MouseButton::Left)));
+        };
+
+        click(&mut app);
+        assert_eq!(app.opened.as_ref().map(|(url, _)| url.clone()), Some(target));
+        assert!(screen(&app, 120, 24).contains(&format!("Opening {}", file.display())));
+
+        std::fs::remove_file(&file).unwrap();
+        click(&mut app);
+        assert_eq!(app.opened, None, "a file that's gone opens nothing");
+        assert!(screen(&app, 120, 24).contains("File no longer exists"));
     }
 
     #[test]

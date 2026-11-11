@@ -442,6 +442,22 @@ fn setup(list: &mut dyn Steps, steps: &SetupSteps, client: &Client, base_url: &s
     list.finish_all();
 }
 
+/// The folder SLP keeps `project` in, as `config.json` lists it: the agent
+/// copies each document it adds into its `documents/`.
+pub fn project_dir(project: &str) -> Option<PathBuf> {
+    let config = fs::read_to_string(install_dir().join("config.json")).ok()?;
+    project_dir_in(&serde_json::from_str(&config).ok()?, project)
+}
+
+fn project_dir_in(config: &serde_json::Value, project: &str) -> Option<PathBuf> {
+    config["workspace"]["projects"]
+        .as_array()?
+        .iter()
+        .find(|p| p["id"].as_str() == Some(project))?["project_dir"]
+        .as_str()
+        .map(PathBuf::from)
+}
+
 /// The workspace SLP is using: `config.json`'s workspace id, or the only
 /// UUID-named directory under the home that has a `models/` dir.
 fn workspace_dir() -> Option<PathBuf> {
@@ -940,6 +956,18 @@ mod tests {
         assert!(!serves_home(Some(Path::new("/tmp/other-home")), home));
         assert!(!serves_home(Some(Path::new("/Users/me/.smartloop-dev")), home));
         assert!(serves_home(None, home));
+    }
+
+    #[test]
+    fn finds_a_project_folder_in_the_config() {
+        let config = serde_json::json!({"id": "w", "workspace": {"projects": [
+            {"id": "p1", "project_dir": "/Users/me/.smartloop/w/p1"},
+            {"id": "p2"},
+        ]}});
+        assert_eq!(project_dir_in(&config, "p1"), Some(PathBuf::from("/Users/me/.smartloop/w/p1")));
+        assert_eq!(project_dir_in(&config, "p2"), None);
+        assert_eq!(project_dir_in(&config, "p3"), None);
+        assert_eq!(project_dir_in(&serde_json::json!({}), "p1"), None);
     }
 
     #[test]
