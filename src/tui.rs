@@ -2611,10 +2611,11 @@ impl App {
             .as_ref()
             .map(|l| l.project.clone())
             .filter(|id| projects.iter().any(|p| field(p, "id") == *id));
-        // A folder never linked, opened without a project asked for, gets
-        // a project of its own, named after it.
+        // A folder never linked, or linked to a project the agent no longer
+        // has, opened without a project asked for, gets a project of its
+        // own, named after it: never the one the last folder left current.
         if self.wanted_project.is_none()
-            && link.is_none()
+            && linked.is_none()
             && let Some(root) = sync_root().filter(|root| docent::refusal(root).is_none())
             && let Some(folder) = root.file_name().map(|name| name.to_string_lossy().into_owned())
         {
@@ -2637,7 +2638,7 @@ impl App {
         match chosen {
             Some(project) => {
                 // Nothing here or for the project synced yet: say what /sync would add.
-                if link.is_none() && project_root(&project.0).is_none() {
+                if linked.is_none() && project_root(&project.0).is_none() {
                     self.hint_unsynced(project.1.clone());
                 }
                 self.project = Some(project);

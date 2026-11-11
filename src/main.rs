@@ -204,9 +204,16 @@ fn select_project(client: &Client) -> String {
         fail("No projects found; create one with /project new in `docent`".to_string());
     }
 
-    let default = projects
-        .iter()
-        .position(|p| p["current"].as_bool().unwrap_or_default())
+    // The project the folder syncs to, else the agent's current one.
+    let linked = std::env::current_dir()
+        .ok()
+        .map(|here| docent::root(&here))
+        .filter(|root| docent::refusal(root).is_none())
+        .and_then(|root| docent::linked(&root))
+        .map(|l| l.project);
+    let default = linked
+        .and_then(|id| projects.iter().position(|p| p["id"].as_str() == Some(id.as_str())))
+        .or_else(|| projects.iter().position(|p| p["current"].as_bool().unwrap_or_default()))
         .unwrap_or(0);
     let id = |i: usize| projects[i]["id"].as_str().unwrap_or_default().to_string();
     let name = |i: usize| projects[i]["name"].as_str().unwrap_or_default();
