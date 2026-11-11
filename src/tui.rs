@@ -4903,15 +4903,20 @@ impl App {
     /// The project's models as a list, like Claude Code's model picker:
     /// the selected one marked, each with its state and what it can do.
     fn draw_models(&self, frame: &mut Frame, area: Rect, rows: &Option<Result<Vec<ModelRow>, String>>, selected: usize) {
-        let block = panel(&bar_hints(&[("↑↓", "select"), ("enter", "enable/disable"), ("ctrl+r", "refresh"), ("esc", "close")]));
+        // Enter downloads a local model that isn't downloaded yet; anything
+        // else it turns on or off.  Only a local model is ever downloaded.
+        let enter = match rows {
+            Some(Ok(list)) if list.get(selected).is_some_and(|m| !m.cloud && !m.downloaded && !m.enabled) => "download",
+            _ => "enable/disable",
+        };
+        let block = panel(&bar_hints(&[("↑↓", "select"), ("enter", enter), ("ctrl+r", "refresh"), ("esc", "close")]));
         frame.render_widget(Clear, area);
         let list = match rows {
             None => return frame.render_widget(Paragraph::new(format!(" Loading models {}", self.spinner())).block(block), area),
             Some(Err(e)) => return frame.render_widget(Paragraph::new(e.clone()).block(block).wrap(Wrap { trim: false }), area),
             Some(Ok(list)) => list,
         };
-        let label = |m: &ModelRow| if m.cloud { format!("{} ☁", m.name) } else { m.name.clone() };
-        let name_width = list.iter().map(|m| label(m).chars().count()).max().unwrap_or(0) + 2;
+        let name_width = list.iter().map(|m| m.name.chars().count()).max().unwrap_or(0) + 2;
         let lines: Vec<Line> = list
             .iter()
             .enumerate()
@@ -4920,9 +4925,12 @@ impl App {
                 let mut spans = vec![
                     Span::styled(if chosen { "› " } else { "  " }, Style::new().fg(pink()).bold()),
                     Span::styled(
-                        format!("{:<w$}", label(m), w = name_width),
+                        format!("{:<w$}", m.name, w = name_width),
                         if chosen { Style::new().fg(pink()).bold() } else { Style::new() },
                     ),
+                    // Where it runs: a local model downloads and runs here, a
+                    // cloud one (paid) is only turned on or off.
+                    Span::styled(if m.cloud { "cloud  " } else { "local  " }, dim()),
                 ];
                 let downloading = self.downloads.iter().find(|d| d.model == m.name && !d.finished);
                 let state = match downloading.and_then(|d| d.list.active()) {
@@ -4933,7 +4941,7 @@ impl App {
                     None if m.enabled => Span::styled("✓ enabled", Style::new().fg(Color::Green)),
                     None if m.cloud || !m.accessible => Span::styled("disabled", dim()),
                     None if m.downloaded => Span::styled("downloaded", dim()),
-                    None => Span::styled("not downloaded", dim()),
+                    None => Span::styled("↓ download", Style::new().fg(Color::Cyan)),
                 };
                 let state_width = state.width();
                 spans.push(state);
@@ -8011,9 +8019,15 @@ mod tests {
             selected: 1,
         };
         let text = screen(&app, 80, 24);
-        assert!(text.contains("  gemma4-e4b  not downloaded  general, vision"), "{}", text);
-        assert!(text.contains("› qwen3.5-2b  ✓ enabled"), "{}", text);
-        assert!(text.contains("  sonnet ☁    disabled"), "{}", text);
+        assert!(text.contains("  gemma4-e4b  local  ↓ download      general, vision"), "{}", text);
+        assert!(text.contains("› qwen3.5-2b  local  ✓ enabled"), "{}", text);
+        assert!(text.contains("  sonnet      cloud  disabled"), "{}", text);
+        // On a downloaded model Enter toggles it; on one to fetch it downloads.
+        assert!(text.contains("enable/disable"), "{}", text);
+        if let Overlay::Models { selected, .. } = &mut app.overlay {
+            *selected = 0;
+        }
+        assert!(screen(&app, 80, 24).contains("[enter] download"), "the hint follows the selection");
         assert!(!text.contains("Capabilities") && !text.contains("Models"), "{}", text);
     }
 
