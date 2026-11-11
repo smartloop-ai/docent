@@ -98,7 +98,17 @@ pub fn run(client: &Client, prompt: Option<String>, project: Option<String>, ses
         }
         hook(info);
     }));
-    let result = runtime.block_on(App::new(client.clone(), prompt, project, session).run(&mut terminal));
+    let mut app = App::new(client.clone(), prompt, project, session);
+    // A `sudo` in a command asks for its password here, at the prompt.
+    let tx = app.tx.clone();
+    let askpass = crate::askpass::Askpass::start(move |ask| {
+        let _ = tx.send(AppEvent::Password(ask));
+    });
+    if let Some(askpass) = &askpass {
+        let _ = COMMAND_ENV.set(askpass.env().to_vec());
+    }
+    app.askpass = askpass;
+    let result = runtime.block_on(app.run(&mut terminal));
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     if enhanced {
         let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
@@ -134,6 +144,8 @@ enum AppEvent {
     TurnDone(Result<TurnStats, String>),
     Download(usize, StepEvent),
     DownloadDone(usize),
+    /// A command's `sudo` asks for a password.
+    Password(crate::askpass::Ask),
     Notice(String),
     Warning(String),
     Error(String),
@@ -416,6 +428,8 @@ struct Download {
     model: String,
     list: StepList,
     finished: bool,
+    /// Asked to stop: its end is said as a notice, not an error.
+    cancelling: bool,
 }
 
 enum Entry {
@@ -1415,6 +1429,13 @@ struct App {
     ticks: usize,
     /// The prompt takes a token for `/login`, masked, instead of a message.
     token_entry: bool,
+    /// Passwords commands ask for, the first at the prompt, masked; with
+    /// what was typed before it came, put back once it's answered.
+    passwords: std::collections::VecDeque<crate::askpass::Ask>,
+    stashed: Option<(String, usize)>,
+    /// Where a command's `sudo` asks: kept for the app's life, as its
+    /// folder goes when it's dropped.
+    askpass: Option<crate::askpass::Askpass>,
     /// Files dropped on the prompt, each shown there as a chip such as
     /// `[Image 1]` until the message is sent.
     attachments: Vec<Attachment>,
@@ -1541,6 +1562,9 @@ impl App {
             clipboard: None,
             ticks: 0,
             token_entry: false,
+            passwords: std::collections::VecDeque::new(),
+            stashed: None,
+            askpass: None,
             attachments: Vec::new(),
             queued: Vec::new(),
             shell_context: Vec::new(),
@@ -1851,12 +1875,32 @@ impl App {
             return;
         }
         let id = self.downloads.len();
-        self.downloads.push(Download { model: name.clone(), list: StepList::new(), finished: false });
+        self.downloads.push(Download { model: name.clone(), list: StepList::new(), finished: false, cancelling: false });
         self.spawn(move |client, tx| {
             let mut list = Remote::new(tx.clone(), move |e| AppEvent::Download(id, e));
             crate::enable_steps(&mut list, &client, &project, &name);
             let _ = tx.send(AppEvent::DownloadDone(id));
             let _ = tx.send(AppEvent::Notice(format!("Model {} enabled", name)));
+        });
+    }
+
+    /// Stop the running download of `name`. The agent ends its `/v1/init`
+    /// stream with a `cancelled` event, which ends the download here and
+    /// leaves the model off.
+    fn cancel_download(&mut self, name: String) {
+        let Some(download) = self.downloads.iter_mut().find(|d| d.model == name && !d.finished) else { return };
+        if download.cancelling {
+            return;
+        }
+        download.cancelling = true;
+        self.spawn(move |client, tx| {
+            let event = match crate::cancel_download(&client, &name) {
+                Ok(true) => return,
+                // Nothing running: it finished before the cancel landed.
+                Ok(false) => AppEvent::Notice(format!("{} had already finished downloading", name)),
+                Err(e) => AppEvent::Error(e),
+            };
+            let _ = tx.send(event);
         });
     }
 
@@ -2790,8 +2834,14 @@ impl App {
             }
             AppEvent::Download(id, event) => {
                 if let StepEvent::Fail(_, message) = &event {
-                    self.entries.push(Entry::Error(message.clone()));
-                    self.downloads[id].finished = true;
+                    let download = &mut self.downloads[id];
+                    self.entries.push(if download.cancelling {
+                        Entry::Notice(message.clone())
+                    } else {
+                        Entry::Error(message.clone())
+                    });
+                    download.finished = true;
+                    self.load_models();
                 }
                 self.downloads[id].list.apply(event);
             }
@@ -2799,6 +2849,16 @@ impl App {
                 self.downloads[id].list.finish();
                 self.downloads[id].finished = true;
                 self.load_models();
+            }
+            AppEvent::Password(ask) => {
+                if self.passwords.is_empty() {
+                    self.stashed = Some((std::mem::take(&mut self.input), self.cursor));
+                    self.cursor = 0;
+                }
+                self.passwords.push_back(ask);
+                // At the prompt, in view: a panel open closes.
+                self.overlay = Overlay::None;
+                self.scroll_back = 0;
             }
             AppEvent::Notice(text) => self.entries.push(Entry::Notice(text)),
             AppEvent::Warning(text) => self.entries.push(Entry::Warning(text)),
@@ -3245,6 +3305,11 @@ impl App {
                 self.quit = true;
                 return;
             }
+            // A password asked for takes every key until it's answered.
+            _ if !self.passwords.is_empty() => {
+                self.overlay = Overlay::None;
+                return self.key_chat(key);
+            }
             (KeyCode::Char('o'), true) => return self.open_models(),
             (KeyCode::Char('p'), true) => return self.open_projects(),
             (KeyCode::Char('b'), true) => return self.open_jobs(),
@@ -3636,7 +3701,7 @@ impl App {
     /// word starting with `/`: the CLI's own and the project's skills
     /// together, by name.
     fn command_hints(&self) -> Vec<(String, String)> {
-        if self.token_entry || !self.input.starts_with('/') || self.input.contains(' ') {
+        if self.secret() || !self.input.starts_with('/') || self.input.contains(' ') {
             return Vec::new();
         }
         let typed = self.input.to_lowercase();
@@ -3671,8 +3736,10 @@ impl App {
         // Any other key in between makes the next Esc a first one again.
         let last_esc = self.last_esc.take();
         let esc_again = key.code == KeyCode::Esc && last_esc.is_some_and(|t| t.elapsed() < DOUBLE_ESC);
-        let asked = self.ask.is_some() && self.input.is_empty() && self.turn.is_none() && !self.token_entry;
+        let asked = self.ask.is_some() && self.input.is_empty() && self.turn.is_none() && !self.secret();
         match key.code {
+            KeyCode::Esc if !self.passwords.is_empty() => self.answer_password(false),
+            KeyCode::Enter if !self.passwords.is_empty() => self.answer_password(true),
             KeyCode::Esc if self.token_entry => {
                 self.token_entry = false;
                 self.input.clear();
@@ -3694,7 +3761,7 @@ impl App {
             KeyCode::Esc if asked => self.answer_ask(false, false),
             // On an empty prompt, Tab turns auto-approve on or off: whether
             // a reply's commands run without asking.
-            KeyCode::Tab if self.input.is_empty() && !self.token_entry => {
+            KeyCode::Tab if self.input.is_empty() && !self.secret() => {
                 self.always_run = !self.always_run;
                 let state = if self.always_run {
                     "on: a reply's commands run without asking"
@@ -3714,10 +3781,10 @@ impl App {
             KeyCode::Esc if !self.input.is_empty() => self.last_esc = Some(Instant::now()),
             // A new line in the prompt: Shift+Enter where the terminal tells
             // it apart, Alt+Enter and Ctrl+J everywhere.
-            KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) && !self.token_entry => {
+            KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) && !self.secret() => {
                 self.insert("\n")
             }
-            KeyCode::Char('j') if ctrl && !self.token_entry => self.insert("\n"),
+            KeyCode::Char('j') if ctrl && !self.secret() => self.insert("\n"),
             KeyCode::Enter => self.submit(),
             KeyCode::Char('u') if ctrl => {
                 self.input.clear();
@@ -3725,7 +3792,7 @@ impl App {
             }
             KeyCode::Char('a') if ctrl => self.cursor = 0,
             KeyCode::Char('e') if ctrl => self.cursor = self.input.chars().count(),
-            KeyCode::Char('?') if self.input.is_empty() => self.overlay = Overlay::Help,
+            KeyCode::Char('?') if self.input.is_empty() && !self.secret() => self.overlay = Overlay::Help,
             KeyCode::Char(c) if !ctrl => {
                 let at = self.byte_at(self.cursor);
                 self.input.insert(at, c);
@@ -3783,7 +3850,7 @@ impl App {
 
     /// A paste: dropped files become chips, anything else is typed in.
     fn paste(&mut self, text: &str) {
-        if self.token_entry {
+        if self.secret() {
             return self.insert(text.trim());
         }
         match dropped_files(text) {
@@ -3876,6 +3943,27 @@ impl App {
             Some(i) if step < 0 => self.input[..i].chars().count(),
             _ => self.input.chars().count(),
         };
+    }
+
+    /// Whether the prompt takes something secret, shown as dots: a token
+    /// for `/login`, or a password a command asks for.
+    fn secret(&self) -> bool {
+        self.token_entry || !self.passwords.is_empty()
+    }
+
+    /// Answer the password asked for first: with what's typed, or, `given`
+    /// false, decline it, and the command's `sudo` fails. What was typed
+    /// before it came is put back once none is left to answer.
+    fn answer_password(&mut self, given: bool) {
+        let Some(ask) = self.passwords.pop_front() else { return };
+        let password = std::mem::take(&mut self.input);
+        self.cursor = 0;
+        let _ = ask.reply.send(given.then_some(password));
+        if self.passwords.is_empty()
+            && let Some((input, cursor)) = self.stashed.take()
+        {
+            (self.input, self.cursor) = (input, cursor);
+        }
     }
 
     fn submit(&mut self) {
@@ -4097,6 +4185,12 @@ impl App {
                     } else {
                         format!("{} needs a sign-in; /login first", row.name)
                     }));
+                } else if needs_download(&row) {
+                    // Enter never downloads: a model is fetched only when
+                    // asked for with ctrl+d.
+                    if !self.downloads.iter().any(|d| d.model == row.name && !d.finished) {
+                        self.entries.push(Entry::Notice(format!("{} isn't downloaded; ctrl+d downloads it", row.name)));
+                    }
                 } else {
                     self.enable_model(row.name);
                 }
@@ -4105,10 +4199,15 @@ impl App {
                 // Download the local copy (and enable it).  Only a model
                 // with one, not yet downloaded.
                 if let Some(row) = rows.as_ref().and_then(|r| r.as_ref().ok()).and_then(|r| r.get(*selected)).cloned()
-                    && row.local
-                    && !row.downloaded
+                    && downloadable(&row)
+                    && row.accessible
                 {
                     self.enable_model(row.name);
+                }
+            }
+            KeyCode::Char('x') if ctrl => {
+                if let Some(row) = rows.as_ref().and_then(|r| r.as_ref().ok()).and_then(|r| r.get(*selected)).cloned() {
+                    self.cancel_download(row.name);
                 }
             }
             _ => return false,
@@ -4637,8 +4736,16 @@ impl App {
     /// Rows the prompt shows at `width`: each line typed, wrapped, up to
     /// `PROMPT_LINES`.
     fn input_rows(&self, width: u16) -> u16 {
-        let label = if self.token_entry { "token: " } else if self.input.starts_with('!') { "! " } else { "> " };
-        let input = if !self.token_entry && self.input.starts_with('!') { &self.input[1..] } else { self.input.as_str() };
+        let label = if !self.passwords.is_empty() {
+            "password: "
+        } else if self.token_entry {
+            "token: "
+        } else if self.input.starts_with('!') {
+            "! "
+        } else {
+            "> "
+        };
+        let input = if !self.secret() && self.input.starts_with('!') { &self.input[1..] } else { self.input.as_str() };
         let room = width.saturating_sub(label.len() as u16 + 1) as usize;
         (prompt_rows(input, room).len() as u16).clamp(1, PROMPT_LINES)
     }
@@ -4646,7 +4753,7 @@ impl App {
     fn draw_input(&self, frame: &mut Frame, area: Rect) {
         // Between two rules across the screen, as in Claude Code; in the
         // brand color while a `!command` is typed, as it runs in the shell.
-        let shell = !self.token_entry && self.input.starts_with('!');
+        let shell = !self.secret() && self.input.starts_with('!');
         let rules = if shell { Style::new().fg(pink()) } else { dim() };
         let block = Block::new().borders(Borders::TOP | Borders::BOTTOM).border_style(rules);
         let inner = block.inner(area);
@@ -4654,10 +4761,18 @@ impl App {
         // A shell command has `!` ahead of it, as Claude Code's shell mode
         // does: the `!` typed is what the mark stands for, so it isn't
         // shown twice, and the cursor moves up with it.
-        let label = if self.token_entry { "token: " } else if shell { "! " } else { "> " };
+        let label = if !self.passwords.is_empty() {
+            "password: "
+        } else if self.token_entry {
+            "token: "
+        } else if shell {
+            "! "
+        } else {
+            "> "
+        };
         let prompt = Span::styled(label, Style::new().fg(pink()).bold());
-        // A token shows as dots.
-        let input = if self.token_entry {
+        // A token or password shows as dots.
+        let input = if self.secret() {
             "•".repeat(self.input.chars().count())
         } else if shell {
             self.input[1..].to_string()
@@ -4665,7 +4780,10 @@ impl App {
             self.input.clone()
         };
         let cursor = if shell { self.cursor.saturating_sub(1) } else { self.cursor };
-        let line = if self.token_entry && input.is_empty() {
+        let line = if let Some(ask) = self.passwords.front().filter(|_| input.is_empty()) {
+            // What the command asks, as it would in a terminal.
+            Line::from(vec![prompt, Span::styled(ask.prompt.clone(), dim())])
+        } else if self.token_entry && input.is_empty() {
             Line::from(vec![prompt, Span::styled("paste your Smartloop token", dim())])
         } else if input.is_empty() && !ready && !shell {
             // A shell command runs with no agent, so `!` isn't held up.
@@ -4692,7 +4810,7 @@ impl App {
                 // Until something's typed, say what the prompt takes.
                 if input.is_empty() && shell {
                     spans.push(Span::styled("a command to run in the folder; & at its end runs it in the background", dim()));
-                } else if input.is_empty() && !self.token_entry {
+                } else if input.is_empty() && !self.secret() {
                     spans.push(Span::styled("Ask anything, or drop a file to attach it", dim()));
                 }
                 shown.push(Line::from(spans));
@@ -4836,6 +4954,8 @@ impl App {
         } else if self.scroll_back > 0 {
             hints.push(Span::styled(format!("↓ {} lines below  ", self.scroll_back), dim()));
             hints.extend(key_hints(&[("pgdn", "scroll down"), ("end", "latest")]));
+        } else if !self.passwords.is_empty() {
+            hints.extend(key_hints(&[("enter", "send to the command"), ("esc", "decline")]));
         } else if self.token_entry {
             hints.extend(key_hints(&[("enter", "sign in"), ("esc", "cancel")]));
         } else if self.input.starts_with('!') {
@@ -5477,10 +5597,28 @@ fn stream(
     if let Some(dir) = dir {
         shell.current_dir(dir);
     }
+    // In a session of its own, with no terminal: nothing it starts can
+    // read from the one docent draws on, where the kernel stopped it for
+    // reading from a background group (a `sudo` asking for a password)
+    // and it showed as running for ever. Reading from stdin gets an end
+    // instead, and a `sudo` asks at docent's prompt (`COMMAND_ENV`). Its
+    // process group is its own as well, so a stop ends what it started.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        shell.process_group(0);
+        // SAFETY: setsid is async-signal-safe, the one call made between
+        // fork and exec.
+        unsafe {
+            shell.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    if let Some(env) = COMMAND_ENV.get() {
+        shell.envs(env.iter().map(|(k, v)| (k, v)));
     }
     let mut child = match shell
         .arg(traced(command))
@@ -5638,6 +5776,10 @@ fn detached(command: &str) -> (String, bool) {
         _ => (command.to_string(), false),
     }
 }
+
+/// What a command's environment gets so a `sudo` in it asks at the prompt,
+/// once the app has set that up.
+static COMMAND_ENV: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
 
 /// A line of output that is the shell saying which command it runs next:
 /// the trace `set -x` prints ahead of each, with `TRACE` as its prompt.
@@ -6159,25 +6301,35 @@ fn key_hints(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
 }
 
 /// Key hints for a panel's bottom border, padded off its corner.
+/// Whether `m` has a copy to fetch that isn't here yet: a local model, or
+/// one served both ways, not downloaded.
+fn downloadable(m: &ModelRow) -> bool {
+    !m.downloaded && (m.local || !m.cloud)
+}
+
+/// Whether `m` runs only once downloaded, so Enter can't turn it on: a
+/// model that isn't on in the cloud and has no local copy yet. A cloud
+/// model, or one downloaded, is turned on as it is.
+fn needs_download(m: &ModelRow) -> bool {
+    !m.cloud && !m.downloaded
+}
+
 /// The model list's footer: the keys that apply to the selected model.
-/// Enter turns it on or off, downloading it first when it isn't (a
-/// downloaded model runs from its local copy); ctrl+d downloads it.  While
-/// it downloads, only refresh and close apply.
+/// Enter turns it on or off and never downloads; ctrl+d downloads a model's
+/// local copy (and turns it on), a model that needs one only so.  While it
+/// downloads, ctrl+x cancels it.
 fn models_footer(selected: Option<&ModelRow>, downloading: bool) -> Vec<Span<'static>> {
     let mut keys: Vec<(&str, &str)> = Vec::new();
     match selected {
-        Some(_) if downloading => {}
+        Some(_) if downloading => keys.push(("ctrl+x", "cancel download")),
         Some(m) => {
-            let enter = if m.enabled {
-                "disable"
-            } else if !m.cloud && !m.downloaded {
-                "download & enable"
-            } else {
-                "enable"
-            };
-            keys.push(("enter", enter));
-            if m.local && !m.downloaded {
-                keys.push(("ctrl+d", "download"));
+            if m.enabled {
+                keys.push(("enter", "disable"));
+            } else if !needs_download(m) {
+                keys.push(("enter", "enable"));
+            }
+            if downloadable(m) {
+                keys.push(("ctrl+d", if m.enabled { "download" } else { "download & enable" }));
             }
         }
         None => keys.extend([("↑↓", "select"), ("enter", "enable/disable")]),
@@ -6482,6 +6634,20 @@ mod tests {
         assert!(screen(&app, 80, 12).contains("! a command to run in the folder"));
         app.input.clear();
         assert!(!screen(&app, 40, 12).contains("shell mode"));
+    }
+
+    /// A command has no terminal to read from: one that opens it, as `sudo`
+    /// does for a password, fails at once instead of being stopped by the
+    /// kernel and running for ever.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_has_no_terminal_to_hang_on() {
+        // The shell leads a session of its own, which has no terminal.
+        let (output, ended) = run_command("[ \"$(ps -o sid= -p $$ | tr -d ' ')\" = \"$$\" ] && echo own session", None, false, report());
+        assert!(output.ends_with("own session"), "{}", output);
+        assert_eq!(ended, Some(Ended::Exited(0)));
+        let (output, _) = run_command("exec 3</dev/tty || echo no terminal", None, false, report());
+        assert!(output.ends_with("no terminal"), "{}", output);
     }
 
     #[test]
@@ -7471,6 +7637,43 @@ mod tests {
         assert_eq!(app.history, vec!["/login".to_string()]);
     }
 
+    /// A command's `sudo` asks at the prompt, masked: what's typed goes
+    /// back to it, and what was typed before comes back after.
+    #[test]
+    fn a_password_a_command_asks_for_is_asked_at_the_prompt() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.input = "half a message".into();
+        app.cursor = 4;
+        app.overlay = Overlay::Help;
+        let (reply, answer) = std::sync::mpsc::channel();
+        app.apply(AppEvent::Password(crate::askpass::Ask { prompt: "[sudo] password for me:".into(), reply }));
+        assert!(matches!(app.overlay, Overlay::None) && app.input.is_empty());
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("password: [sudo] password for me:"), "{}", text);
+        assert!(text.contains("[enter] send to the command  [esc] decline"), "{}", text);
+        for c in "hunter2".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        // Keys that would open a panel are typing too.
+        app.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        let text = screen(&app, 80, 24);
+        assert!(text.contains("password: ••••••••") && !text.contains("hunter2"), "{}", text);
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(answer.recv().unwrap(), Some("hunter2?".to_string()));
+        assert_eq!((app.input.as_str(), app.cursor), ("half a message", 4));
+        assert!(app.history.is_empty(), "a password isn't kept as a prompt");
+
+        // Esc declines it.
+        let (reply, answer) = std::sync::mpsc::channel();
+        app.apply(AppEvent::Password(crate::askpass::Ask { prompt: "Password:".into(), reply }));
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(answer.recv().unwrap(), None);
+        assert_eq!(app.input, "half a message");
+    }
+
     #[test]
     fn the_banner_opens_the_conversation_and_scrolls_away() {
         let mut app = app();
@@ -8122,12 +8325,15 @@ mod tests {
         assert!(text.contains("[enter] enable  [ctrl+r]"), "a cloud model only turns on: {}", text);
         select(&mut app, 3);
         let text = screen(&app, 100, 24);
-        // Downloading is how a model is used: Enter downloads it too.
-        assert!(text.contains("[enter] download & enable  [ctrl+d] download"), "{}", text);
-        // While it downloads, only refresh and close apply.
-        app.downloads.push(Download { model: "qwen3.8-27b".into(), list: StepList::new(), finished: false });
+        // Enter never downloads: a model with a copy to fetch is only
+        // downloaded when asked, with ctrl+d.
+        assert!(text.contains("[ctrl+d] download & enable  [ctrl+r]"), "{}", text);
+        assert!(!text.contains("[enter]"), "{}", text);
+        // While it downloads, it can be cancelled.
+        app.downloads.push(Download { model: "qwen3.8-27b".into(), list: StepList::new(), finished: false, cancelling: false });
         let text = screen(&app, 100, 24);
-        assert!(!text.contains("[ctrl+d]") && !text.contains("[enter]") && text.contains("[ctrl+r] refresh"), "{}", text);
+        assert!(!text.contains("[ctrl+d]") && !text.contains("[enter]") && text.contains("[ctrl+x] cancel download"), "{}", text);
+        assert!(text.contains("[ctrl+r] refresh"), "{}", text);
         assert!(!text.contains("Capabilities") && !text.contains("Models"), "{}", text);
     }
 
