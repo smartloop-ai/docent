@@ -389,8 +389,30 @@ install_docent() {
                  && chmod 755 "${INSTALL_DIR}/${BIN_NAME}"; }
     fi
 
-    "${INSTALL_DIR}/${BIN_NAME}" --version >/dev/null 2>&1 \
-        || error "Installation verification failed: 'docent --version' did not succeed"
+    # Put the bin directory on PATH before verifying: if verification fails
+    # for a fixable reason (a missing system library), `docent` should still
+    # be found once the user fixes it, not fail a second time with "command
+    # not found". (Windows is handled after the DLLs are copied, below.)
+    if [ "$OS" != "pc-windows-msvc" ]; then
+        say "${MUTED}Processing triggers for docent (${VERSION}) ...${NC}"
+        setup_path "$INSTALL_DIR"
+    fi
+
+    local verify_out
+    if ! verify_out="$("${INSTALL_DIR}/${BIN_NAME}" --version 2>&1)"; then
+        say "${verify_out}" >&2
+        # Name what is missing rather than leave the user to run ldd: a
+        # minimal image can lack a system library the binary links. ldd the
+        # real file, not the symlink, or $ORIGIN/lib (the bundled libraries)
+        # resolves against the bin directory and they show as missing too.
+        if [ "$OS" = "unknown-linux-gnu" ] && command -v ldd >/dev/null 2>&1; then
+            local real missing
+            real="$(readlink -f "${INSTALL_DIR}/${BIN_NAME}" 2>/dev/null || echo "${INSTALL_DIR}/${BIN_NAME}")"
+            missing="$(ldd "$real" 2>/dev/null | awk '/not found/{print $1}' | tr '\n' ' ')"
+            [ -z "$missing" ] || say "${MUTED}Missing shared libraries:${NC} ${missing}" >&2
+        fi
+        error "Installation verification failed: 'docent --version' did not succeed"
+    fi
 
     # The `smartloop` name an older install left, a link or a copy, goes.
     rm -f "${INSTALL_DIR}/${OLD_NAME}"
@@ -400,16 +422,14 @@ install_docent() {
 
     say "${GREEN}Installed${NC} ${INSTALL_DIR}/${BIN_NAME}"
 
-    say "${MUTED}Processing triggers for docent (${VERSION}) ...${NC}"
     if [ "$OS" = "pc-windows-msvc" ]; then
+        say "${MUTED}Processing triggers for docent (${VERSION}) ...${NC}"
         # No POSIX rc file to edit under MSYS/Cygwin; install.ps1 sets the real
         # Windows user PATH.
         on_path "$INSTALL_DIR" || {
             say "${MUTED}Add the following to your PATH:${NC}"
             say "  ${BOLD}${INSTALL_DIR}${NC}"
         }
-    else
-        setup_path "$INSTALL_DIR"
     fi
 
     print_banner

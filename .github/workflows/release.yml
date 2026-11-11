@@ -246,9 +246,16 @@ jobs:
           case "${{ runner.os }}" in
             Linux)
               # Found through the binary's $ORIGIN/lib RUNPATH (build.rs).
+              # libvulkan.so.1 is the Vulkan loader; libgomp.so.1 is the
+              # OpenMP runtime llama.cpp's CPU backend links. Neither is in a
+              # stock Ubuntu image, and both need only libc.
               mkdir -p "dist/${NAME}/lib"
-              for d in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib64 /usr/lib; do
-                [ -e "$d/libvulkan.so.1" ] && cp -L "$d/libvulkan.so.1" "dist/${NAME}/lib/" && break
+              for lib in libvulkan.so.1 libgomp.so.1; do
+                found=""
+                for d in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib64 /usr/lib; do
+                  [ -e "$d/$lib" ] && cp -L "$d/$lib" "dist/${NAME}/lib/" && found=1 && break
+                done
+                [ -n "$found" ] || { echo "FAIL: $lib not found on the runner" >&2; exit 1; }
               done
               ;;
             Windows)
@@ -273,9 +280,20 @@ jobs:
           esac
           case "${{ runner.os }}" in
             Linux)
-              ldd "$BIN" | grep 'libvulkan.so.1' | grep -q "$PWD/dist/${NAME}/lib/" \
-                || { echo "FAIL: bundled libvulkan.so.1 not used:"; ldd "$BIN"; exit 1; }
+              for lib in libvulkan.so.1 libgomp.so.1; do
+                ldd "$BIN" | grep "$lib" | grep -q "$PWD/dist/${NAME}/lib/" \
+                  || { echo "FAIL: bundled $lib not used:"; ldd "$BIN"; exit 1; }
+              done
               ! ldd "$BIN" | grep -q 'not found' || { ldd "$BIN"; exit 1; }
+              # fontconfig is dlopened (font-kit's source-fontconfig-dlopen),
+              # never a hard dependency: minimal images lack it.
+              ! readelf -d "$BIN" | grep -q 'libfontconfig' \
+                || { echo "FAIL: binary links libfontconfig directly"; readelf -d "$BIN"; exit 1; }
+              # The runner has dev packages installed that users don't, so
+              # ldd above can pass while the binary won't start for a user.
+              # Run it where they would: a bare Ubuntu image.
+              docker run --rm -v "$PWD/dist/${NAME}:/d:ro" ubuntu:22.04 /d/docent --version \
+                || { echo "FAIL: docent does not start on a stock ubuntu:22.04"; exit 1; }
               ;;
             macOS)
               # Users have no Homebrew prefix: system libraries only.
