@@ -1155,6 +1155,95 @@ pub fn commands(reply: &str) -> Vec<String> {
 /// Info-string languages that mark a block as shell commands to run.
 const SHELL_LANGS: [&str; 6] = ["sh", "bash", "zsh", "shell", "console", "terminal"];
 
+/// Whether `reply` holds tool-call markup a model wrote as text (see
+/// [`tool_calls_as_blocks`]).
+pub fn has_tool_call_markup(reply: &str) -> bool {
+    reply.contains(TOOL_CALL_OPEN) || control_token_at(reply).is_some()
+}
+
+/// `reply` with each tool call a model wrote as text turned into what docent
+/// runs: a fenced `bash` block for a shell call, nothing for any other.
+///
+/// Agent-trained models (MiniMax, say) answer "let me look around" with
+/// their own native call, `<tool_call>{"name": "bash", "arguments":
+/// {"command": "ls"}}</tool_call>`, wrapped in control tokens such as
+/// `]<]minimax[>[`, when no tools were offered. Docent runs the commands in
+/// a reply's shell blocks, so the call becomes one; the control tokens go.
+/// A call still streaming (no closing tag yet) is left for the next pass.
+pub fn tool_calls_as_blocks(reply: &str) -> String {
+    let text = strip_control_tokens(reply);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(open) = rest.find(TOOL_CALL_OPEN) {
+        let Some(len) = rest[open..].find(TOOL_CALL_CLOSE) else { break };
+        let close = open + len;
+        out.push_str(&rest[..open]);
+        if let Some(command) = shell_call(&rest[open + TOOL_CALL_OPEN.len()..close]) {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("```bash\n");
+            out.push_str(command.trim_end());
+            out.push_str("\n```\n");
+        }
+        rest = rest[close + TOOL_CALL_CLOSE.len()..].trim_start_matches([' ', '\t', '\n']);
+    }
+    out.push_str(rest);
+    out
+}
+
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+const TOOL_CALL_CLOSE: &str = "</tool_call>";
+
+/// Tool names that mean "run this in a shell".
+const SHELL_TOOLS: [&str; 9] = ["bash", "sh", "shell", "zsh", "terminal", "run", "run_command", "execute", "exec"];
+
+/// The command of a tool call's JSON `body` when it is a shell call:
+/// `{"name": "bash", "arguments": {"command": "..."}}`, with `arguments`
+/// as an object or a JSON string, and `cmd` or `script` for `command`.
+fn shell_call(body: &str) -> Option<String> {
+    let call: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let name = call.get("name")?.as_str()?.to_lowercase();
+    if !SHELL_TOOLS.contains(&name.as_str()) {
+        return None;
+    }
+    let args = match call.get("arguments").or_else(|| call.get("parameters"))? {
+        serde_json::Value::String(s) => serde_json::from_str(s).ok()?,
+        args => args.clone(),
+    };
+    ["command", "cmd", "script"]
+        .iter()
+        .find_map(|k| args.get(k).and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+}
+
+/// `text` without a model's control tokens: `]<]word[>[`.
+fn strip_control_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((at, len)) = control_token_at(rest) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Where the first `]<]word[>[` control token in `text` starts, and its length.
+fn control_token_at(text: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(i) = text[from..].find("]<]") {
+        let at = from + i;
+        let word = &text[at + 3..];
+        let n = word.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(word.len());
+        if word[n..].starts_with("[>[") {
+            return Some((at, 3 + n + 3));
+        }
+        from = at + 3;
+    }
+    None
+}
+
 /// Whether `block`, a fenced block's text from its opening fence, has its
 /// closing fence: not while it streams.
 pub fn block_closed(block: &str) -> bool {
@@ -2277,5 +2366,40 @@ mod tests {
     fn a_skill_is_a_file_under_docent() {
         let reply = "```sh\nmkdir -p .docent/skills/review && cat > .docent/skills/review/SKILL.md <<'EOF'\n---\nname: review\n---\nRead it.\nEOF\n```";
         assert_eq!(paths(reply), [".docent/skills/review/SKILL.md"]);
+    }
+
+    #[test]
+    fn a_shell_tool_call_written_as_text_runs_as_a_block() {
+        let reply = "Let me first explore the codebase.]<]minimax[>[<tool_call> {\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la /tmp/boxy-bird/\", \"description\": \"List the project root\"}}\n]<]minimax[>[</tool_call>\n";
+        assert!(has_tool_call_markup(reply));
+        let tidy = tool_calls_as_blocks(reply);
+        assert_eq!(tidy, "Let me first explore the codebase.\n```bash\nls -la /tmp/boxy-bird/\n```\n");
+        assert!(!has_tool_call_markup(&tidy));
+        assert_eq!(commands(&tidy), ["ls -la /tmp/boxy-bird/"]);
+    }
+
+    #[test]
+    fn a_tool_call_with_string_arguments_runs_too() {
+        let reply = "<tool_call>{\"name\": \"shell\", \"arguments\": \"{\\\"cmd\\\": \\\"cargo build\\\"}\"}</tool_call>";
+        assert_eq!(commands(&tool_calls_as_blocks(reply)), ["cargo build"]);
+    }
+
+    #[test]
+    fn a_tool_call_docent_cannot_run_is_dropped() {
+        let reply = "Reading.\n<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.rs\"}}</tool_call>\nDone.";
+        assert_eq!(tool_calls_as_blocks(reply), "Reading.\nDone.");
+    }
+
+    #[test]
+    fn a_streaming_tool_call_waits_for_its_closing_tag() {
+        let reply = "Looking.]<]minimax[>[<tool_call> {\"name\": \"bash\", \"argu";
+        assert_eq!(tool_calls_as_blocks(reply), "Looking.<tool_call> {\"name\": \"bash\", \"argu");
+    }
+
+    #[test]
+    fn text_that_only_looks_like_a_control_token_is_kept() {
+        let reply = "a[0]<]b c [>[ d";
+        assert!(!has_tool_call_markup(reply));
+        assert_eq!(tool_calls_as_blocks(reply), reply);
     }
 }
