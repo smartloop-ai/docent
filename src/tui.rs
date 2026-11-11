@@ -6165,9 +6165,9 @@ fn key_hints(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
 }
 
 /// Key hints for a panel's bottom border, padded off its corner.
-/// The model list's footer: where the selected model runs (💻 local, ☁
-/// cloud, both for a model served both ways), and the keys that apply to
-/// it.  Enter turns a model on or off, downloading a local one it needs; for
+/// The model list's footer: where the selected model runs (`local`,
+/// `cloud`, or `local/cloud` for a model served both ways), and the keys
+/// that apply to it.  Enter turns a model on or off, downloading a local one it needs; for
 /// a model served both ways and not downloaded, Enter turns on the cloud
 /// copy (paid, and said so) and ctrl+d downloads the local one.  While the
 /// selected model downloads, only refresh and close apply.
@@ -6178,8 +6178,8 @@ fn models_footer(selected: Option<&ModelRow>, downloading: bool) -> Vec<Span<'st
     let mut spans = vec![Span::raw(" ")];
     match selected {
         Some(m) => {
-            let place = if m.cloud_option { "💻 ☁" } else if m.cloud { "☁" } else { "💻" };
-            spans.push(Span::raw(place));
+            let place = if m.cloud_option { "local/cloud" } else if m.cloud { "cloud" } else { "local" };
+            spans.push(Span::styled(place, dim()));
             spans.push(Span::raw("  "));
             if downloading {
                 keys.extend([("ctrl+r", "refresh"), ("esc", "close")]);
@@ -8105,7 +8105,7 @@ mod tests {
         assert!(text.contains("› qwen3.5-2b   ✓ enabled"), "{}", text);
         assert!(text.contains("  sonnet ☁     disabled"), "{}", text);
         // The footer says where the selected model runs, and its keys.
-        assert!(text.contains("💻") && text.contains("[enter] disable  [ctrl+r] refresh"), "{}", text);
+        assert!(text.contains("local  [enter] disable  [ctrl+r] refresh"), "{}", text);
         let select = |app: &mut App, i| {
             if let Overlay::Models { selected, .. } = &mut app.overlay {
                 *selected = i;
@@ -8113,10 +8113,10 @@ mod tests {
         };
         select(&mut app, 2);
         let text = screen(&app, 100, 24);
-        assert!(text.contains("☁") && text.contains("[enter] enable  [ctrl+r]"), "a cloud model only turns on: {}", text);
+        assert!(text.contains("cloud  [enter] enable  [ctrl+r]"), "a cloud model only turns on: {}", text);
         select(&mut app, 3);
         let text = screen(&app, 100, 24);
-        assert!(text.contains("💻") && text.contains("[enter] use cloud (paid)  [ctrl+d] download"), "{}", text);
+        assert!(text.contains("local/cloud  [enter] use cloud (paid)  [ctrl+d] download"), "{}", text);
         // While it downloads, only refresh and close apply.
         app.downloads.push(Download { model: "qwen3.8-27b".into(), list: StepList::new(), finished: false });
         let text = screen(&app, 100, 24);
