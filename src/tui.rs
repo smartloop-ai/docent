@@ -1860,22 +1860,6 @@ impl App {
         });
     }
 
-    /// Turn on the cloud copy of a model served both ways, the user's pick.
-    fn use_cloud(&mut self, name: String) {
-        let Some((project, _)) = self.project.clone() else { return };
-        if self.downloads.iter().any(|d| d.model == name && !d.finished) {
-            return;
-        }
-        let id = self.downloads.len();
-        self.downloads.push(Download { model: name.clone(), list: StepList::new(), finished: false });
-        self.spawn(move |client, tx| {
-            let mut list = Remote::new(tx.clone(), move |e| AppEvent::Download(id, e));
-            crate::cloud_steps(&mut list, &client, &project, &name);
-            let _ = tx.send(AppEvent::DownloadDone(id));
-            let _ = tx.send(AppEvent::Notice(format!("Model {} enabled in the cloud", name)));
-        });
-    }
-
     fn disable_model(&mut self, name: String) {
         let Some((project, _)) = self.project.clone() else { return };
         self.spawn(move |client, tx| {
@@ -4106,10 +4090,6 @@ impl App {
                     } else {
                         format!("{} needs a sign-in; /login first", row.name)
                     }));
-                } else if row.cloud_option && !row.downloaded {
-                    // The footer names it: Enter turns on the (paid) cloud
-                    // copy; ctrl+d downloads the local one instead.
-                    self.use_cloud(row.name);
                 } else {
                     self.enable_model(row.name);
                 }
@@ -6165,32 +6145,17 @@ fn key_hints(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
 }
 
 /// Key hints for a panel's bottom border, padded off its corner.
-/// The model list's footer: where the selected model runs (`local`,
-/// `cloud`, or `local/cloud` for a model served both ways), and the keys
-/// that apply to it.  Enter turns a model on or off, downloading a local one it needs; for
-/// a model served both ways and not downloaded, Enter turns on the cloud
-/// copy (paid, and said so) and ctrl+d downloads the local one.  While the
-/// selected model downloads, only refresh and close apply.
+/// The model list's footer: the keys that apply to the selected model.
+/// Enter turns it on or off, downloading it first when it isn't (a
+/// downloaded model runs from its local copy); ctrl+d downloads it.  While
+/// it downloads, only refresh and close apply.
 fn models_footer(selected: Option<&ModelRow>, downloading: bool) -> Vec<Span<'static>> {
-    // No ↑↓ hint: the row the arrows move is plain, and the room goes to
-    // where the model runs and what Enter does to it.
     let mut keys: Vec<(&str, &str)> = Vec::new();
-    let mut spans = vec![Span::raw(" ")];
     match selected {
+        Some(_) if downloading => {}
         Some(m) => {
-            let place = if m.cloud_option { "local/cloud" } else if m.cloud { "cloud" } else { "local" };
-            spans.push(Span::styled(place, dim()));
-            spans.push(Span::raw("  "));
-            if downloading {
-                keys.extend([("ctrl+r", "refresh"), ("esc", "close")]);
-                spans.extend(key_hints(&keys));
-                spans.push(Span::raw(" "));
-                return spans;
-            }
             let enter = if m.enabled {
                 "disable"
-            } else if m.cloud_option && !m.downloaded {
-                "use cloud (paid)"
             } else if !m.cloud && !m.downloaded {
                 "download & enable"
             } else {
@@ -6204,9 +6169,7 @@ fn models_footer(selected: Option<&ModelRow>, downloading: bool) -> Vec<Span<'st
         None => keys.extend([("↑↓", "select"), ("enter", "enable/disable")]),
     }
     keys.extend([("ctrl+r", "refresh"), ("esc", "close")]);
-    spans.extend(key_hints(&keys));
-    spans.push(Span::raw(" "));
-    spans
+    bar_hints(&keys)
 }
 
 fn bar_hints(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
@@ -7139,7 +7102,6 @@ mod tests {
             enabled: true,
             cloud: false,
             local: false,
-            cloud_option: false,
             recommended: false,
         }];
         app.overlay = Overlay::Models { rows: Some(Ok(rows)), selected: 0 };
@@ -7995,7 +7957,6 @@ mod tests {
             enabled,
             cloud: false,
             local: false,
-            cloud_option: false,
             recommended,
         };
         let list = vec![
@@ -8027,7 +7988,6 @@ mod tests {
             enabled,
             cloud: false,
             local: false,
-            cloud_option: false,
             recommended,
         };
         app.apply(AppEvent::Models(Ok(vec![row("big", false, false), row("small", true, false)])));
@@ -8090,11 +8050,10 @@ mod tests {
             enabled,
             cloud: false,
             local: false,
-            cloud_option: false,
             recommended: false,
         };
         let cloud = ModelRow { cloud: true, ..model("sonnet", false, false) };
-        let both = ModelRow { local: true, cloud_option: true, ..model("qwen3.8-27b", false, false) };
+        let both = ModelRow { local: true, ..model("qwen3.8-27b", false, false) };
         app.overlay = Overlay::Models {
             rows: Some(Ok(vec![model("gemma4-e4b", false, false), model("qwen3.5-2b", true, true), cloud, both])),
             selected: 1,
@@ -8105,7 +8064,8 @@ mod tests {
         assert!(text.contains("› qwen3.5-2b   ✓ enabled"), "{}", text);
         assert!(text.contains("  sonnet ☁     disabled"), "{}", text);
         // The footer says where the selected model runs, and its keys.
-        assert!(text.contains("local  [enter] disable  [ctrl+r] refresh"), "{}", text);
+        assert!(text.contains("[enter] disable  [ctrl+r] refresh"), "{}", text);
+        assert!(!text.contains("local") && !text.contains("cloud ["), "no place in the footer: {}", text);
         let select = |app: &mut App, i| {
             if let Overlay::Models { selected, .. } = &mut app.overlay {
                 *selected = i;
@@ -8113,14 +8073,15 @@ mod tests {
         };
         select(&mut app, 2);
         let text = screen(&app, 100, 24);
-        assert!(text.contains("cloud  [enter] enable  [ctrl+r]"), "a cloud model only turns on: {}", text);
+        assert!(text.contains("[enter] enable  [ctrl+r]"), "a cloud model only turns on: {}", text);
         select(&mut app, 3);
         let text = screen(&app, 100, 24);
-        assert!(text.contains("local/cloud  [enter] use cloud (paid)  [ctrl+d] download"), "{}", text);
+        // Downloading is how a model is used: Enter downloads it too.
+        assert!(text.contains("[enter] download & enable  [ctrl+d] download"), "{}", text);
         // While it downloads, only refresh and close apply.
         app.downloads.push(Download { model: "qwen3.8-27b".into(), list: StepList::new(), finished: false });
         let text = screen(&app, 100, 24);
-        assert!(!text.contains("[ctrl+d]") && !text.contains("use cloud") && text.contains("[ctrl+r] refresh"), "{}", text);
+        assert!(!text.contains("[ctrl+d]") && !text.contains("[enter]") && text.contains("[ctrl+r] refresh"), "{}", text);
         assert!(!text.contains("Capabilities") && !text.contains("Models"), "{}", text);
     }
 
