@@ -291,9 +291,12 @@ jobs:
                 || { echo "FAIL: binary links libfontconfig directly"; readelf -d "$BIN"; exit 1; }
               # The runner has dev packages installed that users don't, so
               # ldd above can pass while the binary won't start for a user.
-              # Run it where they would: a bare Ubuntu image.
-              docker run --rm -v "$PWD/dist/${NAME}:/d:ro" ubuntu:22.04 /d/docent --version \
-                || { echo "FAIL: docent does not start on a stock ubuntu:22.04"; exit 1; }
+              # Run it where they would: a bare image of the same Ubuntu
+              # release the runner builds on (its glibc is the binary's floor:
+              # 22.04 for amd64, 24.04 for arm64).
+              IMAGE="ubuntu:$(. /etc/os-release && echo "$VERSION_ID")"
+              docker run --rm -v "$PWD/dist/${NAME}:/d:ro" "$IMAGE" /d/docent --version \
+                || { echo "FAIL: docent does not start on a stock $IMAGE"; exit 1; }
               ;;
             macOS)
               # Users have no Homebrew prefix: system libraries only.
