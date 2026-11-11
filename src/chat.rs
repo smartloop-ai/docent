@@ -103,13 +103,18 @@ impl ToolCall {
 
 /// The one tool docent offers: a shell command, run in the project folder
 /// through the same approval as a reply's fenced commands. Files are still
-/// written from the reply's text, so there's no tool for that.
+/// written from the reply's text, so there's no tool for that, and the
+/// description says so: offered only `bash`, a model asked to refactor wrote
+/// every new file through it (`cat > f <<EOF`), whole files inside one tool
+/// call's arguments. A tool call isn't streamed, so that showed nothing for
+/// minutes and ran into the answer cap, cutting the call off. Written in the
+/// reply, files stream as diffs and are written as each block ends.
 pub fn bash_tool() -> serde_json::Value {
     serde_json::json!({
         "type": "function",
         "function": {
             "name": "bash",
-            "description": "Run a shell command in the project folder and return its output (stdout+stderr, exit code). Use it to inspect the project, build, test, or run git.",
+            "description": "Run a shell command in the project folder and return its output (stdout+stderr, exit code). Use it to look around the project, build, test, or run git. Never use it to create or change files (no cat > file, heredocs, sed -i, tee, or echo >): write new files whole and change existing ones in your reply, as the instructions describe.",
             "parameters": {
                 "type": "object",
                 "properties": {
