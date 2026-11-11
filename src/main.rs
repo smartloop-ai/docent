@@ -1,4 +1,4 @@
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::process::exit;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -58,10 +58,6 @@ struct RunArgs {
     /// Session ID to resume; a fresh one is created when omitted
     #[arg(long, short)]
     session: Option<String>,
-    /// Chat line by line instead of in the full-screen app; the default
-    /// when stdin or stdout isn't a terminal
-    #[arg(long)]
-    plain: bool,
 }
 
 #[derive(Subcommand)]
@@ -98,14 +94,6 @@ pub fn is_local() -> bool {
     std::env::var("SMARTLOOP_API_URL").is_err()
 }
 
-/// Client for talking to the agent, after making sure one is up. Starts the
-/// local framework (installing it on first use) when nothing answers.
-fn agent_client() -> Client {
-    let client = Client::new();
-    framework::ensure_running(&client, &base_url(), is_local());
-    client
-}
-
 pub fn api_url() -> String {
     format!("{}/v1", base_url())
 }
@@ -138,10 +126,6 @@ fn error_message(action: &str, response: Response) -> String {
         Some(detail) => format!("Failed to {}: {} ({})", action, detail, status),
         None => format!("Failed to {}: {}", action, status),
     }
-}
-
-fn fetch_projects(client: &Client) -> Vec<serde_json::Value> {
-    try_fetch_projects(client).unwrap_or_else(|e| fail(e))
 }
 
 pub fn try_fetch_projects(client: &Client) -> Result<Vec<serde_json::Value>, String> {
@@ -191,65 +175,6 @@ pub fn try_claim_project(client: &Client, id: &str) -> Result<bool, String> {
         return Err(error_message("claim the project", response));
     }
     Ok(true)
-}
-
-/// Pick the project a `run` session chats in. The chat request has to name a
-/// project: without one the server's supervisor handles the stream itself and
-/// drops it after the first event. Offers a numbered list on a terminal,
-/// defaulting to the server's current project; non-interactive runs take the
-/// current project without asking.
-fn select_project(client: &Client) -> String {
-    let projects = fetch_projects(client);
-    if projects.is_empty() {
-        fail("No projects found; create one with /project new in `docent`".to_string());
-    }
-
-    // The project the folder syncs to, else the agent's current one.
-    let linked = std::env::current_dir()
-        .ok()
-        .map(|here| docent::root(&here))
-        .filter(|root| docent::refusal(root).is_none())
-        .and_then(|root| docent::linked(&root))
-        .map(|l| l.project);
-    let default = linked
-        .and_then(|id| projects.iter().position(|p| p["id"].as_str() == Some(id.as_str())))
-        .or_else(|| projects.iter().position(|p| p["current"].as_bool().unwrap_or_default()))
-        .unwrap_or(0);
-    let id = |i: usize| projects[i]["id"].as_str().unwrap_or_default().to_string();
-    let name = |i: usize| projects[i]["name"].as_str().unwrap_or_default();
-
-    if projects.len() == 1 || !std::io::stdin().is_terminal() {
-        eprintln!("project: {}", name(default));
-        return id(default);
-    }
-
-    for i in 0..projects.len() {
-        let marker = if i == default { " (current)" } else { "" };
-        eprintln!("  {}. {}{}", i + 1, name(i), marker);
-    }
-
-    loop {
-        eprint!("Select a project [{}]: ", default + 1);
-        let _ = std::io::stderr().flush();
-
-        let mut input = String::new();
-        if std::io::stdin()
-            .read_line(&mut input)
-            .unwrap_or_else(|e| fail(format!("Failed to read input: {}", e)))
-            == 0
-        {
-            exit(0);
-        }
-
-        let input = input.trim();
-        if input.is_empty() {
-            return id(default);
-        }
-        match input.parse::<usize>() {
-            Ok(n) if (1..=projects.len()).contains(&n) => return id(n - 1),
-            _ => eprintln!("Enter a number from 1 to {}", projects.len()),
-        }
-    }
 }
 
 /// Create an empty project and return it as the agent lists it.
@@ -951,22 +876,12 @@ fn main() {
             }
             AgentCommands::Stop => framework::stop(),
         },
-        Commands::Run(RunArgs { prompt, project, session, plain }) => {
-            let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-            if terminal && !plain {
-                // The app shows setup itself, so the agent may still be down.
-                let client = Client::new();
-                tui::run(&client, prompt, project, session);
-                return;
+        Commands::Run(RunArgs { prompt, project, session }) => {
+            if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+                fail("docent needs a terminal: run it in one, not with its input or output piped".to_string());
             }
-            // Resolved before the async runtime starts: the blocking client
-            // must not run inside it.
-            let client = agent_client();
-            let project = project.unwrap_or_else(|| select_project(&client));
-            let runtime = tokio::runtime::Runtime::new()
-                .unwrap_or_else(|e| fail(format!("Failed to start async runtime: {}", e)));
-            let chat = chat::openai_client(api_url());
-            runtime.block_on(chat::run_plain(&chat, prompt, project, session));
+            // The app shows setup itself, so the agent may still be down.
+            tui::run(&Client::new(), prompt, project, session);
         }
     }
 }
@@ -986,10 +901,10 @@ mod tests {
         assert_eq!(args.run.session.as_deref(), Some("cli-1794030663371002000-34134"));
         assert_eq!(args.run.project.as_deref(), Some("p1"));
         assert_eq!(args.run.prompt.as_deref(), Some("hello"));
-        let Some(Commands::Run(run)) = parse(&["run", "--session", "abc", "--plain"]).command else {
+        let Some(Commands::Run(run)) = parse(&["run", "--session", "abc"]).command else {
             panic!("run");
         };
-        assert_eq!((run.session.as_deref(), run.plain), (Some("abc"), true));
+        assert_eq!(run.session.as_deref(), Some("abc"));
         assert!(matches!(parse(&["agent", "status"]).command, Some(Commands::Agent { .. })));
         // Options before a subcommand belong to the chat, not to `agent`.
         assert!(Args::try_parse_from(["docent", "-s", "abc", "agent", "status"]).is_err());
