@@ -169,6 +169,8 @@ enum AppEvent {
     /// `None` when it goes on in the background, told once; its end comes
     /// later as another `Shell`.
     Shell(usize, String, Option<Ended>),
+    /// A turn's files were uploaded: their ids, for its tool rounds.
+    Uploaded(Vec<String>),
     /// A reply's script finished, or went on in the background: as
     /// `Shell`, with the project it ran for.
     Ran(usize, String, String, Option<Ended>),
@@ -1141,6 +1143,153 @@ struct Turn {
     files_dir: Option<std::path::PathBuf>,
     /// The files the agent was shown whole, which its reply may give back.
     whole: Vec<String>,
+    /// The tool calls the reply ended with, run once it's in.
+    calls: Vec<chat::ToolCall>,
+}
+
+/// What a turn sent, kept for its tool rounds: each round sends it again,
+/// with the calls and their results so far after the user's message.
+#[derive(Clone, Default)]
+struct Sent {
+    system: Option<String>,
+    message: String,
+    /// Ids of the files uploaded with it.
+    attachments: Vec<String>,
+    cwd: Option<std::path::PathBuf>,
+    files_dir: Option<std::path::PathBuf>,
+    whole: Vec<String>,
+}
+
+/// A turn's native tool calling: the reply asks for `bash` calls, they run
+/// as a reply's fenced commands do, asked about first unless auto-approve
+/// is on, and their results go back in a turn of their own so the agent
+/// goes on, for `TOOL_ROUNDS` rounds at most.
+#[derive(Default)]
+struct Tooling {
+    sent: Sent,
+    /// The assistant and tool messages of the rounds so far.
+    rounds: Vec<serde_json::Value>,
+    /// Rounds sent back so far.
+    round: u32,
+    /// The last reply's calls, waiting on their results.
+    calls: Vec<Call>,
+    /// The command whose run failed last, to tell one failing again.
+    failed: Option<String>,
+    /// Why the next round isn't sent, once it's known it won't be.
+    stop: Option<String>,
+}
+
+/// One tool call of a reply, as it runs.
+struct Call {
+    id: String,
+    /// The command it runs; none for a call that won't run.
+    command: Option<String>,
+    /// The shell run it's shown as, once started.
+    run: Option<usize>,
+    /// What goes back to the agent, once known.
+    result: Option<String>,
+    /// What the user's next prompt carries instead, should the rounds stop
+    /// here: how the run ended, as for a `!command`.
+    context: Option<String>,
+}
+
+impl Tooling {
+    /// A reply of `text` ended calling `calls`: they're kept, with the
+    /// reply as the round's assistant message. The commands to run, and
+    /// the text to show them in the reply with, as fenced commands show.
+    /// A call that can't run, of an unknown tool or with no command, has
+    /// its result at once.
+    fn called(&mut self, text: &str, calls: Vec<chat::ToolCall>) -> (Vec<String>, String) {
+        let content = if text.trim().is_empty() { serde_json::Value::Null } else { text.into() };
+        self.rounds.push(serde_json::json!({
+            "role": "assistant",
+            "content": content,
+            "tool_calls": calls.iter().map(chat::ToolCall::to_json).collect::<Vec<_>>(),
+        }));
+        let (mut commands, mut shown) = (Vec::new(), String::new());
+        self.calls = calls
+            .into_iter()
+            .map(|call| {
+                let mut c = Call { id: call.id, command: None, run: None, result: None, context: None };
+                match bash_command(&call.name, &call.arguments) {
+                    Ok((command, description)) => {
+                        let note = description.map_or_else(String::new, |d| format!("# {}\n", d.replace('\n', " ")));
+                        shown.push_str(&format!("\n\n```sh\n{}{}\n```\n", note, command));
+                        // The same command twice in one reply runs once.
+                        if commands.contains(&command) {
+                            c.result = Some("Not run: the same command as another call of this reply; see its result.".into());
+                        } else {
+                            commands.push(command.clone());
+                            c.command = Some(command);
+                        }
+                    }
+                    Err(why) => c.result = Some(why),
+                }
+                c
+            })
+            .collect();
+        (commands, shown)
+    }
+
+    /// The call waiting to run `command`, not started yet.
+    fn waiting(&mut self, command: &str) -> Option<&mut Call> {
+        self.calls.iter_mut().find(|c| c.command.as_deref() == Some(command) && c.run.is_none() && c.result.is_none())
+    }
+
+    /// Give the calls of `commands` not run, nor started, `result`.
+    fn resolve(&mut self, commands: &[String], result: &str) {
+        for command in commands {
+            while let Some(call) = self.waiting(command) {
+                call.result = Some(result.to_string());
+            }
+        }
+    }
+}
+
+/// The command a `bash` call runs, and what it says the command does; an
+/// error, for the agent, for a call of another tool or with no command.
+fn bash_command(name: &str, arguments: &str) -> Result<(String, Option<String>), String> {
+    if name != "bash" {
+        return Err(format!("Error: there's no tool named `{}`; the only tool is `bash`.", name));
+    }
+    let arguments: serde_json::Value = serde_json::from_str(arguments)
+        .map_err(|e| format!("Error: the arguments aren't valid JSON ({}); give {{\"command\": \"...\"}}.", e))?;
+    let command = arguments["command"].as_str().map(str::trim).filter(|c| !c.is_empty());
+    let Some(command) = command else {
+        return Err("Error: no `command` given; give {\"command\": \"...\"}.".to_string());
+    };
+    let description = arguments["description"].as_str().map(str::trim).filter(|d| !d.is_empty()).map(str::to_string);
+    Ok((command.to_string(), description))
+}
+
+/// What a tool call that ran gives back: how it ended, then what it
+/// printed, as a terminal shows it, its middle cut past `TOOL_KEPT`
+/// characters, as an error is at the start or the end.
+fn tool_output(output: &str, ended: Option<Ended>) -> String {
+    let status = match ended {
+        Some(Ended::Exited(code)) => format!("Exit code: {}", code),
+        Some(Ended::Killed) => "Killed by a signal".to_string(),
+        Some(Ended::Stopped) => "Stopped by the user".to_string(),
+        None => "Still running in the background; its output so far".to_string(),
+    };
+    let lines: Vec<String> =
+        output.lines().map(|l| trace_of(l).map_or_else(|| l.to_string(), |c| format!("$ {}", c))).collect();
+    let printed = lines.join("\n");
+    let printed = if printed.trim().is_empty() { "(no output)".to_string() } else { head_tail(&printed, TOOL_KEPT) };
+    format!("{}\n{}", status, printed)
+}
+
+/// `text` with its middle cut, past `n` characters: the first and last
+/// halves of `n` kept, and a note of how much went.
+fn head_tail(text: &str, n: usize) -> String {
+    let count = text.chars().count();
+    if count <= n {
+        return text.to_string();
+    }
+    let half = n / 2;
+    let head_end = text.char_indices().nth(half).map_or(text.len(), |(i, _)| i);
+    let tail_start = text.char_indices().nth(count - half).map_or(text.len(), |(i, _)| i);
+    format!("{}\n…({} characters cut)…\n{}", &text[..head_end], count - 2 * half, &text[tail_start..])
 }
 
 /// The working directory's sync to `project`, running until `stop`.
@@ -1321,6 +1470,9 @@ struct App {
     ask: Option<(std::path::PathBuf, Vec<String>)>,
     /// Allowed for the session: a reply's commands run without asking.
     always_run: bool,
+    /// The last turn's tool calling, when it works in a folder of the
+    /// user's.
+    tooling: Option<Tooling>,
     /// Rounds of fixing a reply's failed command since the user's last
     /// prompt, so a command that keeps failing doesn't go on forever.
     command_round: u32,
@@ -1407,6 +1559,7 @@ impl App {
             commands: None,
             ask: None,
             always_run: false,
+            tooling: None,
             command_round: 0,
             last_failure: None,
             hint_at: 0,
@@ -1776,19 +1929,30 @@ impl App {
             };
             self.entries.push(Entry::Warning(warning));
         }
-        self.entries.push(Entry::Reply(Reply { root: files_dir.clone(), whole: whole.clone(), ..Default::default() }));
+        let sent = Sent { system, message, attachments: Vec::new(), cwd, files_dir, whole };
+        // A turn in a folder of the user's offers the `bash` tool, and its
+        // tool rounds start over: it's a new request, not one going on.
+        self.tooling = sent.files_dir.is_some().then(|| Tooling { sent: sent.clone(), ..Default::default() });
+        self.start_turn(project, sent, files, Vec::new());
+    }
+
+    /// Stream the turn `sent`, with `files` uploaded first and the tool
+    /// `rounds` so far after its message, into a new reply.
+    fn start_turn(&mut self, project: String, sent: Sent, files: Vec<Attachment>, rounds: Vec<serde_json::Value>) {
+        self.entries.push(Entry::Reply(Reply { root: sent.files_dir.clone(), whole: sent.whole.clone(), ..Default::default() }));
         let entry = self.entries.len() - 1;
         self.scroll_back = 0;
         // Made per turn: the agent picks its port once it's up, and a new
         // one each time it restarts.
         let chat = chat::openai_client(crate::api_url());
         let (tx, session, client) = (self.tx.clone(), self.session.clone(), self.client.clone());
+        let (files_dir, whole) = (sent.files_dir.clone(), sent.whole.clone());
         let task = tokio::spawn(async move {
             let events = tx.clone();
             let mut on = move |event| {
                 let _ = events.send(AppEvent::Chat(event));
             };
-            let mut ids = Vec::new();
+            let mut ids = sent.attachments.clone();
             for file in files {
                 on(ChatEvent::Status { step: "upload".to_string(), message: format!("Uploading {}", file.name()) });
                 let client = client.clone();
@@ -1799,7 +1963,22 @@ impl App {
                     Err(e) => return drop(tx.send(AppEvent::TurnDone(Err(format!("Upload failed: {}", e))))),
                 }
             }
-            let result = chat::stream_turn(&chat, system.as_deref(), &message, &ids, &project, cwd.as_deref(), &session, &mut on).await;
+            // Kept for the turn's tool rounds, which send them again
+            // rather than uploading them again.
+            if ids.len() > sent.attachments.len() {
+                let _ = tx.send(AppEvent::Uploaded(ids.clone()));
+            }
+            let request = chat::Request {
+                system: sent.system.as_deref(),
+                message: &sent.message,
+                attachments: &ids,
+                project_id: &project,
+                cwd: sent.cwd.as_deref(),
+                session_id: &session,
+                tools: sent.files_dir.is_some(),
+                rounds: &rounds,
+            };
+            let result = chat::stream_turn(&chat, &request, &mut on).await;
             let _ = tx.send(AppEvent::TurnDone(result));
         });
         self.turn = Some(Turn {
@@ -1810,6 +1989,7 @@ impl App {
             activity: None,
             files_dir,
             whole,
+            calls: Vec::new(),
         });
         self.busy.store(true, Ordering::Relaxed);
     }
@@ -2115,6 +2295,9 @@ impl App {
                     check.command,
                     self.fix_round
                 )));
+                // The tool calls among them are dropped with them: the
+                // agent's next round would only build on broken files.
+                self.tooling = None;
                 if let Some((_, commands)) = self.commands.take() {
                     self.entries.push(Entry::Warning(format!(
                         "Not run, as the check failed: {}",
@@ -2132,7 +2315,9 @@ impl App {
     fn reply_done(&mut self, root: std::path::PathBuf, found: files::Extracted, mut whole: Vec<String>, commands: Vec<String>) {
         // Asked to make something in an empty folder, a small model may say
         // what it made without giving the files: asked once more for them.
-        if found.files.is_empty() && found.failed.is_empty() && !self.files_asked && files::is_empty_folder(&root) {
+        // One calling tools may only be looking around first.
+        let calling = self.tooling.as_ref().is_some_and(|t| !t.calls.is_empty());
+        if found.files.is_empty() && found.failed.is_empty() && !calling && !self.files_asked && files::is_empty_folder(&root) {
             self.files_asked = true;
             return self.ask_for_files();
         }
@@ -2254,7 +2439,8 @@ impl App {
     /// about, as opencode asks before a tool runs; allowed for the session
     /// already, they run at once.
     fn run_commands(&mut self) {
-        let Some((root, commands)) = self.commands.take() else { return };
+        // None waiting, the reply's tool calls that needed none may go on.
+        let Some((root, commands)) = self.commands.take() else { return self.tool_round_done() };
         if self.always_run {
             return self.run_allowed(root, commands);
         }
@@ -2273,7 +2459,12 @@ impl App {
         if !run {
             self.entries.push(Entry::Notice(format!("Skipped: {}", commands.join("; ").replace('\n', "; "))));
             self.scroll_back = 0;
-            return;
+            // A tool call skipped is answered so: the agent hears it wasn't
+            // run and goes on without it, as it can't go on with no result.
+            if let Some(tooling) = &mut self.tooling {
+                tooling.resolve(&commands, TOOL_DECLINED);
+            }
+            return self.tool_round_done();
         }
         if always {
             self.always_run = true;
@@ -2309,11 +2500,20 @@ impl App {
     fn run_allowed(&mut self, root: std::path::PathBuf, commands: Vec<String>) {
         let Some((project, _)) = self.project.clone() else { return };
         let mut runs = Vec::new();
+        let asked = commands.clone();
         for command in self.runnable(commands) {
-            let (command, background) = detached(&co_authored(&command));
-            let (id, report) = self.shell_entry(command.clone(), background);
-            runs.push((id, command, background, report));
+            let (shown, background) = detached(&co_authored(&command));
+            let (id, report) = self.shell_entry(shown.clone(), background);
+            if let Some(call) = self.tooling.as_mut().and_then(|t| t.waiting(&command)) {
+                call.run = Some(id);
+            }
+            runs.push((id, shown, background, report));
         }
+        // A call whose command was left out, for a placeholder in it.
+        if let Some(tooling) = &mut self.tooling {
+            tooling.resolve(&asked, "Not run: the command has a placeholder to fill in, such as <name>.");
+        }
+        self.tool_round_done();
         if cfg!(test) {
             return;
         }
@@ -2340,6 +2540,11 @@ impl App {
         if ids.is_empty() {
             return;
         }
+        if let Some(tooling) = &mut self.tooling {
+            for call in tooling.calls.iter_mut().filter(|c| c.run.is_some_and(|r| ids.contains(&r)) && c.result.is_none()) {
+                call.result = Some("Not run, as the command before it failed or was stopped.".to_string());
+            }
+        }
         let commands: Vec<String> = ids.iter().filter_map(|id| self.shell_of(*id).map(|s| s.command.clone())).collect();
         self.jobs.retain(|j| !ids.contains(&j.id));
         if let Overlay::Jobs { selected } = &mut self.overlay {
@@ -2352,12 +2557,16 @@ impl App {
         if !commands.is_empty() {
             self.entries.push(Entry::Notice(format!("Not run: {}", commands.join("; ").replace('\n', "; "))));
         }
+        self.tool_round_done();
     }
 
     /// A reply's script ended. Failed, the agent is asked to put it right,
     /// with other commands or with files, for a few rounds only. Done, it
     /// isn't asked anything: what was printed rides with the next prompt.
     fn ran(&mut self, id: usize, project: String, output: String, ended: Option<Ended>) {
+        if self.tooling.as_ref().is_some_and(|t| t.calls.iter().any(|c| c.run == Some(id))) {
+            return self.tool_ran(id, project, output, ended);
+        }
         let Some(context) = self.shell_reported(id, &output, ended) else { return };
         let command = self.shell_mut(id).map(|s| s.command.clone()).unwrap_or_default();
         self.shell_context.push(context);
@@ -2392,8 +2601,81 @@ impl App {
         self.send_turn(shown, message, Vec::new(), true);
     }
 
+    /// Tool call run `id` ended: its result is kept for the agent, and once
+    /// the reply's calls all have theirs, the turn goes on. Stopped by the
+    /// user, the rounds stop too, and what it printed rides with the next
+    /// prompt, as the rest is theirs to say.
+    fn tool_ran(&mut self, id: usize, project: String, output: String, ended: Option<Ended>) {
+        let context = self.shell_reported(id, &output, ended);
+        let elsewhere = self.project.as_ref().is_none_or(|(p, _)| *p != project);
+        if ended == Some(Ended::Stopped) || elsewhere {
+            self.tooling = None;
+            if !elsewhere {
+                self.shell_context.extend(context);
+            }
+            return;
+        }
+        let Some(tooling) = &mut self.tooling else { return };
+        let Some(call) = tooling.calls.iter_mut().find(|c| c.run == Some(id)) else { return };
+        call.result = Some(tool_output(&output, ended));
+        call.context = context;
+        let command = call.command.clone().unwrap_or_default();
+        if ended.is_some_and(Ended::failed) {
+            // The same command failing again won't do better a third time.
+            if tooling.failed.as_deref() == Some(command.as_str()) {
+                tooling.stop = Some(format!(
+                    "`{}` failed again, so the agent isn't asked to go on; its output is above, and goes with your next prompt",
+                    command.lines().next().unwrap_or_default()
+                ));
+            }
+            tooling.failed = Some(command);
+        } else {
+            tooling.failed = None;
+        }
+        self.tool_round_done();
+    }
+
+    /// The last reply's tool calls, once each has its result and nothing
+    /// else is going on (its files' check, a question about its commands,
+    /// another turn), go back to the agent in a turn of their own, which
+    /// carries on the same request. That's done `TOOL_ROUNDS` times at
+    /// most, and not when a command failed twice running: then the results
+    /// ride with the next prompt instead, as a `!command`'s do.
+    fn tool_round_done(&mut self) {
+        let ready = self.tooling.as_ref().is_some_and(|t| !t.calls.is_empty() && t.calls.iter().all(|c| c.result.is_some()));
+        if !ready || self.turn.is_some() || self.check.is_some() || self.ask.is_some() || self.commands.is_some() {
+            return;
+        }
+        let Some(mut tooling) = self.tooling.take() else { return };
+        let Some((project, _)) = self.project.clone() else { return };
+        let calls = std::mem::take(&mut tooling.calls);
+        let stop = tooling.stop.take().or_else(|| {
+            (tooling.round >= TOOL_ROUNDS).then(|| {
+                format!("Stopped after {} tool rounds; the output is above, and goes with your next prompt", TOOL_ROUNDS)
+            })
+        });
+        if let Some(why) = stop {
+            self.entries.push(Entry::Warning(why));
+            self.shell_context.extend(calls.into_iter().filter_map(|c| c.context));
+            self.scroll_back = 0;
+            return;
+        }
+        for call in calls {
+            tooling.rounds.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": call.result.unwrap_or_default(),
+            }));
+        }
+        tooling.round += 1;
+        let (sent, rounds) = (tooling.sent.clone(), tooling.rounds.clone());
+        self.tooling = Some(tooling);
+        self.start_turn(project, sent, Vec::new(), rounds);
+    }
+
     fn stop_turn(&mut self) {
         self.commands = None;
+        self.tooling = None;
         if let Some(turn) = self.turn.take() {
             self.busy.store(false, Ordering::Relaxed);
             turn.task.abort();
@@ -2472,7 +2754,18 @@ impl App {
                                 // The files as they were before the reply,
                                 // some of its own being written already.
                                 let found = files::extract_with(&reply.text, |p| reply.old(p));
-                                let commands = files::commands(&reply.text);
+                                let mut commands = files::commands(&reply.text);
+                                // A reply that called tools runs those: its
+                                // fenced commands, if any, only illustrate.
+                                if !turn.calls.is_empty() {
+                                    let text = reply.text.clone();
+                                    commands = Vec::new();
+                                    if let Some(tooling) = &mut self.tooling {
+                                        let (asked, shown) = tooling.called(&text, turn.calls);
+                                        commands = asked;
+                                        reply.text.push_str(&shown);
+                                    }
+                                }
                                 self.early = reply
                                     .written
                                     .iter()
@@ -2483,6 +2776,7 @@ impl App {
                                     })
                                     .collect();
                                 self.reply_done(root, found, turn.whole, commands);
+                                self.tool_round_done();
                             }
                         }
                         Err(e) => reply.ended = Some(e),
@@ -2517,6 +2811,11 @@ impl App {
             AppEvent::Check(id, output, code) => self.check_ended(id, output, code),
             AppEvent::Diagnostics(id, servers, problems) => self.diagnostics_ended(id, servers, problems),
             AppEvent::Ran(id, project, output, code) => self.ran(id, project, output, code),
+            AppEvent::Uploaded(ids) => {
+                if let Some(tooling) = &mut self.tooling {
+                    tooling.sent.attachments = ids;
+                }
+            }
             AppEvent::Unrun(ids) => self.unrun(&ids),
             AppEvent::Started(id, pid) => {
                 if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
@@ -2824,6 +3123,7 @@ impl App {
                 }
             }
             ChatEvent::Retrying(e) => reply.warnings.push(format!("Connection dropped, retrying: {}", e)),
+            ChatEvent::ToolCalls(calls) => turn.calls = calls,
         }
     }
 
@@ -3651,6 +3951,7 @@ impl App {
                 self.shell_context.clear();
                 self.commands = None;
                 self.ask = None;
+                self.tooling = None;
                 self.session = chat::new_session_id();
                 self.scroll_back = 0;
             }
@@ -5077,6 +5378,14 @@ fn selected_model(message: &str) -> Option<String> {
 const SHELL_SHOWN: usize = 20;
 /// How many times a reply's failed command is sent back to be fixed.
 const COMMAND_ROUNDS: u32 = 3;
+/// How many times a reply's tool calls go back with their results, per
+/// prompt: the agent looks around, builds and tests, a step a round.
+const TOOL_ROUNDS: u32 = 8;
+/// Characters of a tool call's output the agent gets, its start and end.
+const TOOL_KEPT: usize = 6000;
+/// A tool call's result when the user skips its command.
+const TOOL_DECLINED: &str = "The user declined to run this command, so it wasn't run. Don't run it again; go on \
+                             without it, or say what you'd need.";
 /// Characters of output the agent gets, from its end.
 const SHELL_KEPT: usize = 8000;
 
@@ -5942,6 +6251,7 @@ mod tests {
             activity: None,
             files_dir: None,
             whole: Vec::new(),
+            calls: Vec::new(),
         });
         app.chat_event(ChatEvent::Status { step: "index".into(), message: "Reading Testamento ejemplo.pdf".into() });
 
@@ -6414,6 +6724,148 @@ mod tests {
     }
 
     #[test]
+    fn a_bash_tool_call_names_its_command_or_says_why_it_cant_run() {
+        assert_eq!(bash_command("bash", r#"{"command": " ls -la ", "description": "List"}"#), Ok(("ls -la".into(), Some("List".into()))));
+        assert_eq!(bash_command("bash", r#"{"command": "pwd"}"#), Ok(("pwd".into(), None)));
+        assert!(bash_command("python", r#"{"code": "1"}"#).unwrap_err().contains("no tool named `python`"));
+        assert!(bash_command("bash", "{not json").unwrap_err().contains("aren't valid JSON"));
+        assert!(bash_command("bash", r#"{"command": ""}"#).unwrap_err().contains("no `command` given"));
+    }
+
+    #[test]
+    fn a_tool_calls_output_keeps_its_end_and_its_start() {
+        assert_eq!(tool_output("", Some(Ended::Exited(0))), "Exit code: 0\n(no output)");
+        assert_eq!(tool_output(&format!("{TRACE}make\nok"), Some(Ended::Exited(2))), "Exit code: 2\n$ make\nok");
+        assert!(tool_output("up", None).starts_with("Still running in the background"));
+        let long = format!("start{}end", "x".repeat(10_000));
+        let kept = tool_output(&long, Some(Ended::Killed));
+        assert!(kept.starts_with("Killed by a signal\nstart") && kept.ends_with("end"), "{}", &kept[..40]);
+        assert!(kept.contains(&format!("…({} characters cut)…", 10_008 - TOOL_KEPT)));
+        assert!(kept.chars().count() < TOOL_KEPT + 100);
+        assert_eq!(head_tail("héllo wörld", 4), "hé\n…(7 characters cut)…\nld");
+    }
+
+    #[test]
+    fn a_replys_tool_calls_run_as_its_commands_and_their_output_goes_back_until_it_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let sent = Sent { system: Some("sys".into()), message: "build it".into(), files_dir: Some(dir.path().to_path_buf()), ..Default::default() };
+        app.tooling = Some(Tooling { sent, ..Default::default() });
+        app.entries.push(Entry::Reply(Reply::default()));
+        app.turn = Some(Turn {
+            started: Instant::now(),
+            task: runtime.spawn(async {}),
+            entry: app.entries.len() - 1,
+            tokens: 0,
+            activity: None,
+            files_dir: Some(dir.path().to_path_buf()),
+            whole: Vec::new(),
+            calls: Vec::new(),
+        });
+        let call = |id: &str, name: &str, arguments: &str| chat::ToolCall { id: id.into(), name: name.into(), arguments: arguments.into() };
+        // A reply ends calling tools: its text, then the turn's end.
+        let reply = |app: &mut App, text: &str, calls: Vec<chat::ToolCall>| {
+            app.apply(AppEvent::Chat(ChatEvent::Content(text.into())));
+            app.apply(AppEvent::Chat(ChatEvent::ToolCalls(calls)));
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+        };
+        let key = |app: &mut App, code: KeyCode| app.key(KeyEvent::new(code, KeyModifiers::NONE));
+        let run_of = |app: &App| app.tooling.as_ref().and_then(|t| t.calls.iter().find_map(|c| c.run)).expect("a call runs");
+        let last_round = |app: &App| app.tooling.as_ref().unwrap().rounds.last().cloned().unwrap();
+
+        // A `bash` call is asked about as a fenced command is, and shows in
+        // the reply as one; another tool's is answered there and then. The
+        // fenced block in its text only illustrates, so it isn't run.
+        reply(
+            &mut app,
+            "Building first.\n\n```sh\nrm -rf /\n```\n",
+            vec![call("call_1", "bash", r#"{"command":"cargo build","description":"Build it"}"#), call("call_2", "python", "{}")],
+        );
+        assert!(matches!(app.entries.last(), Some(Entry::Ask(c)) if c == &["cargo build"]));
+        let Some(Entry::Reply(shown)) = app.entries.iter().rev().find(|e| matches!(e, Entry::Reply(_))) else { panic!() };
+        assert!(shown.text.ends_with("```sh\n# Build it\ncargo build\n```\n"), "{}", shown.text);
+        let tooling = app.tooling.as_ref().unwrap();
+        assert_eq!(tooling.rounds.len(), 1);
+        assert_eq!(tooling.rounds[0]["content"], "Building first.\n\n```sh\nrm -rf /\n```\n");
+        assert_eq!(tooling.rounds[0]["tool_calls"][1]["function"]["name"], "python");
+        assert!(tooling.calls[1].result.as_deref().is_some_and(|r| r.contains("no tool named `python`")));
+        // Run, and its output goes back in a turn of its own, the request
+        // carried on: no prompt shows for it, nor does the output wait for
+        // the next one.
+        key(&mut app, KeyCode::Enter);
+        let id = run_of(&app);
+        let entries = app.entries.len();
+        app.apply(AppEvent::Ran(id, "p1".into(), "Compiling app\nFinished".into(), Some(Ended::Exited(0))));
+        assert!(app.turn.is_some(), "the next round was sent");
+        assert!(matches!(app.entries.last(), Some(Entry::Reply(_))) && app.entries.len() == entries + 1);
+        assert!(app.shell_context.is_empty());
+        let tooling = app.tooling.as_ref().unwrap();
+        assert_eq!(tooling.round, 1);
+        assert_eq!(tooling.rounds[1], serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "Exit code: 0\nCompiling app\nFinished"}));
+        assert_eq!(tooling.rounds[2]["tool_call_id"], "call_2");
+
+        // Skipped, the agent hears so and goes on without it.
+        reply(&mut app, "", vec![call("call_3", "bash", r#"{"command":"cargo publish"}"#)]);
+        assert_eq!(app.tooling.as_ref().unwrap().rounds[3]["content"], serde_json::Value::Null);
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.entries.iter().rev().nth(1), Some(Entry::Notice(n)) if n == "Skipped: cargo publish"));
+        assert!(app.turn.is_some());
+        assert_eq!(last_round(&app)["content"], TOOL_DECLINED);
+
+        // Auto-approved, a call runs at once. The same command failing
+        // twice running stops the rounds; its output rides with the next
+        // prompt.
+        app.always_run = true;
+        reply(&mut app, "", vec![call("call_4", "bash", r#"{"command":"cargo test"}"#)]);
+        app.apply(AppEvent::Ran(run_of(&app), "p1".into(), "test failed".into(), Some(Ended::Exited(101))));
+        assert_eq!(last_round(&app)["content"], "Exit code: 101\ntest failed");
+        assert_eq!(app.tooling.as_ref().unwrap().round, 3);
+        reply(&mut app, "", vec![call("call_5", "bash", r#"{"command":"cargo test"}"#)]);
+        app.apply(AppEvent::Ran(run_of(&app), "p1".into(), "test failed".into(), Some(Ended::Exited(101))));
+        assert!(app.turn.is_none(), "no round after the same failure twice");
+        assert!(matches!(app.entries.last(), Some(Entry::Warning(w)) if w.starts_with("`cargo test` failed again")));
+        assert_eq!(app.shell_context.len(), 1);
+        assert!(app.shell_context[0].starts_with("I ran `cargo test` in the shell; it exited with 101"));
+        assert!(app.idle(), "the next prompt goes");
+
+        // A reply with no tool calls is as before: its fenced commands run.
+        app.shell_context.clear();
+        app.send_turn("go".into(), "go".into(), Vec::new(), false);
+        let entry = app.entries.len() - 1;
+        let turn = app.turn.as_mut().unwrap();
+        (turn.files_dir, turn.entry) = (Some(dir.path().to_path_buf()), entry);
+        let sent = Sent { files_dir: Some(dir.path().to_path_buf()), ..Default::default() };
+        app.tooling = Some(Tooling { sent, ..Default::default() });
+        reply(&mut app, "```sh\ngit status\n```\n", Vec::new());
+        assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "git status"));
+        assert!(app.tooling.as_ref().unwrap().calls.is_empty());
+
+        // The rounds stop at the cap, as they do after a repeated failure.
+        app.tooling.as_mut().unwrap().round = TOOL_ROUNDS;
+        app.entries.push(Entry::Reply(Reply::default()));
+        app.turn = Some(Turn {
+            started: Instant::now(),
+            task: runtime.spawn(async {}),
+            entry: app.entries.len() - 1,
+            tokens: 0,
+            activity: None,
+            files_dir: Some(dir.path().to_path_buf()),
+            whole: Vec::new(),
+            calls: Vec::new(),
+        });
+        reply(&mut app, "", vec![call("call_6", "bash", r#"{"command":"ls"}"#)]);
+        app.apply(AppEvent::Ran(run_of(&app), "p1".into(), "src".into(), Some(Ended::Exited(0))));
+        assert!(app.turn.is_none());
+        assert!(matches!(app.entries.last(), Some(Entry::Warning(w)) if w.starts_with("Stopped after 8 tool rounds")));
+        assert_eq!(app.shell_context.len(), 1);
+    }
+
+    #[test]
     fn a_replys_shell_commands_run_in_the_folder_once_its_files_pass_the_check() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
@@ -6429,6 +6881,7 @@ mod tests {
                 activity: None,
                 files_dir: Some(dir.path().to_path_buf()),
                 whole: Vec::new(),
+                calls: Vec::new(),
             });
             app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
         };
@@ -6635,6 +7088,7 @@ mod tests {
                 activity: None,
                 files_dir: Some(dir.path().to_path_buf()),
                 whole: Vec::new(),
+                calls: Vec::new(),
             });
             app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
         };
@@ -6684,6 +7138,7 @@ mod tests {
             activity: None,
             files_dir: Some(dir.path().to_path_buf()),
             whole: Vec::new(),
+            calls: Vec::new(),
         });
         app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
         // The whole file is written; the one with a comment for lines isn't.
@@ -6781,6 +7236,7 @@ mod tests {
                 activity: None,
                 files_dir: Some(dir.path().to_path_buf()),
                 whole: Vec::new(),
+                calls: Vec::new(),
             });
         };
         let chunk = |app: &mut App, text: &str| app.apply(AppEvent::Chat(ChatEvent::Content(text.into())));
@@ -7054,6 +7510,7 @@ mod tests {
             activity: Some("Reading northwind-redlines.pdf".into()),
             files_dir: None,
             whole: Vec::new(),
+            calls: Vec::new(),
         });
         app.input = "".into();
 
@@ -7408,7 +7865,7 @@ mod tests {
         // still running stops: its session is gone.
         let runtime = tokio::runtime::Runtime::new().unwrap();
         app.entries.push(Entry::Reply(Reply::default()));
-        app.turn = Some(Turn { started: Instant::now(), task: runtime.spawn(async {}), entry: app.entries.len() - 1, tokens: 0, activity: None, files_dir: None, whole: Vec::new() });
+        app.turn = Some(Turn { started: Instant::now(), task: runtime.spawn(async {}), entry: app.entries.len() - 1, tokens: 0, activity: None, files_dir: None, whole: Vec::new(), calls: Vec::new() });
         app.apply(AppEvent::SwitchProject(Project::from_json(&project("p4", "Contracts", false))));
         assert!(app.turn.is_none());
         assert_eq!(app.project, Some(("p4".into(), "Contracts".into())));
@@ -8141,6 +8598,7 @@ mod tests {
             activity: Some("Reading roadmap.pdf".into()),
             files_dir: None,
             whole: Vec::new(),
+            calls: Vec::new(),
         });
         let text = screen(&app, 80, 24);
         let rows: Vec<&str> = text.lines().collect();
