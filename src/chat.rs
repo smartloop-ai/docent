@@ -1,7 +1,6 @@
-//! Chat turns streamed from the agent's SSE endpoint, reported as events so
-//! the plain line-based chat and the TUI can each show them their own way.
+//! Chat turns streamed from the agent's SSE endpoint, reported as events for
+//! the TUI to show.
 
-use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
@@ -19,6 +18,9 @@ pub enum ChatEvent {
     Citations(Vec<Citation>),
     /// The connection dropped before any content; the turn is sent again.
     Retrying(String),
+    /// The tool calls the reply ended with, once each is whole: the turn
+    /// goes on once they've run and their results are sent back.
+    ToolCalls(Vec<ToolCall>),
 }
 
 /// A finished turn's size and time.
@@ -57,6 +59,167 @@ pub fn new_session_id() -> String {
     format!("cli-{}-{}", nanos, std::process::id())
 }
 
+/// What one chat turn sends.
+pub struct Request<'a> {
+    /// Goes as a system message ahead of `message`: the agent adds it to
+    /// its own system prompt, so instructions there are followed, where in
+    /// the user's message they'd be read as data.
+    pub system: Option<&'a str>,
+    pub message: &'a str,
+    /// Ids of files uploaded as assets, which ride along on the user's
+    /// message.
+    pub attachments: &'a [String],
+    pub project_id: &'a str,
+    pub cwd: Option<&'a std::path::Path>,
+    pub session_id: &'a str,
+    /// Offer the `bash` tool: only on a turn that works in a folder of the
+    /// user's, where its commands can run. A server that won't give tools
+    /// to the model it picked ignores it and answers in text, as before.
+    pub tools: bool,
+    /// The turn's tool rounds so far, after the user's message: each
+    /// assistant message with its `tool_calls`, then a `tool` message with
+    /// each call's result.
+    pub rounds: &'a [serde_json::Value],
+}
+
+/// A tool call the reply asked for: the call's id, which its result goes
+/// back with, the tool's name, and its arguments as the JSON text given.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+impl ToolCall {
+    /// The call as the assistant message carries it back, OpenAI-style.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "type": "function",
+            "function": {"name": self.name, "arguments": self.arguments},
+        })
+    }
+}
+
+/// The one tool docent offers: a shell command, run in the project folder
+/// through the same approval as a reply's fenced commands. Files are still
+/// written from the reply's text, so there's no tool for that, and the
+/// description says so: offered only `bash`, a model asked to refactor wrote
+/// every new file through it (`cat > f <<EOF`), whole files inside one tool
+/// call's arguments. A tool call isn't streamed, so that showed nothing for
+/// minutes and ran into the answer cap, cutting the call off. Written in the
+/// reply, files stream as diffs and are written as each block ends.
+pub fn bash_tool() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command in the project folder and return its output (stdout+stderr, exit code). Use it to look around the project, build, test, or run git. Never use it to create or change files (no cat > file, heredocs, sed -i, tee, or echo >): write new files whole and change existing ones in your reply, as the instructions describe.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The command to run"},
+                    "description": {"type": "string", "description": "What the command does, in a few words"},
+                },
+                "required": ["command"],
+            },
+        },
+    })
+}
+
+/// The tool calls of a streamed reply, put together from their deltas: a
+/// call comes in pieces by its `index`, its id and name first, then its
+/// arguments a bit at a time.
+#[derive(Debug, Default)]
+pub struct ToolCalls {
+    calls: Vec<(u64, ToolCall)>,
+}
+
+impl ToolCalls {
+    /// Add one chunk's `delta.tool_calls`.
+    pub fn push(&mut self, deltas: &serde_json::Value) {
+        let Some(deltas) = deltas.as_array() else { return };
+        for (n, delta) in deltas.iter().enumerate() {
+            // Some servers leave the index out of a lone call.
+            let index = delta["index"].as_u64().unwrap_or(n as u64);
+            let at = match self.calls.iter().position(|(i, _)| *i == index) {
+                Some(at) => at,
+                None => {
+                    self.calls.push((index, ToolCall { id: String::new(), name: String::new(), arguments: String::new() }));
+                    self.calls.len() - 1
+                }
+            };
+            let call = &mut self.calls[at].1;
+            if let Some(id) = delta["id"].as_str().filter(|id| !id.is_empty()) {
+                call.id = id.to_string();
+            }
+            // The name comes whole, once; a server repeating it in every
+            // chunk isn't giving a longer one.
+            if let Some(name) = delta["function"]["name"].as_str()
+                && !call.name.ends_with(name)
+            {
+                call.name.push_str(name);
+            }
+            if let Some(arguments) = delta["function"]["arguments"].as_str() {
+                call.arguments.push_str(arguments);
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+
+    /// The calls, in order; one the server gave no id gets one, as its
+    /// result must name it.
+    pub fn finish(mut self) -> Vec<ToolCall> {
+        self.calls.sort_by_key(|(i, _)| *i);
+        self.calls
+            .into_iter()
+            .map(|(i, mut call)| {
+                if call.id.is_empty() {
+                    call.id = format!("call_{}", i);
+                }
+                call
+            })
+            .collect()
+    }
+}
+
+/// The body of a turn's request.
+pub fn request_body(request: &Request) -> serde_json::Value {
+    // The server-side orchestrator always picks the model that actually
+    // serves the turn; "sl-mini" here just names the entry point it routes
+    // through, not a choice the caller gets to make.
+    // Files uploaded as assets ride along by id; the agent puts their
+    // contents in front of the message.
+    let mut user = serde_json::json!({"role": "user", "content": request.message});
+    if !request.attachments.is_empty() {
+        user["attachments"] = serde_json::json!(request.attachments);
+    }
+    let mut messages = Vec::new();
+    if let Some(system) = request.system {
+        messages.push(serde_json::json!({"role": "system", "content": system}));
+    }
+    messages.push(user);
+    messages.extend(request.rounds.iter().cloned());
+    let cwd = request.cwd.map(|dir| dir.to_string_lossy().into_owned());
+    let mut body = serde_json::json!({
+        "model": "sl-mini",
+        "messages": messages,
+        "session_id": request.session_id,
+        "project_id": request.project_id,
+        "cwd": cwd,
+        "stream": true,
+    });
+    if request.tools {
+        body["tools"] = serde_json::json!([bash_tool()]);
+        body["tool_choice"] = serde_json::json!("auto");
+    }
+    body
+}
+
 /// Stream one chat turn, reporting each event to `on` the moment it arrives.
 /// Returns an error message when the stream drops mid-way instead of
 /// exiting, so an interactive session can keep going after a server hiccup.
@@ -65,27 +228,16 @@ pub fn new_session_id() -> String {
 /// server (or a proxy in front of it) to drop it, which surfaces as a stream
 /// error before any content has streamed. Retry once in that case since a
 /// fresh connection usually succeeds.
-///
-/// `system`, when given, goes as a system message ahead of `message`: the
-/// agent adds it to its own system prompt, so instructions there are
-/// followed, where in the user's message they'd be read as data.
 pub async fn stream_turn(
     client: &OpenAIClient<OpenAIConfig>,
-    system: Option<&str>,
-    message: &str,
-    attachments: &[String],
-    project_id: &str,
-    cwd: Option<&std::path::Path>,
-    session_id: &str,
+    request: &Request<'_>,
     on: &mut (dyn FnMut(ChatEvent) + Send),
 ) -> Result<TurnStats, String> {
-    match stream_turn_once(client, system, message, attachments, project_id, cwd, session_id, on).await {
+    match stream_turn_once(client, request, on).await {
         Ok(stats) => Ok(stats),
-        Err((e, tokens)) if tokens == 0 => {
+        Err((e, 0)) => {
             on(ChatEvent::Retrying(e));
-            stream_turn_once(client, system, message, attachments, project_id, cwd, session_id, on)
-                .await
-                .map_err(|(e, _)| e)
+            stream_turn_once(client, request, on).await.map_err(|(e, _)| e)
         }
         Err((e, _)) => Err(e),
     }
@@ -93,36 +245,10 @@ pub async fn stream_turn(
 
 async fn stream_turn_once(
     client: &OpenAIClient<OpenAIConfig>,
-    system: Option<&str>,
-    message: &str,
-    attachments: &[String],
-    project_id: &str,
-    cwd: Option<&std::path::Path>,
-    session_id: &str,
+    request: &Request<'_>,
     on: &mut (dyn FnMut(ChatEvent) + Send),
 ) -> Result<TurnStats, (String, u64)> {
-    // The server-side orchestrator always picks the model that actually
-    // serves the turn; "sl-mini" here just names the entry point it routes
-    // through, not a choice the caller gets to make.
-    // Files uploaded as assets ride along by id; the agent puts their
-    // contents in front of the message.
-    let mut user = serde_json::json!({"role": "user", "content": message});
-    if !attachments.is_empty() {
-        user["attachments"] = serde_json::json!(attachments);
-    }
-    let cwd = cwd.map(|dir| dir.to_string_lossy().into_owned());
-    let body = serde_json::json!({
-        "model": "sl-mini",
-        "messages": system.map_or_else(
-            || vec![user.clone()],
-            |system| vec![serde_json::json!({"role": "system", "content": system}), user.clone()],
-        ),
-        "session_id": session_id,
-        "project_id": project_id,
-        "cwd": cwd,
-        "stream": true,
-    });
-
+    let body = request_body(request);
     let started = Instant::now();
     let mut stream = client
         .chat()
@@ -130,15 +256,25 @@ async fn stream_turn_once(
         .await
         .map_err(|e| (format!("Failed to run: {}", e), 0))?;
 
-    let mut tokens: u64 = 0;
+    // `shown` counts what went to `on`: a drop before any of it is retried.
+    // Tool calls go to `on` only once whole, so their chunks aren't shown,
+    // though they count in the turn's size.
+    let (mut tokens, mut shown): (u64, u64) = (0, 0);
+    let mut calls = ToolCalls::default();
     while let Some(event) = stream.next().await {
-        let event = event.map_err(|e| (format!("Failed to read stream: {}", e), tokens))?;
+        let event = event.map_err(|e| (format!("Failed to read stream: {}", e), shown))?;
 
         match event["object"].as_str() {
             Some("chat.completion.chunk") => {
-                if let Some(content) = event["choices"][0]["delta"]["content"].as_str() {
+                let delta = &event["choices"][0]["delta"];
+                if let Some(content) = delta["content"].as_str() {
                     tokens += 1;
+                    shown += 1;
                     on(ChatEvent::Content(content.to_string()));
+                }
+                if delta["tool_calls"].is_array() {
+                    tokens += 1;
+                    calls.push(&delta["tool_calls"]);
                 }
                 if event["choices"][0]["finish_reason"].is_string() {
                     break;
@@ -159,6 +295,11 @@ async fn stream_turn_once(
             },
             _ => {}
         }
+    }
+    // Ended with `finish_reason: "tool_calls"`, or with calls seen whatever
+    // the reason given: the reply waits on their results.
+    if !calls.is_empty() {
+        on(ChatEvent::ToolCalls(calls.finish()));
     }
 
     Ok(TurnStats { tokens, elapsed: started.elapsed() })
@@ -356,154 +497,6 @@ pub fn in_hidden_folder(path: &str) -> bool {
         .is_some_and(|(dirs, _)| dirs.split('/').any(|d| d.len() > 1 && d.starts_with('.') && d != ".."))
 }
 
-/// ANSI color for a `chat.status` step name, grouped by what the step is
-/// doing rather than its exact label (the server's step vocabulary isn't a
-/// fixed contract, so unrecognized steps still get a sensible default).
-fn step_color(step: &str) -> &'static str {
-    match step {
-        "tools" | "web_search" | "explore" => "\x1b[36m", // cyan
-        "plan" => "\x1b[35m",                             // magenta
-        "model" => "\x1b[33m",                            // yellow
-        "preparing" | "streaming" => "\x1b[32m",          // green
-        "error" => "\x1b[31m",                            // red
-        _ => "\x1b[34m",                                  // blue
-    }
-}
-
-/// Print a `[step] message` progress line on stderr, coloring the step tag
-/// when stderr is a terminal and leaving plain text otherwise (piped output,
-/// redirected logs).
-fn print_status(step: &str, message: &str) {
-    if std::io::stderr().is_terminal() {
-        eprintln!(
-            "\x1b[2m[\x1b[0m{}{}\x1b[0m\x1b[2m]\x1b[0m {}",
-            step_color(step),
-            step,
-            message
-        );
-    } else {
-        eprintln!("[{}] {}", step, message);
-    }
-}
-
-/// Print the answer's sources under it as a numbered "References" list. On
-/// stdout, like the answer, so piping a reply keeps its sources.
-fn print_citations(out: &mut impl Write, citations: &[Citation], project_id: &str) {
-    let labels: Vec<String> = references(citations, Some(project_id)).into_iter().map(|r| r.label).collect();
-    if labels.is_empty() {
-        return;
-    }
-
-    let styled = std::io::stdout().is_terminal();
-    let (dim, reset) = if styled { ("\x1b[2m", "\x1b[0m") } else { ("", "") };
-    let _ = writeln!(out, "\n{}References{}", dim, reset);
-    for (i, label) in labels.iter().enumerate() {
-        let _ = writeln!(out, "{}[{}]{} {}", dim, i + 1, reset, label);
-    }
-    let _ = out.flush();
-}
-
-/// One turn printed line by line: the answer on stdout as it streams,
-/// status lines on stderr so they don't corrupt it, then its sources and a
-/// token/throughput summary.
-async fn print_turn(
-    client: &OpenAIClient<OpenAIConfig>,
-    message: &str,
-    project_id: &str,
-    session_id: &str,
-) -> Result<(), String> {
-    // Whether the answer so far ends in a newline. A status line printed
-    // mid-answer (e.g. "[streaming] Response complete" right after the last
-    // token) must start on its own line rather than trail the text.
-    let mut at_line_start = true;
-    let mut citations: Vec<Citation> = Vec::new();
-    let mut on = |event: ChatEvent| {
-        let mut out = std::io::stdout().lock();
-        match event {
-            ChatEvent::Content(content) => {
-                let _ = out.write_all(content.as_bytes());
-                let _ = out.flush();
-                if !content.is_empty() {
-                    at_line_start = content.ends_with('\n');
-                }
-            }
-            ChatEvent::Citations(list) => citations = list,
-            ChatEvent::Status { step, message } => {
-                if !at_line_start {
-                    let _ = writeln!(out);
-                    let _ = out.flush();
-                    at_line_start = true;
-                }
-                print_status(&step, &message);
-            }
-            ChatEvent::Retrying(e) => print_status("error", &format!("connection dropped, retrying: {}", e)),
-        }
-    };
-    let cwd = turn_dir(project_id);
-    let stats = stream_turn(client, None, message, &[], project_id, cwd.as_deref(), session_id, &mut on).await?;
-
-    let mut out = std::io::stdout().lock();
-    if !at_line_start {
-        let _ = writeln!(out);
-    }
-    print_citations(&mut out, &citations, project_id);
-    print_status("stats", &stats.summary());
-    Ok(())
-}
-
-/// Line-based chat with the local agent, for pipes and `--plain`: answer a
-/// first prompt, then keep reading new ones from stdin until EOF, `/quit`,
-/// or `exit`.
-pub async fn run_plain(
-    client: &OpenAIClient<OpenAIConfig>,
-    first_prompt: Option<String>,
-    project_id: String,
-    session: Option<String>,
-) {
-    let session_id = session.unwrap_or_else(new_session_id);
-    eprintln!("session: {}", session_id);
-
-    let stdin = std::io::stdin();
-    let report = |result: Result<(), String>| {
-        if let Err(e) = result {
-            if std::io::stdin().is_terminal() {
-                eprintln!("{}", e);
-            } else {
-                crate::fail(e);
-            }
-        }
-    };
-
-    if let Some(prompt) = first_prompt.filter(|p| !p.trim().is_empty()) {
-        println!("> {}", prompt);
-        report(print_turn(client, &prompt, &project_id, &session_id).await);
-    }
-
-    loop {
-        print!("> ");
-        let _ = std::io::stdout().flush();
-
-        let mut input = String::new();
-        if stdin
-            .read_line(&mut input)
-            .unwrap_or_else(|e| crate::fail(format!("Failed to read input: {}", e)))
-            == 0
-        {
-            break;
-        }
-
-        let input = input.trim();
-        if input.is_empty() {
-            continue;
-        }
-        if matches!(input, "/quit" | "/exit" | "/q" | "exit" | "Exit") {
-            break;
-        }
-
-        report(print_turn(client, input, &project_id, &session_id).await);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +526,70 @@ mod tests {
         // that's another project's.
         assert_eq!(making_dir_in("p2", elsewhere.path(), None), Some(elsewhere.path().to_path_buf()));
         assert_eq!(making_dir_in("p2", folder.path(), None), None);
+    }
+
+    #[test]
+    fn tool_calls_are_put_together_from_their_deltas() {
+        let mut calls = ToolCalls::default();
+        assert!(calls.is_empty());
+        let chunks = [
+            serde_json::json!([{"index": 0, "id": "call_a", "type": "function", "function": {"name": "bash", "arguments": ""}}]),
+            serde_json::json!([{"index": 0, "function": {"arguments": "{\"comm"}}]),
+            serde_json::json!([{"index": 1, "id": "call_b", "function": {"name": "ba"}}, {"index": 0, "function": {"arguments": "and\": \"ls\"}"}}]),
+            serde_json::json!([{"index": 1, "function": {"name": "sh", "arguments": "{\"command\":\"pwd\"}"}}]),
+            // A server repeating the name in every chunk.
+            serde_json::json!([{"index": 1, "function": {"name": "bash"}}]),
+        ];
+        for chunk in &chunks {
+            calls.push(chunk);
+        }
+        assert_eq!(
+            calls.finish(),
+            [
+                ToolCall { id: "call_a".into(), name: "bash".into(), arguments: r#"{"command": "ls"}"#.into() },
+                ToolCall { id: "call_b".into(), name: "bash".into(), arguments: r#"{"command":"pwd"}"#.into() },
+            ]
+        );
+        // One with no index or id still gets an id for its result.
+        let mut calls = ToolCalls::default();
+        calls.push(&serde_json::json!([{"function": {"name": "bash", "arguments": "{}"}}]));
+        assert_eq!(calls.finish()[0].id, "call_0");
+    }
+
+    #[test]
+    fn tools_are_offered_on_making_turns_with_their_rounds_after_the_users_message() {
+        let call = ToolCall { id: "call_1".into(), name: "bash".into(), arguments: r#"{"command":"ls"}"#.into() };
+        let rounds = vec![
+            serde_json::json!({"role": "assistant", "content": null, "tool_calls": [call.to_json()]}),
+            serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "Exit code: 0\nsrc"}),
+        ];
+        let request = Request {
+            system: Some("sys"),
+            message: "list it",
+            attachments: &[],
+            project_id: "p1",
+            cwd: None,
+            session_id: "s1",
+            tools: true,
+            rounds: &rounds,
+        };
+        let body = request_body(&request);
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "bash");
+        assert_eq!(body["tools"][0]["function"]["parameters"]["required"], serde_json::json!(["command"]));
+        let roles: Vec<&str> = body["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "tool"]);
+        assert_eq!(
+            body["messages"][2]["tool_calls"][0],
+            serde_json::json!({"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}})
+        );
+        assert_eq!(body["messages"][3]["tool_call_id"], "call_1");
+
+        // A turn that isn't making files offers none, and is as before.
+        let plain = request_body(&Request { system: None, tools: false, rounds: &[], attachments: &["a1".into()], ..request });
+        assert!(plain.get("tools").is_none() && plain.get("tool_choice").is_none());
+        assert_eq!(plain["messages"], serde_json::json!([{"role": "user", "content": "list it", "attachments": ["a1"]}]));
     }
 
     #[test]

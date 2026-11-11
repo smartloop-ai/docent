@@ -236,22 +236,10 @@ Options:
 ```sh
 docent run --project <project-id>   # chat in this project
 docent run --session <session-id>   # resume an existing session; a new one is created when omitted
-docent run --plain                  # line-by-line chat instead of the full-screen app
 ```
 
-When stdin or stdout isn't a terminal, or with `--plain`, `run` chats line by
-line instead: without `--project` it lists your projects and asks which one to
-chat in (press Enter for the current one), then keeps reading prompts from
-stdin until EOF, `/quit`, `/exit`, `/q`, or `exit`. The response streams token
-by token on stdout, and the agent's progress is printed on stderr as
-`[step] message` lines, so it doesn't interleave with the answer. When the
-answer draws on documents or web pages, the sources it used follow it on
-stdout as a numbered list:
-
-```
-References
-[1] https://releases.rs/
-```
+`docent` runs in a terminal only: with its input or output piped, it says so
+and stops.
 
 ### Keep a project in sync
 

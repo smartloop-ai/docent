@@ -1,4 +1,4 @@
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::process::exit;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -58,10 +58,6 @@ struct RunArgs {
     /// Session ID to resume; a fresh one is created when omitted
     #[arg(long, short)]
     session: Option<String>,
-    /// Chat line by line instead of in the full-screen app; the default
-    /// when stdin or stdout isn't a terminal
-    #[arg(long)]
-    plain: bool,
 }
 
 #[derive(Subcommand)]
@@ -98,14 +94,6 @@ pub fn is_local() -> bool {
     std::env::var("SMARTLOOP_API_URL").is_err()
 }
 
-/// Client for talking to the agent, after making sure one is up. Starts the
-/// local framework (installing it on first use) when nothing answers.
-fn agent_client() -> Client {
-    let client = Client::new();
-    framework::ensure_running(&client, &base_url(), is_local());
-    client
-}
-
 pub fn api_url() -> String {
     format!("{}/v1", base_url())
 }
@@ -138,10 +126,6 @@ fn error_message(action: &str, response: Response) -> String {
         Some(detail) => format!("Failed to {}: {} ({})", action, detail, status),
         None => format!("Failed to {}: {}", action, status),
     }
-}
-
-fn fetch_projects(client: &Client) -> Vec<serde_json::Value> {
-    try_fetch_projects(client).unwrap_or_else(|e| fail(e))
 }
 
 pub fn try_fetch_projects(client: &Client) -> Result<Vec<serde_json::Value>, String> {
@@ -191,58 +175,6 @@ pub fn try_claim_project(client: &Client, id: &str) -> Result<bool, String> {
         return Err(error_message("claim the project", response));
     }
     Ok(true)
-}
-
-/// Pick the project a `run` session chats in. The chat request has to name a
-/// project: without one the server's supervisor handles the stream itself and
-/// drops it after the first event. Offers a numbered list on a terminal,
-/// defaulting to the server's current project; non-interactive runs take the
-/// current project without asking.
-fn select_project(client: &Client) -> String {
-    let projects = fetch_projects(client);
-    if projects.is_empty() {
-        fail("No projects found; create one with /project new in `docent`".to_string());
-    }
-
-    let default = projects
-        .iter()
-        .position(|p| p["current"].as_bool().unwrap_or_default())
-        .unwrap_or(0);
-    let id = |i: usize| projects[i]["id"].as_str().unwrap_or_default().to_string();
-    let name = |i: usize| projects[i]["name"].as_str().unwrap_or_default();
-
-    if projects.len() == 1 || !std::io::stdin().is_terminal() {
-        eprintln!("project: {}", name(default));
-        return id(default);
-    }
-
-    for i in 0..projects.len() {
-        let marker = if i == default { " (current)" } else { "" };
-        eprintln!("  {}. {}{}", i + 1, name(i), marker);
-    }
-
-    loop {
-        eprint!("Select a project [{}]: ", default + 1);
-        let _ = std::io::stderr().flush();
-
-        let mut input = String::new();
-        if std::io::stdin()
-            .read_line(&mut input)
-            .unwrap_or_else(|e| fail(format!("Failed to read input: {}", e)))
-            == 0
-        {
-            exit(0);
-        }
-
-        let input = input.trim();
-        if input.is_empty() {
-            return id(default);
-        }
-        match input.parse::<usize>() {
-            Ok(n) if (1..=projects.len()).contains(&n) => return id(n - 1),
-            _ => eprintln!("Enter a number from 1 to {}", projects.len()),
-        }
-    }
 }
 
 /// Create an empty project and return it as the agent lists it.
@@ -491,6 +423,8 @@ pub struct ModelRow {
     pub enabled: bool,
     /// A cloud (remote) model: nothing to download, only on or off.
     pub cloud: bool,
+    /// The model has a local copy to download (the agent's `local` flag).
+    pub local: bool,
     /// Light enough for this machine, as the agent judges by its RAM.
     pub recommended: bool,
 }
@@ -504,28 +438,38 @@ pub fn model_rows(client: &Client, project_id: &str) -> Result<Vec<ModelRow>, St
         .as_array()
         .cloned()
         .unwrap_or_default()
-        .into_iter()
-        .map(|model| {
-            let name = model["name"].as_str().unwrap_or_default().to_string();
-            let entry = state.get(&name);
-            let flag = |key: &str| entry.and_then(|m| m[key].as_bool()).unwrap_or_default();
-            ModelRow {
-                capabilities: model["capabilities"]
-                    .as_array()
-                    .map(|c| c.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
-                    .unwrap_or_default(),
-                overridden: model["capabilities_overridden"].as_bool().unwrap_or_default(),
-                context: model["context_length"].as_u64().filter(|n| *n > 0),
-                access: model["access_level"].as_str().unwrap_or_default().to_string(),
-                accessible: model["is_accessible"].as_bool() != Some(false),
-                downloaded: flag("downloaded"),
-                enabled: flag("enabled"),
-                cloud: model["type"].as_str() == Some("remote"),
-                recommended: model["recommended"].as_bool().unwrap_or_default(),
-                name,
-            }
-        })
+        .iter()
+        .map(|model| model_row(model, state.get(model["name"].as_str().unwrap_or_default())))
         .collect())
+}
+
+/// One catalog `model` as a row, with the project's `entry` for it.
+pub fn model_row(model: &serde_json::Value, entry: Option<&serde_json::Value>) -> ModelRow {
+    let name = model["name"].as_str().unwrap_or_default().to_string();
+    let flag = |key: &str| entry.and_then(|m| m[key].as_bool()).unwrap_or_default();
+    let local = model["local"].as_bool().unwrap_or_default();
+    let remote = model["type"].as_str() == Some("remote");
+    ModelRow {
+        capabilities: model["capabilities"]
+            .as_array()
+            .map(|c| c.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default(),
+        overridden: model["capabilities_overridden"].as_bool().unwrap_or_default(),
+        context: model["context_length"].as_u64().filter(|n| *n > 0),
+        access: model["access_level"].as_str().unwrap_or_default().to_string(),
+        accessible: model["is_accessible"].as_bool() != Some(false),
+        // Registered to run in the cloud, a model with a local copy hasn't
+        // been downloaded: that copy is what ctrl+d fetches.
+        downloaded: flag("downloaded") && !(local && remote),
+        enabled: flag("enabled"),
+        // Runs in the cloud: a cloud-only model, or one served both ways that
+        // is on in the cloud.  A both-ways model registered there but off
+        // reads as a local one still to download.
+        cloud: remote && (!local || flag("enabled")),
+        local,
+        recommended: model["recommended"].as_bool().unwrap_or_default(),
+        name,
+    }
 }
 
 /// Set a model's capabilities here, over the catalog's, for routing: an
@@ -695,11 +639,20 @@ pub fn enable_steps(list: &mut dyn Steps, client: &Client, project_id: &str, nam
     let download = list.add(&format!("Download {}", name));
     let enable = list.add("Enable for project");
 
-    let downloaded = project_model_state(client, project_id)
-        .unwrap_or_else(|e| list.fail(download, e))
-        .get(name)
-        .and_then(|m| m["downloaded"].as_bool())
-        .unwrap_or_default();
+    // A model with a local copy that is registered to run in the cloud
+    // reads as downloaded (a cloud model has nothing to fetch), but it's the
+    // local copy that gets enabled: `/v1/init` switches it back and fetches
+    // it, so docent never turns a paid cloud model on in its place.
+    let needs_local = request_json(client, format!("{}/models", api_url()), "list models")
+        .ok()
+        .and_then(|catalog| catalog.as_array().and_then(|rows| rows.iter().find(|m| m["name"] == name).cloned()))
+        .is_some_and(|row| row["local"].as_bool() == Some(true) && row["type"].as_str() == Some("remote"));
+    let downloaded = !needs_local
+        && project_model_state(client, project_id)
+            .unwrap_or_else(|e| list.fail(download, e))
+            .get(name)
+            .and_then(|m| m["downloaded"].as_bool())
+            .unwrap_or_default();
     if downloaded {
         list.set_detail(download, "downloaded");
         list.done(download);
@@ -944,22 +897,12 @@ fn main() {
             }
             AgentCommands::Stop => framework::stop(),
         },
-        Commands::Run(RunArgs { prompt, project, session, plain }) => {
-            let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-            if terminal && !plain {
-                // The app shows setup itself, so the agent may still be down.
-                let client = Client::new();
-                tui::run(&client, prompt, project, session);
-                return;
+        Commands::Run(RunArgs { prompt, project, session }) => {
+            if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+                fail("docent needs a terminal: run it in one, not with its input or output piped".to_string());
             }
-            // Resolved before the async runtime starts: the blocking client
-            // must not run inside it.
-            let client = agent_client();
-            let project = project.unwrap_or_else(|| select_project(&client));
-            let runtime = tokio::runtime::Runtime::new()
-                .unwrap_or_else(|e| fail(format!("Failed to start async runtime: {}", e)));
-            let chat = chat::openai_client(api_url());
-            runtime.block_on(chat::run_plain(&chat, prompt, project, session));
+            // The app shows setup itself, so the agent may still be down.
+            tui::run(&Client::new(), prompt, project, session);
         }
     }
 }
@@ -979,10 +922,10 @@ mod tests {
         assert_eq!(args.run.session.as_deref(), Some("cli-1794030663371002000-34134"));
         assert_eq!(args.run.project.as_deref(), Some("p1"));
         assert_eq!(args.run.prompt.as_deref(), Some("hello"));
-        let Some(Commands::Run(run)) = parse(&["run", "--session", "abc", "--plain"]).command else {
+        let Some(Commands::Run(run)) = parse(&["run", "--session", "abc"]).command else {
             panic!("run");
         };
-        assert_eq!((run.session.as_deref(), run.plain), (Some("abc"), true));
+        assert_eq!(run.session.as_deref(), Some("abc"));
         assert!(matches!(parse(&["agent", "status"]).command, Some(Commands::Agent { .. })));
         // Options before a subcommand belong to the chat, not to `agent`.
         assert!(Args::try_parse_from(["docent", "-s", "abc", "agent", "status"]).is_err());
@@ -1029,5 +972,34 @@ mod tests {
         for row in super::BANNER {
             assert!(install.contains(row), "install.sh is missing {:?}", row);
         }
+    }
+
+    #[test]
+    fn a_model_served_both_ways_is_a_local_download_even_if_registered_as_cloud() {
+        let model = serde_json::json!({"name": "qwen3.8-27b", "type": "remote", "cloud": true, "local": true});
+        let registered = serde_json::json!({"downloaded": true, "enabled": false});
+        let row = model_row(&model, Some(&registered));
+        assert!(row.local);
+        assert!(!row.cloud, "off in the cloud, it reads as a local model");
+        assert!(!row.downloaded, "the local copy is still to fetch");
+
+        // Turned on in the cloud, it runs there.
+        let on = serde_json::json!({"downloaded": true, "enabled": true});
+        let row = model_row(&model, Some(&on));
+        assert!(row.cloud && row.enabled && !row.downloaded);
+    }
+
+    #[test]
+    fn a_cloud_only_model_stays_cloud() {
+        let model = serde_json::json!({"name": "minimax-m3", "type": "remote"});
+        let row = model_row(&model, Some(&serde_json::json!({"downloaded": true})));
+        assert!(row.cloud && !row.local && row.downloaded);
+    }
+
+    #[test]
+    fn an_agent_without_the_local_flag_reads_as_before() {
+        let model = serde_json::json!({"name": "gemma4-e2b", "type": "local"});
+        let row = model_row(&model, Some(&serde_json::json!({"downloaded": true, "enabled": true})));
+        assert!(!row.cloud && !row.local && row.downloaded && row.enabled);
     }
 }
