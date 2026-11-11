@@ -1860,6 +1860,22 @@ impl App {
         });
     }
 
+    /// Turn on the cloud copy of a model served both ways, the user's pick.
+    fn use_cloud(&mut self, name: String) {
+        let Some((project, _)) = self.project.clone() else { return };
+        if self.downloads.iter().any(|d| d.model == name && !d.finished) {
+            return;
+        }
+        let id = self.downloads.len();
+        self.downloads.push(Download { model: name.clone(), list: StepList::new(), finished: false });
+        self.spawn(move |client, tx| {
+            let mut list = Remote::new(tx.clone(), move |e| AppEvent::Download(id, e));
+            crate::cloud_steps(&mut list, &client, &project, &name);
+            let _ = tx.send(AppEvent::DownloadDone(id));
+            let _ = tx.send(AppEvent::Notice(format!("Model {} enabled in the cloud", name)));
+        });
+    }
+
     fn disable_model(&mut self, name: String) {
         let Some((project, _)) = self.project.clone() else { return };
         self.spawn(move |client, tx| {
@@ -4085,7 +4101,21 @@ impl App {
                     } else {
                         format!("{} needs a sign-in; /login first", row.name)
                     }));
+                } else if row.cloud_option && !row.downloaded {
+                    // The footer names it: Enter turns on the (paid) cloud
+                    // copy; ctrl+d downloads the local one instead.
+                    self.use_cloud(row.name);
                 } else {
+                    self.enable_model(row.name);
+                }
+            }
+            KeyCode::Char('d') if ctrl => {
+                // Download the local copy (and enable it).  Only a model
+                // with one, not yet downloaded.
+                if let Some(row) = rows.as_ref().and_then(|r| r.as_ref().ok()).and_then(|r| r.get(*selected)).cloned()
+                    && row.local
+                    && !row.downloaded
+                {
                     self.enable_model(row.name);
                 }
             }
@@ -4903,20 +4933,18 @@ impl App {
     /// The project's models as a list, like Claude Code's model picker:
     /// the selected one marked, each with its state and what it can do.
     fn draw_models(&self, frame: &mut Frame, area: Rect, rows: &Option<Result<Vec<ModelRow>, String>>, selected: usize) {
-        // Enter downloads a local model that isn't downloaded yet; anything
-        // else it turns on or off.  Only a local model is ever downloaded.
-        let enter = match rows {
-            Some(Ok(list)) if list.get(selected).is_some_and(|m| !m.cloud && !m.downloaded && !m.enabled) => "download",
-            _ => "enable/disable",
-        };
-        let block = panel(&bar_hints(&[("↑↓", "select"), ("enter", enter), ("ctrl+r", "refresh"), ("esc", "close")]));
+        let block = panel(&models_footer(match rows {
+            Some(Ok(list)) => list.get(selected),
+            _ => None,
+        }));
         frame.render_widget(Clear, area);
         let list = match rows {
             None => return frame.render_widget(Paragraph::new(format!(" Loading models {}", self.spinner())).block(block), area),
             Some(Err(e)) => return frame.render_widget(Paragraph::new(e.clone()).block(block).wrap(Wrap { trim: false }), area),
             Some(Ok(list)) => list,
         };
-        let name_width = list.iter().map(|m| m.name.chars().count()).max().unwrap_or(0) + 2;
+        let label = |m: &ModelRow| if m.cloud { format!("{} ☁", m.name) } else { m.name.clone() };
+        let name_width = list.iter().map(|m| label(m).chars().count()).max().unwrap_or(0) + 2;
         let lines: Vec<Line> = list
             .iter()
             .enumerate()
@@ -4925,12 +4953,9 @@ impl App {
                 let mut spans = vec![
                     Span::styled(if chosen { "› " } else { "  " }, Style::new().fg(pink()).bold()),
                     Span::styled(
-                        format!("{:<w$}", m.name, w = name_width),
+                        format!("{:<w$}", label(m), w = name_width),
                         if chosen { Style::new().fg(pink()).bold() } else { Style::new() },
                     ),
-                    // Where it runs: a local model downloads and runs here, a
-                    // cloud one (paid) is only turned on or off.
-                    Span::styled(if m.cloud { "cloud  " } else { "local  " }, dim()),
                 ];
                 let downloading = self.downloads.iter().find(|d| d.model == m.name && !d.finished);
                 let state = match downloading.and_then(|d| d.list.active()) {
@@ -4941,11 +4966,11 @@ impl App {
                     None if m.enabled => Span::styled("✓ enabled", Style::new().fg(Color::Green)),
                     None if m.cloud || !m.accessible => Span::styled("disabled", dim()),
                     None if m.downloaded => Span::styled("downloaded", dim()),
-                    None => Span::styled("↓ download", Style::new().fg(Color::Cyan)),
+                    None => Span::styled("↓ not downloaded", dim()),
                 };
                 let state_width = state.width();
                 spans.push(state);
-                spans.push(Span::raw(" ".repeat(16usize.saturating_sub(state_width))));
+                spans.push(Span::raw(" ".repeat(18usize.saturating_sub(state_width))));
                 spans.push(Span::styled(m.capabilities.clone(), dim()));
                 if m.overridden {
                     spans.push(Span::styled(" · set here", dim()));
@@ -6133,6 +6158,43 @@ fn key_hints(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
 }
 
 /// Key hints for a panel's bottom border, padded off its corner.
+/// The model list's footer: where the selected model runs, and the keys
+/// that apply to it.  Enter turns a model on or off, downloading a local
+/// one it needs; for a model served both ways and not downloaded, Enter
+/// turns on the cloud copy (paid, and said so) and ctrl+d downloads the
+/// local one.
+fn models_footer(selected: Option<&ModelRow>) -> Vec<Span<'static>> {
+    // No ↑↓ hint: the row the arrows move is plain, and the room goes to
+    // where the model runs and what Enter does to it.
+    let mut keys: Vec<(&str, &str)> = Vec::new();
+    let mut spans = vec![Span::raw(" ")];
+    match selected {
+        Some(m) => {
+            let place = if m.cloud_option { "local · cloud" } else if m.cloud { "cloud" } else { "local" };
+            spans.push(Span::styled(place, Style::new().fg(if m.cloud { Color::Blue } else { Color::Green })));
+            spans.push(Span::raw("  "));
+            let enter = if m.enabled {
+                "disable"
+            } else if m.cloud_option && !m.downloaded {
+                "use cloud (paid)"
+            } else if !m.cloud && !m.downloaded {
+                "download & enable"
+            } else {
+                "enable"
+            };
+            keys.push(("enter", enter));
+            if m.local && !m.downloaded {
+                keys.push(("ctrl+d", "download"));
+            }
+        }
+        None => keys.extend([("↑↓", "select"), ("enter", "enable/disable")]),
+    }
+    keys.extend([("ctrl+r", "refresh"), ("esc", "close")]);
+    spans.extend(key_hints(&keys));
+    spans.push(Span::raw(" "));
+    spans
+}
+
 fn bar_hints(keys: &[(&str, &str)]) -> Vec<Span<'static>> {
     let mut spans = vec![Span::raw(" ")];
     spans.extend(key_hints(keys));
@@ -7063,6 +7125,7 @@ mod tests {
             enabled: true,
             cloud: false,
             local: false,
+            cloud_option: false,
             recommended: false,
         }];
         app.overlay = Overlay::Models { rows: Some(Ok(rows)), selected: 0 };
@@ -7918,6 +7981,7 @@ mod tests {
             enabled,
             cloud: false,
             local: false,
+            cloud_option: false,
             recommended,
         };
         let list = vec![
@@ -7949,6 +8013,7 @@ mod tests {
             enabled,
             cloud: false,
             local: false,
+            cloud_option: false,
             recommended,
         };
         app.apply(AppEvent::Models(Ok(vec![row("big", false, false), row("small", true, false)])));
@@ -8011,23 +8076,33 @@ mod tests {
             enabled,
             cloud: false,
             local: false,
+            cloud_option: false,
             recommended: false,
         };
         let cloud = ModelRow { cloud: true, ..model("sonnet", false, false) };
+        let both = ModelRow { local: true, cloud_option: true, ..model("qwen3.8-27b", false, false) };
         app.overlay = Overlay::Models {
-            rows: Some(Ok(vec![model("gemma4-e4b", false, false), model("qwen3.5-2b", true, true), cloud])),
+            rows: Some(Ok(vec![model("gemma4-e4b", false, false), model("qwen3.5-2b", true, true), cloud, both])),
             selected: 1,
         };
-        let text = screen(&app, 80, 24);
-        assert!(text.contains("  gemma4-e4b  local  ↓ download      general, vision"), "{}", text);
-        assert!(text.contains("› qwen3.5-2b  local  ✓ enabled"), "{}", text);
-        assert!(text.contains("  sonnet      cloud  disabled"), "{}", text);
-        // On a downloaded model Enter toggles it; on one to fetch it downloads.
-        assert!(text.contains("enable/disable"), "{}", text);
-        if let Overlay::Models { selected, .. } = &mut app.overlay {
-            *selected = 0;
-        }
-        assert!(screen(&app, 80, 24).contains("[enter] download"), "the hint follows the selection");
+        let text = screen(&app, 100, 24);
+        // Rows stay plain: name, state, capabilities.
+        assert!(text.contains("  gemma4-e4b   ↓ not downloaded  general, vision"), "{}", text);
+        assert!(text.contains("› qwen3.5-2b   ✓ enabled"), "{}", text);
+        assert!(text.contains("  sonnet ☁     disabled"), "{}", text);
+        // The footer says where the selected model runs, and its keys.
+        assert!(text.contains("local  [enter] disable  [ctrl+r] refresh"), "{}", text);
+        let select = |app: &mut App, i| {
+            if let Overlay::Models { selected, .. } = &mut app.overlay {
+                *selected = i;
+            }
+        };
+        select(&mut app, 2);
+        assert!(screen(&app, 100, 24).contains("cloud  [enter] enable  [ctrl+r]"), "a cloud model only turns on");
+        select(&mut app, 3);
+        let text = screen(&app, 100, 24);
+        assert!(text.contains("local · cloud"), "{}", text);
+        assert!(text.contains("local · cloud  [enter] use cloud (paid)  [ctrl+d] download"), "{}", text);
         assert!(!text.contains("Capabilities") && !text.contains("Models"), "{}", text);
     }
 

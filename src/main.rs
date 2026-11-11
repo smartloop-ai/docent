@@ -424,9 +424,11 @@ pub struct ModelRow {
     /// A cloud (remote) model: nothing to download, only on or off.
     pub cloud: bool,
     /// The model has a local copy to download (the agent's `local` flag).
-    /// A model served both ways is shown and enabled as a local one: cloud
-    /// models are paid, so docent never turns one on in its place.
     pub local: bool,
+    /// The model also runs in the cloud and the plan includes it (the
+    /// agent's `cloud` flag): Enter can turn the cloud copy on, ctrl+d
+    /// downloads the local one.
+    pub cloud_option: bool,
     /// Light enough for this machine, as the agent judges by its RAM.
     pub recommended: bool,
 }
@@ -461,11 +463,15 @@ pub fn model_row(model: &serde_json::Value, entry: Option<&serde_json::Value>) -
         access: model["access_level"].as_str().unwrap_or_default().to_string(),
         accessible: model["is_accessible"].as_bool() != Some(false),
         // Registered to run in the cloud, a model with a local copy hasn't
-        // been downloaded: that copy is what Enter fetches.
+        // been downloaded: that copy is what ctrl+d fetches.
         downloaded: flag("downloaded") && !(local && remote),
         enabled: flag("enabled"),
-        cloud: remote && !local,
+        // Runs in the cloud: a cloud-only model, or one served both ways that
+        // is on in the cloud.  A both-ways model registered there but off
+        // reads as a local one still to download.
+        cloud: remote && (!local || flag("enabled")),
         local,
+        cloud_option: local && model["cloud"].as_bool() == Some(true),
         recommended: model["recommended"].as_bool().unwrap_or_default(),
         name,
     }
@@ -673,6 +679,32 @@ pub fn enable_steps(list: &mut dyn Steps, client: &Client, project_id: &str, nam
         list.finish_before(enable);
     }
 
+    list.start(enable);
+    if let Err(e) = patch_project_model(client, project_id, name, true) {
+        list.fail(enable, e);
+    }
+    list.done(enable);
+}
+
+/// The steps of turning on the cloud copy of `name`, a model served both
+/// ways: register it to run in the cloud (`/v1/init` with `cloud`), then
+/// enable it.  Cloud models are paid, so this runs only on the user's pick.
+pub fn cloud_steps(list: &mut dyn Steps, client: &Client, project_id: &str, name: &str) {
+    let add = list.add(&format!("Use {} in the cloud", name));
+    let enable = list.add("Enable for project");
+    list.start(add);
+    framework::stream_progress(
+        &base_url(),
+        "/v1/init",
+        serde_json::json!({ "model_name": name, "project_id": project_id, "cloud": true }),
+        list,
+        add,
+        &|status| match status {
+            "model_ready" | "completed" => framework::Stage::Done(add),
+            _ => framework::Stage::Other,
+        },
+    );
+    list.finish_before(enable);
     list.start(enable);
     if let Err(e) = patch_project_model(client, project_id, name, true) {
         list.fail(enable, e);
@@ -978,9 +1010,20 @@ mod tests {
         let model = serde_json::json!({"name": "qwen3.8-27b", "type": "remote", "cloud": true, "local": true});
         let registered = serde_json::json!({"downloaded": true, "enabled": false});
         let row = model_row(&model, Some(&registered));
-        assert!(row.local);
-        assert!(!row.cloud, "shown as local, never as the paid cloud model");
+        assert!(row.local && row.cloud_option);
+        assert!(!row.cloud, "off in the cloud, it reads as a local model");
         assert!(!row.downloaded, "the local copy is still to fetch");
+
+        // Turned on in the cloud, it runs there.
+        let on = serde_json::json!({"downloaded": true, "enabled": true});
+        let row = model_row(&model, Some(&on));
+        assert!(row.cloud && row.enabled && !row.downloaded);
+    }
+
+    #[test]
+    fn no_cloud_option_without_the_plan() {
+        let model = serde_json::json!({"name": "qwen3.8-27b", "type": "local", "cloud": false, "local": true});
+        assert!(!model_row(&model, None).cloud_option);
     }
 
     #[test]
