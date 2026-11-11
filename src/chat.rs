@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
 use futures_util::StreamExt;
+use smartloop::api::model::{Citation, CitationSource};
 
 /// What one chat turn reports while it streams.
 #[derive(Debug, Clone)]
@@ -14,7 +15,7 @@ pub enum ChatEvent {
     /// A `chat.status` progress line, e.g. `[tools] searching documents`.
     Status { step: String, message: String },
     /// Sources the answer used, sent once after the last token.
-    Citations(Vec<serde_json::Value>),
+    Citations(Vec<Citation>),
     /// The connection dropped before any content; the turn is sent again.
     Retrying(String),
     /// The tool calls the reply ended with, once each is whole: the turn
@@ -281,7 +282,8 @@ async fn stream_turn_once(
             }
             Some("chat.citations") => {
                 if let Some(list) = event["citations"].as_array() {
-                    on(ChatEvent::Citations(list.clone()));
+                    let citations = list.iter().filter_map(|c| serde_json::from_value(c.clone()).ok()).collect();
+                    on(ChatEvent::Citations(citations));
                 }
             }
             Some("chat.status") => match event["message"].as_str() {
@@ -337,35 +339,154 @@ pub fn making_dir_in(project_id: &str, here: &std::path::Path, folder: Option<st
     }
 }
 
-/// What to show for one citation, as the studio app labels its reference
-/// pills: a web source by its URL, a document by the path the agent gave or
-/// else its name.
-pub fn citation_label(citation: &serde_json::Value) -> Option<String> {
-    let field = |keys: &[&str]| {
-        keys.iter()
-            .filter_map(|k| citation[*k].as_str())
-            .map(str::trim)
-            .find(|v| !v.is_empty())
-            .map(str::to_string)
-    };
-    let name = field(&["document_name", "document_id"]);
-    let url = field(&["url", "link", "source_url", "href", "web_url"]);
+/// `text` trimmed, when there's anything left.
+fn text(text: &Option<String>) -> Option<&str> {
+    text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+}
 
-    match (url, name) {
-        (Some(url), Some(name)) if name != url && !name.starts_with("http") => {
-            Some(format!("{} ({})", name, url))
+/// What kind of source `citation` is. An agent older than `source` (the
+/// studio app's, say, which docent uses when it's running) sends none: a
+/// link is a web page and a tool call names its tool.
+fn kind(citation: &Citation) -> Option<CitationSource> {
+    citation.source.or_else(|| {
+        if text(&citation.url).is_some() {
+            Some(CitationSource::Web)
+        } else if text(&citation.tool_name).is_some() {
+            Some(CitationSource::Mcp)
+        } else {
+            None
         }
-        (Some(url), _) => Some(url),
-        (None, name) => {
-            let path = field(&["file_path", "path", "source_path"]);
+    })
+}
+
+/// What a citation is called: its document's name, else its id.
+fn name(citation: &Citation) -> Option<&str> {
+    text(&citation.document_name).or_else(|| Some(citation.document_id.trim()).filter(|id| !id.is_empty()))
+}
+
+/// What to show for `citation`, as the studio app labels its reference
+/// pills: a web source by its URL, a tool by its name, a document by the
+/// path the agent gave or else its name (or `as_named`), then the pages
+/// cited.
+pub fn label(citation: &Citation, as_named: Option<&str>) -> Option<String> {
+    let own = name(citation);
+    let label = match kind(citation) {
+        Some(CitationSource::Web) => match (text(&citation.url), own) {
+            (Some(url), Some(name)) if name != url && !name.starts_with("http") => format!("{} ({})", name, url),
+            (url, name) => url.or(name)?.to_string(),
+        },
+        Some(CitationSource::Mcp) => own?.to_string(),
+        Some(CitationSource::Document) | None => {
             // A document in a hidden folder is the agent's own state, its
             // copy under `~/.smartloop`, not one of the user's to cite.
-            if path.as_deref().or(name.as_deref()).is_some_and(in_hidden_folder) {
+            let path = text(&citation.path);
+            if path.or(own).is_some_and(in_hidden_folder) {
                 return None;
             }
-            path.or(name)
+            as_named.or(path).or(own)?.to_string()
+        }
+    };
+    let pages = citation.page_numbers.as_deref().unwrap_or_default();
+    Some(match pages {
+        [] => label,
+        [page] => format!("{}, p. {}", label, page_text(page)),
+        pages => format!("{}, pp. {}", label, page_ranges(pages)),
+    })
+}
+
+/// A page as the document's index recorded it: `3`, or `iv`.
+fn page_text(page: &serde_json::Value) -> String {
+    page.as_str().map_or_else(|| page.to_string(), str::to_string)
+}
+
+/// `pages` with each run of consecutive numbers as a range: `1–3, 7, iv`.
+fn page_ranges(pages: &[serde_json::Value]) -> String {
+    let mut runs: Vec<(String, Option<(u64, u64)>)> = Vec::new();
+    for page in pages {
+        match (runs.last_mut(), page.as_u64()) {
+            (Some((_, Some((_, last)))), Some(n)) if n == *last + 1 => *last = n,
+            (_, n) => runs.push((page_text(page), n.map(|n| (n, n)))),
         }
     }
+    let runs: Vec<String> = runs
+        .into_iter()
+        .map(|(page, run)| match run {
+            Some((first, last)) if first != last => format!("{}–{}", first, last),
+            _ => page,
+        })
+        .collect();
+    runs.join(", ")
+}
+
+/// A citation as the References list shows it, and what clicking it opens:
+/// a web page, or a file on this machine as a `file://` URL.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Reference {
+    pub label: String,
+    pub target: Option<String>,
+}
+
+impl From<&str> for Reference {
+    fn from(label: &str) -> Self {
+        Reference { label: label.to_string(), target: None }
+    }
+}
+
+/// What clicking `citation` opens. A web source opens its page and a tool
+/// nothing. A document opens, best first: the file the agent gave the full
+/// path of; the file under `root` that `/sync` pushed by the document's
+/// name; the copy the agent keeps under `project_dir`, at the
+/// `document_path` it gave or else in `documents/` by name, which only an
+/// agent on this machine has. A file that isn't there is passed over.
+pub fn reference(
+    citation: &Citation,
+    root: Option<&std::path::Path>,
+    project_dir: Option<&std::path::Path>,
+) -> Option<Reference> {
+    let found = |target: Option<String>| Some(Reference { label: label(citation, None)?, target });
+    match kind(citation) {
+        Some(CitationSource::Web) => {
+            let url = text(&citation.url).filter(|u| u.starts_with("https://") || u.starts_with("http://"));
+            return found(url.map(str::to_string));
+        }
+        Some(CitationSource::Mcp) => return found(None),
+        Some(CitationSource::Document) | None => {}
+    }
+    let given = text(&citation.path).and_then(crate::links::target).filter(|t| t.starts_with("file://"));
+    if given.is_some() {
+        return found(given);
+    }
+    if let Some(name) = name(citation) {
+        if let Some((key, path)) = root.and_then(|root| crate::docent::synced_file(root, name)) {
+            let label = label(citation, Some(&key))?;
+            return Some(Reference { label, target: Some(crate::links::file_url(&path)) });
+        }
+        let copy = project_dir
+            .into_iter()
+            .flat_map(|dir| {
+                let given = text(&citation.document_path).map(|p| dir.join(p));
+                given.into_iter().chain(std::iter::once(dir.join("documents").join(name)))
+            })
+            .find(|p| p.is_file());
+        if let Some(copy) = copy {
+            return found(Some(crate::links::file_url(&copy)));
+        }
+    }
+    found(None)
+}
+
+/// The references for `citations`, found from the folder `project` syncs
+/// from (its own, else the working directory's when that's linked to it)
+/// and the project's folder at the agent when the agent runs here.
+pub fn references(citations: &[Citation], project: Option<&str>) -> Vec<Reference> {
+    let root = project.and_then(|project| {
+        crate::docent::folder(project).or_else(|| {
+            let here = crate::docent::root(&std::env::current_dir().ok()?);
+            crate::docent::linked(&here).is_some_and(|l| l.project == project).then_some(here)
+        })
+    });
+    let project_dir = project.filter(|_| crate::is_local()).and_then(crate::framework::project_dir);
+    citations.iter().filter_map(|c| reference(c, root.as_deref(), project_dir.as_deref())).collect()
 }
 
 /// Whether `path` lies under a folder whose name starts with `.`, as the
@@ -379,6 +500,9 @@ pub fn in_hidden_folder(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::links::file_url;
+    use serde_json::json;
+    use std::fs;
 
     fn link(root: &std::path::Path, project: &str) {
         std::fs::create_dir_all(root.join(".docent")).unwrap();
@@ -478,13 +602,115 @@ mod tests {
         assert!(!in_hidden_folder("../src/main.rs"));
         assert!(!in_hidden_folder("roadmap.pdf"));
 
-        let hidden = serde_json::json!({"document_name": "main.rs", "file_path": "/Users/me/.smartloop/ws/p/src/main.rs"});
-        assert_eq!(citation_label(&hidden), None);
-        let hidden_name = serde_json::json!({"document_name": "/Users/me/.smartloop/ws/p/notes.md"});
-        assert_eq!(citation_label(&hidden_name), None);
-        let shown = serde_json::json!({"document_name": "roadmap.pdf", "file_path": "docs/roadmap.pdf"});
-        assert_eq!(citation_label(&shown).as_deref(), Some("docs/roadmap.pdf"));
-        let web = serde_json::json!({"url": "https://smartloop.ai/guide"});
-        assert_eq!(citation_label(&web).as_deref(), Some("https://smartloop.ai/guide"));
+        let hidden = sent("document", json!({"document_name": "main.rs", "path": "/Users/me/.smartloop/ws/p/src/main.rs"}));
+        assert_eq!(label(&hidden, None), None);
+        let hidden_name = sent("document", json!({"document_name": "/Users/me/.smartloop/ws/p/notes.md"}));
+        assert_eq!(label(&hidden_name, None), None);
+        let shown = sent("document", json!({"document_name": "roadmap.pdf", "path": "docs/roadmap.pdf"}));
+        assert_eq!(label(&shown, None).as_deref(), Some("docs/roadmap.pdf"));
+        let web = sent("web", json!({"document_name": "https://smartloop.ai/guide", "url": "https://smartloop.ai/guide"}));
+        assert_eq!(label(&web, None).as_deref(), Some("https://smartloop.ai/guide"));
+    }
+
+    /// A citation as the agent sends it: its `source`, and the document's
+    /// name as its id when it gives none.
+    fn sent(source: &str, mut fields: serde_json::Value) -> Citation {
+        fields["source"] = json!(source);
+        if fields.get("document_id").is_none() {
+            fields["document_id"] = fields["document_name"].clone();
+        }
+        serde_json::from_value(fields).unwrap()
+    }
+
+    #[test]
+    fn labels_documents_web_sources_tools_and_pages() {
+        let document = sent("document", json!({"document_id": "9f2c", "document_name": "plan.pdf", "page_numbers": [2, 5]}));
+        assert_eq!(label(&document, None).as_deref(), Some("plan.pdf, pp. 2, 5"));
+        let placed = sent("document", json!({"document_name": "plan.pdf", "document_path": "documents/2024/plan.pdf"}));
+        assert_eq!(label(&placed, None).as_deref(), Some("plan.pdf"), "where the agent keeps it isn't its name");
+
+        let page = sent("document", json!({"document_name": "plan.pdf", "page_numbers": [3]}));
+        assert_eq!(label(&page, None).as_deref(), Some("plan.pdf, p. 3"));
+        let run = sent("document", json!({"document_name": "fund.pdf", "page_numbers": [1, 2, 3, 4, 7, 9, 10]}));
+        assert_eq!(label(&run, None).as_deref(), Some("fund.pdf, pp. 1–4, 7, 9–10"));
+        let roman = sent("document", json!({"document_name": "fund.pdf", "page_numbers": ["iv", 1, 2]}));
+        assert_eq!(label(&roman, None).as_deref(), Some("fund.pdf, pp. iv, 1–2"));
+
+        let web = sent("web", json!({"document_name": "https://a.io/x", "url": "https://a.io/x"}));
+        assert_eq!(label(&web, None).as_deref(), Some("https://a.io/x"));
+        let named = sent("web", json!({"document_name": "Guide", "url": "https://a.io/guide"}));
+        assert_eq!(label(&named, None).as_deref(), Some("Guide (https://a.io/guide)"));
+
+        let tool = sent("mcp", json!({"document_id": "mcp:Linear.list_issues", "document_name": "Linear · list_issues"}));
+        assert_eq!(label(&tool, None).as_deref(), Some("Linear · list_issues"));
+
+        let given = sent("document", json!({"document_name": "plan.pdf", "path": " /docs/plan.pdf "}));
+        assert_eq!(label(&given, None).as_deref(), Some("/docs/plan.pdf"));
+        assert_eq!(label(&sent("document", json!({"document_id": "", "page_numbers": [1]})), None), None);
+    }
+
+    #[test]
+    fn opens_the_best_place_a_citation_names() {
+        // Not tempfile's `.tmp` name: a hidden folder isn't cited.
+        let dir = tempfile::Builder::new().prefix("cite").tempdir().unwrap();
+        let root = dir.path().join("project");
+        let project_dir = dir.path().join("slp");
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::create_dir_all(root.join(crate::docent::DIR)).unwrap();
+        fs::create_dir_all(project_dir.join("documents")).unwrap();
+        fs::write(root.join("notes/plan.md"), "plan").unwrap();
+        fs::write(project_dir.join("documents/notes__plan.md"), "plan").unwrap();
+        fs::write(project_dir.join("documents/upload.pdf"), "pdf").unwrap();
+        let manifest = json!({"project": "p", "documents": {"notes/plan.md": {
+            "hash": "h", "size": 4, "mtime": 1, "remote": "notes__plan.md", "synced_at": 1,
+        }}});
+        fs::write(root.join(crate::docent::DIR).join("manifest.json"), manifest.to_string()).unwrap();
+        let open = |value: serde_json::Value| reference(&sent("document", value), Some(&root), Some(&project_dir)).unwrap();
+
+        // A web source opens its page, and a tool nothing, even one named
+        // like a file that's here.
+        let web = sent("web", json!({"document_name": "https://a.io", "url": "https://a.io"}));
+        assert_eq!(reference(&web, Some(&root), Some(&project_dir)).unwrap().target.as_deref(), Some("https://a.io"));
+        let tool = sent("mcp", json!({"document_name": "upload.pdf", "tool_name": "fetch"}));
+        assert_eq!(reference(&tool, Some(&root), Some(&project_dir)).unwrap().target, None);
+
+        // A path the agent gives wins, when it's there.
+        let given = root.join("notes/plan.md");
+        let with_path = open(json!({"document_name": "upload.pdf", "path": given.to_str().unwrap()}));
+        assert_eq!(with_path.target, Some(file_url(&given)));
+        let gone = open(json!({"document_name": "upload.pdf", "path": "/nowhere/upload.pdf"}));
+        assert_eq!(gone.target, Some(file_url(&project_dir.join("documents/upload.pdf"))));
+
+        // A synced document opens the original, named as it is here.
+        let synced = open(json!({"document_name": "notes__plan.md", "page_numbers": [1]}));
+        assert_eq!(synced, Reference { label: "notes/plan.md, p. 1".into(), target: Some(file_url(&root.join("notes/plan.md"))) });
+
+        // Gone here since its sync: the agent's copy.
+        fs::remove_file(root.join("notes/plan.md")).unwrap();
+        let copy = open(json!({"document_name": "notes__plan.md"}));
+        assert_eq!(copy, Reference { label: "notes__plan.md".into(), target: Some(file_url(&project_dir.join("documents/notes__plan.md"))) });
+
+        // The agent's copy where it says it keeps it, over the guess by name.
+        fs::create_dir_all(project_dir.join("documents/2024")).unwrap();
+        fs::write(project_dir.join("documents/2024/upload.pdf"), "pdf").unwrap();
+        let placed = open(json!({"document_name": "upload.pdf", "document_path": "documents/2024/upload.pdf"}));
+        assert_eq!(placed.target, Some(file_url(&project_dir.join("documents/2024/upload.pdf"))));
+        let stale = open(json!({"document_name": "upload.pdf", "document_path": "documents/old/upload.pdf"}));
+        assert_eq!(stale.target, Some(file_url(&project_dir.join("documents/upload.pdf"))));
+
+        // An agent from before `source`: a link still opens, a tool still
+        // doesn't, and a document cited by name alone still reads.
+        let old = |value: serde_json::Value| {
+            let citation: Citation = serde_json::from_value(value).unwrap();
+            reference(&citation, Some(&root), Some(&project_dir)).unwrap()
+        };
+        assert_eq!(old(json!({"document_name": "Guide", "url": "https://a.io"})).target.as_deref(), Some("https://a.io"));
+        assert_eq!(old(json!({"document_id": "mcp:x.fetch", "document_name": "upload.pdf", "tool_name": "fetch"})).target, None);
+        assert_eq!(old(json!({"document_name": "upload.pdf"})).target, Some(file_url(&project_dir.join("documents/upload.pdf"))));
+
+        // An agent elsewhere has no copy here; nothing found opens nothing.
+        let remote = reference(&sent("document", json!({"document_name": "upload.pdf"})), None, None).unwrap();
+        assert_eq!(remote, Reference { label: "upload.pdf".into(), target: None });
+        assert_eq!(open(json!({"document_name": "missing.pdf"})).target, None);
     }
 }
