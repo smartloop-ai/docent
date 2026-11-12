@@ -436,8 +436,9 @@ enum Entry {
     User(String),
     Reply(Reply),
     Shell(Shell),
-    /// The last reply's shell commands, waiting to be allowed or skipped.
-    Ask(Vec<String>),
+    /// The last reply's shell commands, with their folder, waiting to be
+    /// allowed or skipped.
+    Ask(std::path::PathBuf, Vec<String>),
     Notice(String),
     Warning(String),
     Error(String),
@@ -2489,8 +2490,8 @@ impl App {
             return self.run_allowed(root, commands);
         }
         // An earlier question still open is answered by this one.
-        self.entries.retain(|e| !matches!(e, Entry::Ask(_)));
-        self.entries.push(Entry::Ask(commands.clone()));
+        self.entries.retain(|e| !matches!(e, Entry::Ask(..)));
+        self.entries.push(Entry::Ask(root.clone(), commands.clone()));
         self.ask = Some((root, commands));
         self.scroll_back = 0;
     }
@@ -2499,7 +2500,7 @@ impl App {
     /// skipped and said so; `always` keeps running them for the session.
     fn answer_ask(&mut self, run: bool, always: bool) {
         let Some((root, commands)) = self.ask.take() else { return };
-        self.entries.retain(|e| !matches!(e, Entry::Ask(_)));
+        self.entries.retain(|e| !matches!(e, Entry::Ask(..)));
         if !run {
             self.entries.push(Entry::Notice(format!("Skipped: {}", commands.join("; ").replace('\n', "; "))));
             self.scroll_back = 0;
@@ -2545,7 +2546,13 @@ impl App {
         let Some((project, _)) = self.project.clone() else { return };
         let mut runs = Vec::new();
         let asked = commands.clone();
-        for command in self.runnable(commands) {
+        let commands = self.runnable(commands);
+        // Said before they start, so it's plain what the answer set going.
+        if !commands.is_empty() {
+            let how = if self.always_run { "Auto-approved: running" } else { "Running" };
+            self.entries.push(Entry::Notice(format!("{} {} in {}", how, count_commands(&commands), shown_folder(&root))));
+        }
+        for command in commands {
             let (shown, background) = detached(&co_authored(&command));
             let (id, report) = self.shell_entry(shown.clone(), background);
             if let Some(call) = self.tooling.as_mut().and_then(|t| t.waiting(&command)) {
@@ -3736,7 +3743,7 @@ impl App {
         // Any other key in between makes the next Esc a first one again.
         let last_esc = self.last_esc.take();
         let esc_again = key.code == KeyCode::Esc && last_esc.is_some_and(|t| t.elapsed() < DOUBLE_ESC);
-        let asked = self.ask.is_some() && self.input.is_empty() && self.turn.is_none() && !self.secret();
+        let asked = self.asking() && self.input.is_empty();
         match key.code {
             KeyCode::Esc if !self.passwords.is_empty() => self.answer_password(false),
             KeyCode::Enter if !self.passwords.is_empty() => self.answer_password(true),
@@ -3759,6 +3766,12 @@ impl App {
             KeyCode::Enter if asked && key.modifiers.is_empty() => self.answer_ask(true, false),
             KeyCode::Tab if asked => self.answer_ask(true, true),
             KeyCode::Esc if asked => self.answer_ask(false, false),
+            // Esc on an empty prompt stops the command running in front.
+            KeyCode::Esc if self.input.is_empty() && self.foreground_job() => {
+                let stopped = self.stop_jobs(|j| self.shell_of(j.id).is_some_and(|s| !s.background));
+                self.entries.push(Entry::Notice(format!("Stopped: {}", stopped.join("; ").replace('\n', "; "))));
+                self.scroll_back = 0;
+            }
             // On an empty prompt, Tab turns auto-approve on or off: whether
             // a reply's commands run without asking.
             KeyCode::Tab if self.input.is_empty() && !self.secret() => {
@@ -4104,6 +4117,18 @@ impl App {
         self.command_round = 0;
         self.last_failure = None;
         self.send_turn(input, message, files, making);
+    }
+
+    /// A reply's commands are asked about, and the prompt answers: no
+    /// reply streaming, no token being typed.
+    fn asking(&self) -> bool {
+        self.ask.is_some() && self.turn.is_none() && !self.secret()
+    }
+
+    /// A command running in the foreground, a reply's or a `!` one, that
+    /// Esc stops.
+    fn foreground_job(&self) -> bool {
+        self.jobs.iter().any(|j| self.shell_of(j.id).is_some_and(|s| !s.background))
     }
 
     /// Nothing between the last prompt and the next: no reply streaming,
@@ -4645,7 +4670,7 @@ impl App {
             }
             Entry::Reply(reply) => reply_lines(reply, width, lines),
             Entry::Shell(shell) => shell_lines(shell, self.spinner(), SHELL_SHOWN, lines),
-            Entry::Ask(commands) => ask_lines(commands, lines),
+            Entry::Ask(root, commands) => ask_lines(root, commands, lines),
             Entry::Notice(text) => {
                 lines.push(Line::from(vec![Span::styled("■ ", Style::new().fg(Color::Green)), Span::raw(text.clone())]))
             }
@@ -4754,7 +4779,16 @@ impl App {
         // Between two rules across the screen, as in Claude Code; in the
         // brand color while a `!command` is typed, as it runs in the shell.
         let shell = !self.secret() && self.input.starts_with('!');
-        let rules = if shell { Style::new().fg(pink()) } else { dim() };
+        // A reply's commands asked about: the prompt is the question, in the
+        // card's yellow, until something else is typed.
+        let asked = self.asking() && self.input.is_empty();
+        let rules = if shell {
+            Style::new().fg(pink())
+        } else if asked {
+            Style::new().fg(Color::Yellow)
+        } else {
+            dim()
+        };
         let block = Block::new().borders(Borders::TOP | Borders::BOTTOM).border_style(rules);
         let inner = block.inner(area);
         let ready = matches!(self.phase, Phase::Ready) && self.project.is_some();
@@ -4767,10 +4801,13 @@ impl App {
             "token: "
         } else if shell {
             "! "
+        } else if asked {
+            "? "
         } else {
             "> "
         };
-        let prompt = Span::styled(label, Style::new().fg(pink()).bold());
+        let mark = if asked { Color::Yellow } else { pink() };
+        let prompt = Span::styled(label, Style::new().fg(mark).bold());
         // A token or password shows as dots.
         let input = if self.secret() {
             "•".repeat(self.input.chars().count())
@@ -4808,7 +4845,10 @@ impl App {
                 let text: String = chars[start..end].iter().collect();
                 let mut spans = vec![mark, Span::raw(text)];
                 // Until something's typed, say what the prompt takes.
-                if input.is_empty() && shell {
+                if asked {
+                    let (_, commands) = self.ask.as_ref().expect("asked");
+                    spans.push(Span::styled(format!("Run {}?", count_commands(commands)), Style::new().bold()));
+                } else if input.is_empty() && shell {
                     spans.push(Span::styled("a command to run in the folder; & at its end runs it in the background", dim()));
                 } else if input.is_empty() && !self.secret() {
                     spans.push(Span::styled("Ask anything, or drop a file to attach it", dim()));
@@ -4961,7 +5001,7 @@ impl App {
         } else if self.input.starts_with('!') {
             // Shell mode, said as Claude Code says it, in the rules' color.
             hints.push(Span::styled("! for shell mode", Style::new().fg(pink())));
-        } else if self.ask.is_some() && self.input.is_empty() && self.turn.is_none() {
+        } else if self.asking() && self.input.is_empty() {
             hints.extend(key_hints(&[("enter", "run"), ("tab", "always this session"), ("esc", "skip")]));
         } else if self.input.trim() == "/project import" {
             // Asked from the projects panel, or typed: what it wants next.
@@ -4974,8 +5014,19 @@ impl App {
         } else if let Some(notice) = self.update_notice(area.width.saturating_sub(2) as usize) {
             hints.extend(notice);
         } else {
-            // The rest live under help, as in Claude Code.
-            let mut keys = vec![("enter", if self.turn.is_some() { "queue" } else { "send" }), ("esc", "interrupt")];
+            // A question about a reply's commands, put aside while typing,
+            // isn't lost.
+            if self.ask.is_some() && !self.secret() {
+                hints.push(Span::styled("Commands waiting: clear the prompt to answer  ", Style::new().fg(Color::Yellow)));
+            }
+            // The rest live under help, as in Claude Code. Esc says what it
+            // does now, and isn't shown when it does nothing.
+            let mut keys = vec![("enter", if self.turn.is_some() { "queue" } else { "send" })];
+            if self.turn.is_some() {
+                keys.push(("esc", "interrupt"));
+            } else if self.input.is_empty() && self.foreground_job() {
+                keys.push(("esc", "stop command"));
+            }
             if !self.queued.is_empty() && self.input.is_empty() {
                 keys.push(("↑", "unqueue"));
             }
@@ -5354,7 +5405,7 @@ fn entry_version(entry: &Entry) -> u64 {
             (laid_out, reply.text.len(), reply.warnings.len(), reply.citations.len(), reply.stats.is_some(), reply.ended.is_some()).hash(&mut h);
         }
         Entry::Shell(shell) => (shell.id, shell.output.len(), shell.ended.is_some()).hash(&mut h),
-        Entry::Ask(commands) => commands.hash(&mut h),
+        Entry::Ask(root, commands) => (root, commands).hash(&mut h),
         Entry::User(text) | Entry::Notice(text) | Entry::Warning(text) | Entry::Error(text) => text.hash(&mut h),
     }
     h.finish()
@@ -5940,10 +5991,10 @@ fn shell_lines(shell: &Shell, spinner: &str, shown: usize, lines: &mut Vec<Line<
 
 /// The reply's commands, to allow or skip: each script's lines. The keys
 /// that answer show in the footer, which keeps them while they apply.
-fn ask_lines(commands: &[String], lines: &mut Vec<Line<'static>>) {
+fn ask_lines(root: &std::path::Path, commands: &[String], lines: &mut Vec<Line<'static>>) {
     lines.push(Line::from(vec![
         Span::styled("? ", Style::new().fg(Color::Yellow).bold()),
-        Span::styled("Run these in the folder?", Style::new().bold()),
+        Span::styled(format!("Run {} in {}?", count_commands(commands), shown_folder(root)), Style::new().bold()),
     ]));
     for command in commands {
         for line in command.lines() {
@@ -5956,6 +6007,33 @@ fn ask_lines(commands: &[String], lines: &mut Vec<Line<'static>>) {
                 Span::styled(format!("won't run as it is: fill in {}", holes.join(", ")), Style::new().fg(Color::Yellow)),
             ]));
         }
+    }
+}
+
+/// `1 command` or `3 commands`: each line of each block, but for comments
+/// and blank lines, with a line ending in `\` going on into the next.
+fn count_commands(commands: &[String]) -> String {
+    let mut n = 0;
+    for command in commands {
+        let mut continued = false;
+        for line in command.lines().map(str::trim) {
+            let comment = line.starts_with('#');
+            if !continued && !comment && !line.is_empty() {
+                n += 1;
+            }
+            continued = !comment && line.ends_with('\\');
+        }
+    }
+    format!("{} command{}", n, if n == 1 { "" } else { "s" })
+}
+
+/// `path` with the home folder as `~`, as a shell prompt shows it.
+fn shown_folder(path: &std::path::Path) -> String {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from);
+    match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
     }
 }
 
@@ -6241,7 +6319,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("[esc]", "interrupt the reply; the next queued prompt goes at once"),
         ("[↑] with prompts queued", "take back the last queued prompt to edit it"),
         ("[esc] [esc]", "clear the prompt"),
-        ("[enter] [tab] [esc]", "a reply's commands, asked about: run, always this session, skip"),
+        ("[enter] [tab] [esc]", "a reply's commands, asked in the prompt: run, run and always this session, skip"),
         ("[tab]", "on an empty prompt: auto-approve on or off, so a reply's commands run without asking"),
         ("[↑] [↓]", "earlier prompts, past the prompt's first or last line"),
         ("wheel [pgup] [pgdn]", "scroll the conversation"),
@@ -7013,7 +7091,7 @@ mod tests {
             "Building first.\n\n```sh\nrm -rf /\n```\n",
             vec![call("call_1", "bash", r#"{"command":"cargo build","description":"Build it"}"#), call("call_2", "python", "{}")],
         );
-        assert!(matches!(app.entries.last(), Some(Entry::Ask(c)) if c == &["cargo build"]));
+        assert!(matches!(app.entries.last(), Some(Entry::Ask(_, c)) if c == &["cargo build"]));
         let Some(Entry::Reply(shown)) = app.entries.iter().rev().find(|e| matches!(e, Entry::Reply(_))) else { panic!() };
         assert!(shown.text.ends_with("```sh\n# Build it\ncargo build\n```\n"), "{}", shown.text);
         let tooling = app.tooling.as_ref().unwrap();
@@ -7122,11 +7200,11 @@ mod tests {
         // No file to write: the commands are asked about straight away; Esc
         // skips them, and says so.
         turn(&mut app, "Committing:\n\n```sh\ngit add -A\ngit commit -m \"wip\"\n```\n\n```sh\ngit push\n```\n");
-        assert!(matches!(app.entries.last(), Some(Entry::Ask(c)) if c.len() == 2));
+        assert!(matches!(app.entries.last(), Some(Entry::Ask(_, c)) if c.len() == 2));
         assert!(app.commands.is_none());
         key(&mut app, KeyCode::Esc);
         assert!(app.ask.is_none());
-        assert!(!app.entries.iter().any(|e| matches!(e, Entry::Ask(_))));
+        assert!(!app.entries.iter().any(|e| matches!(e, Entry::Ask(..))));
         assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "Skipped: git add -A; git commit -m \"wip\"; git push"));
         assert!(shells(&app).is_empty());
         // Enter runs them, each block its own.
@@ -7142,7 +7220,7 @@ mod tests {
         assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "cargo check --quiet"));
         let id = check.id;
         app.apply(AppEvent::Check(id, String::new(), Ended::Exited(0)));
-        assert!(matches!(app.entries.last(), Some(Entry::Ask(c)) if c == &["git commit -am \"main\""]));
+        assert!(matches!(app.entries.last(), Some(Entry::Ask(_, c)) if c == &["git commit -am \"main\""]));
         assert!(app.commands.is_none());
         key(&mut app, KeyCode::Tab);
         assert!(app.always_run);
@@ -7172,11 +7250,35 @@ mod tests {
             .map(|y| (0..80).map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string()).collect::<String>())
             .collect();
         let text = rows.join("\n");
-        assert!(rows.iter().any(|r| r.starts_with("? Run these in the folder?")), "{}", text);
+        assert!(rows.iter().any(|r| r.starts_with("? Run 1 command in ")), "{}", text);
         assert!(rows.iter().any(|r| r.starts_with("  $ git push")), "{}", text);
-        assert_eq!(rows.iter().filter(|r| r.contains("[enter] run  [tab] always this session  [esc] skip")).count(), 1, "{}", text);
-        assert!(rows.last().unwrap().contains("[enter] run"), "{}", text);
+        // The prompt asks in place of "Ask anything"; the keys that answer
+        // show once, in the footer.
+        assert!(rows.iter().any(|r| r.trim_end() == "? Run 1 command?"), "{}", text);
+        assert_eq!(rows.iter().filter(|r| r.contains("[enter] run")).count(), 1, "{}", text);
+        assert!(!text.contains("Ask anything"), "{}", text);
+        assert!(rows.last().unwrap().contains("[enter] run  [tab] always this session  [esc] skip"), "{}", text);
+        // Typing puts the question aside, and the footer says it waits.
+        app.input = "and".into();
+        app.last_esc = None;
+        let text = screen(&app, 80, 30);
+        assert!(text.contains("> and"), "{}", text);
+        assert!(text.contains("Commands waiting: clear the prompt to answer"), "{}", text);
+        app.input.clear();
+        // Enter runs them, and says so.
+        app.jobs.clear();
         key(&mut app, KeyCode::Enter);
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n.starts_with("Running 1 command in "))));
+        // Esc on the empty prompt stops the command running in front, as
+        // the footer says.
+        assert!(screen(&app, 80, 30).contains("[esc] stop command"));
+        let job = app.jobs.last().expect("git push runs");
+        let stopped = job.stopped.clone();
+        key(&mut app, KeyCode::Esc);
+        assert!(stopped.load(Ordering::Relaxed));
+        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "Stopped: git push"));
+        app.jobs.clear();
+        assert!(!screen(&app, 80, 30).contains("[esc]"));
         // A command with a placeholder is left out, and the rest run.
         turn(&mut app, "```sh\ngit remote add origin https://github.com/<your-username>/app.git\n```\n\n```sh\ngit push\n```\n");
         key(&mut app, KeyCode::Enter);
@@ -8939,6 +9041,14 @@ mod tests {
     }
 
     #[test]
+    fn commands_are_counted_without_comments_or_continued_lines() {
+        let blocks = |b: &[&str]| b.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(count_commands(&blocks(&["# Build it\ncargo build\n\n# Run it\ncargo run"])), "2 commands");
+        assert_eq!(count_commands(&blocks(&["#!/bin/sh\ncargo build \\\n  --release", "git push"])), "2 commands");
+        assert_eq!(count_commands(&blocks(&["cargo build  # debug"])), "1 command");
+    }
+
+    #[test]
     fn answering_a_command_question_keeps_the_conversation_scrollable() {
         let mut app = app();
         app.phase = Phase::Ready;
@@ -8946,7 +9056,7 @@ mod tests {
             app.entries.push(Entry::Notice(format!("line {i}")));
         }
         let commands: Vec<String> = (0..12).map(|i| format!("echo step {i}")).collect();
-        app.entries.push(Entry::Ask(commands.clone()));
+        app.entries.push(Entry::Ask(std::path::PathBuf::from("."), commands.clone()));
         app.ask = Some((std::path::PathBuf::from("."), commands));
         screen(&app, 80, 24);
         // Skipped: the question goes, a one-line notice takes its place.

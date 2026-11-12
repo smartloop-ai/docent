@@ -12,8 +12,12 @@ pub fn upgrade_command() -> &'static str {
 }
 
 /// The latest release's version when it is newer than this build; `None`
-/// when this is the latest, or GitHub can't be reached.
+/// when this is the latest, or GitHub can't be reached. A dev build, which
+/// no installer upgrades, isn't told.
 pub fn newer_release() -> Option<String> {
+    if cfg!(debug_assertions) {
+        return None;
+    }
     latest_release().filter(|latest| is_newer(latest, env!("CARGO_PKG_VERSION")))
 }
 
