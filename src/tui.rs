@@ -1870,7 +1870,9 @@ impl App {
         });
     }
 
-    fn enable_model(&mut self, name: String) {
+    /// Download `name` and enable it, or with `cloud`, run it in the cloud
+    /// instead.
+    fn enable_model(&mut self, name: String, cloud: bool) {
         let Some((project, _)) = self.project.clone() else { return };
         if self.downloads.iter().any(|d| d.model == name && !d.finished) {
             return;
@@ -1879,7 +1881,7 @@ impl App {
         self.downloads.push(Download { model: name.clone(), list: StepList::new(), finished: false, cancelling: false });
         self.spawn(move |client, tx| {
             let mut list = Remote::new(tx.clone(), move |e| AppEvent::Download(id, e));
-            crate::enable_steps(&mut list, &client, &project, &name);
+            crate::enable_steps(&mut list, &client, &project, &name, cloud);
             let _ = tx.send(AppEvent::DownloadDone(id));
             let _ = tx.send(AppEvent::Notice(format!("Model {} enabled", name)));
         });
@@ -4204,12 +4206,16 @@ impl App {
                 if row.enabled {
                     // Always allowed, even for a model the plan no longer covers.
                     self.disable_model(row.name);
-                } else if !row.accessible {
+                } else if !row.accessible || (cloud_instead(&row) && row.cloud_locked) {
+                    // Locked like any cloud model: a sign-in, then the plan.
                     self.entries.push(Entry::Error(if self.search.is_some() {
                         format!("{} needs the pro plan; /upgrade to use it", row.name)
                     } else {
                         format!("{} needs a sign-in; /login first", row.name)
                     }));
+                } else if cloud_instead(&row) {
+                    // Too big to run here: the cloud copy, not a download.
+                    self.enable_model(row.name, true);
                 } else if needs_download(&row) {
                     // Enter never downloads: a model is fetched only when
                     // asked for with ctrl+d.
@@ -4217,17 +4223,20 @@ impl App {
                         self.entries.push(Entry::Notice(format!("{} isn't downloaded; ctrl+d downloads it", row.name)));
                     }
                 } else {
-                    self.enable_model(row.name);
+                    self.enable_model(row.name, false);
                 }
             }
             KeyCode::Char('d') if ctrl => {
                 // Download the local copy (and enable it).  Only a model
                 // with one, not yet downloaded.
+                // One too big for this machine with a cloud copy isn't
+                // offered as a download: Enter runs it in the cloud.
                 if let Some(row) = rows.as_ref().and_then(|r| r.as_ref().ok()).and_then(|r| r.get(*selected)).cloned()
                     && downloadable(&row)
                     && row.accessible
+                    && !cloud_instead(&row)
                 {
-                    self.enable_model(row.name);
+                    self.enable_model(row.name, false);
                 }
             }
             KeyCode::Char('x') if ctrl => {
@@ -5112,7 +5121,7 @@ impl App {
             Some(Err(e)) => return frame.render_widget(Paragraph::new(e.clone()).block(block).wrap(Wrap { trim: false }), area),
             Some(Ok(list)) => list,
         };
-        let label = |m: &ModelRow| if m.cloud { format!("{} ☁", m.name) } else { m.name.clone() };
+        let label = |m: &ModelRow| if m.cloud || cloud_instead(m) { format!("{} ☁", m.name) } else { m.name.clone() };
         let name_width = list.iter().map(|m| label(m).chars().count()).max().unwrap_or(0) + 2;
         let lines: Vec<Line> = list
             .iter()
@@ -5133,7 +5142,7 @@ impl App {
                     }
                     Some(_) => Span::styled(format!("downloading {}", self.spinner()), Style::new().fg(pink())),
                     None if m.enabled => Span::styled("✓ enabled", Style::new().fg(Color::Green)),
-                    None if m.cloud || !m.accessible => Span::styled("disabled", dim()),
+                    None if m.cloud || !m.accessible || cloud_instead(m) => Span::styled("disabled", dim()),
                     None if m.downloaded => Span::styled("downloaded", dim()),
                     None => Span::styled("↓ not downloaded", dim()),
                 };
@@ -5147,7 +5156,10 @@ impl App {
                 if m.recommended && !m.cloud {
                     spans.push(Span::styled("  · recommended", Style::new().fg(Color::Green)));
                 }
-                if !m.accessible {
+                if !m.fits && !m.cloud && !m.downloaded {
+                    spans.push(Span::styled("  · too big for this machine", Style::new().fg(Color::Yellow)));
+                }
+                if !m.accessible || (cloud_instead(m) && m.cloud_locked) {
                     // Signed in but still locked: the plan, not the sign-in, is what's missing.
                     let why = if self.search.is_some() { "  · pro plan" } else { "  · sign in to use" };
                     spans.push(Span::styled(why, Style::new().fg(Color::Yellow)));
@@ -6504,6 +6516,13 @@ fn downloadable(m: &ModelRow) -> bool {
     !m.downloaded && (m.local || !m.cloud)
 }
 
+/// Whether `m` is too big for this machine but served in the cloud too, so
+/// it's offered there, not as a download: locked, as other cloud models are,
+/// until a sign-in or the plan covers it.
+fn cloud_instead(m: &ModelRow) -> bool {
+    m.local && !m.fits && !m.cloud && !m.downloaded && (m.cloud_ready || m.cloud_locked)
+}
+
 /// Whether `m` runs only once downloaded, so Enter can't turn it on: a
 /// model that isn't on in the cloud and has no local copy yet. A cloud
 /// model, or one downloaded, is turned on as it is.
@@ -6519,6 +6538,11 @@ fn models_footer(selected: Option<&ModelRow>, downloading: bool) -> Vec<Span<'st
     let mut keys: Vec<(&str, &str)> = Vec::new();
     match selected {
         Some(_) if downloading => keys.push(("ctrl+x", "cancel download")),
+        Some(m) if cloud_instead(m) && !m.enabled => {
+            if !m.cloud_locked {
+                keys.push(("enter", "enable"));
+            }
+        }
         Some(m) => {
             if m.enabled {
                 keys.push(("enter", "disable"));
@@ -7504,6 +7528,9 @@ mod tests {
             cloud: false,
             local: false,
             recommended: false,
+            cloud_ready: false,
+            cloud_locked: false,
+            fits: true,
         }];
         app.overlay = Overlay::Models { rows: Some(Ok(rows)), selected: 0 };
         let text = screen(&app, 100, 24);
@@ -8428,6 +8455,9 @@ mod tests {
             cloud: false,
             local: false,
             recommended,
+            cloud_ready: false,
+            cloud_locked: false,
+            fits: true,
         };
         let list = vec![
             model("big", "general, reasoning", false, false),
@@ -8459,6 +8489,9 @@ mod tests {
             cloud: false,
             local: false,
             recommended,
+            cloud_ready: false,
+            cloud_locked: false,
+            fits: true,
         };
         app.apply(AppEvent::Models(Ok(vec![row("big", false, false), row("small", true, false)])));
         let text = screen(&app, 120, 30);
@@ -8505,6 +8538,60 @@ mod tests {
     }
 
     #[test]
+    fn a_model_too_big_for_the_machine_is_offered_in_the_cloud_not_as_a_download() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        let big = |name: &str| ModelRow {
+            name: name.into(),
+            capabilities: "general".into(),
+            overridden: false,
+            context: None,
+            access: "free".into(),
+            accessible: true,
+            downloaded: false,
+            enabled: false,
+            cloud: false,
+            local: true,
+            recommended: false,
+            cloud_ready: false,
+            cloud_locked: false,
+            fits: false,
+        };
+        let ready = ModelRow { cloud_ready: true, ..big("qwen-ready") };
+        let locked = ModelRow { cloud_locked: true, ..big("qwen-locked") };
+        let local_only = big("llama-big");
+        app.overlay = Overlay::Models { rows: Some(Ok(vec![ready, locked, local_only])), selected: 0 };
+        let select = |app: &mut App, i| {
+            if let Overlay::Models { selected, .. } = &mut app.overlay {
+                *selected = i;
+            }
+        };
+
+        let text = screen(&app, 120, 24);
+        assert!(text.contains("qwen-ready ☁   disabled"), "{}", text);
+        assert!(text.contains("[enter] enable  [ctrl+r]"), "{}", text);
+        assert!(!text.contains("ctrl+d"), "not offered as a download: {}", text);
+
+        // Signed out, the cloud copy is locked like any cloud model.
+        select(&mut app, 1);
+        let text = screen(&app, 120, 24);
+        assert!(text.contains("qwen-locked ☁  disabled"), "{}", text);
+        assert!(text.contains("· sign in to use"), "{}", text);
+        assert!(!text.contains("[enter]") && !text.contains("ctrl+d"), "{}", text);
+        app.key_models(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.downloads.is_empty(), "nothing enabled while locked");
+        assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("/login")));
+
+        // With no cloud copy it can still be downloaded, marked too big.
+        select(&mut app, 2);
+        let text = screen(&app, 120, 24);
+        assert!(text.contains("llama-big      ↓ not downloaded"), "{}", text);
+        assert!(text.contains("· too big for this machine"), "{}", text);
+        assert!(text.contains("[ctrl+d] download & enable"), "{}", text);
+    }
+
+    #[test]
     fn models_show_as_a_list() {
         let mut app = app();
         app.phase = Phase::Ready;
@@ -8521,6 +8608,9 @@ mod tests {
             cloud: false,
             local: false,
             recommended: false,
+            cloud_ready: false,
+            cloud_locked: false,
+            fits: true,
         };
         let cloud = ModelRow { cloud: true, ..model("sonnet", false, false) };
         let both = ModelRow { local: true, ..model("qwen3.8-27b", false, false) };

@@ -428,6 +428,15 @@ pub struct ModelRow {
     pub local: bool,
     /// Light enough for this machine, as the agent judges by its RAM.
     pub recommended: bool,
+    /// Served both ways and the plan covers the cloud copy: it can run in
+    /// the cloud instead of being downloaded (the catalog's `cloud`).
+    pub cloud_ready: bool,
+    /// Served both ways, but the cloud copy needs a sign-in or a plan first
+    /// (the catalog's `cloud_locked`).
+    pub cloud_locked: bool,
+    /// Its local copy fits this machine's memory, as far as its size is
+    /// known; one of unknown size is taken to fit.
+    pub fits: bool,
 }
 
 /// The catalog (`/v1/models`) joined with the project's state. A model the
@@ -435,17 +444,19 @@ pub struct ModelRow {
 pub fn model_rows(client: &Client, project_id: &str) -> Result<Vec<ModelRow>, String> {
     let catalog = request_json(client, format!("{}/models", api_url()), "list models")?;
     let state = project_model_state(client, project_id)?;
+    let (_, total_gb) = smartloop::utils::device_utils::available_memory_gb();
     Ok(catalog
         .as_array()
         .cloned()
         .unwrap_or_default()
         .iter()
-        .map(|model| model_row(model, state.get(model["name"].as_str().unwrap_or_default())))
+        .map(|model| model_row(model, state.get(model["name"].as_str().unwrap_or_default()), total_gb))
         .collect())
 }
 
-/// One catalog `model` as a row, with the project's `entry` for it.
-pub fn model_row(model: &serde_json::Value, entry: Option<&serde_json::Value>) -> ModelRow {
+/// One catalog `model` as a row, with the project's `entry` for it, on a
+/// machine with `total_gb` of memory.
+pub fn model_row(model: &serde_json::Value, entry: Option<&serde_json::Value>, total_gb: f64) -> ModelRow {
     let name = model["name"].as_str().unwrap_or_default().to_string();
     let flag = |key: &str| entry.and_then(|m| m[key].as_bool()).unwrap_or_default();
     let local = model["local"].as_bool().unwrap_or_default();
@@ -469,7 +480,21 @@ pub fn model_row(model: &serde_json::Value, entry: Option<&serde_json::Value>) -
         cloud: remote && (!local || flag("enabled")),
         local,
         recommended: model["recommended"].as_bool().unwrap_or_default(),
+        cloud_ready: local && model["cloud"].as_bool().unwrap_or_default(),
+        cloud_locked: local && model["cloud_locked"].as_bool().unwrap_or_default(),
+        fits: fits(model["param_size_b"].as_f64(), total_gb),
         name,
+    }
+}
+
+/// Whether a model of `size_b` billion parameters fits `total_gb` of memory,
+/// by the agent's own measure: ~1GB per billion parameters, under
+/// [`FITS_PCT`](smartloop::api::routers::models::FITS_PCT) of the RAM.  An
+/// unknown size, or memory, is taken to fit.
+fn fits(size_b: Option<f64>, total_gb: f64) -> bool {
+    match size_b {
+        Some(size) if size > 0.0 && total_gb > 0.0 => size / total_gb * 100.0 < smartloop::api::routers::models::FITS_PCT,
+        _ => true,
     }
 }
 
@@ -652,8 +677,32 @@ pub fn set_web_search(client: &Client, project_id: &str, enabled: bool) -> Resul
 }
 
 /// The steps of enabling `name`, reported on `list`: the checklist, or the
-/// TUI's downloads panel.
-pub fn enable_steps(list: &mut dyn Steps, client: &Client, project_id: &str, name: &str) {
+/// TUI's downloads panel.  With `cloud`, a model served both ways is set to
+/// run in the cloud, with nothing downloaded.
+pub fn enable_steps(list: &mut dyn Steps, client: &Client, project_id: &str, name: &str, cloud: bool) {
+    if cloud {
+        let register = list.add(&format!("Run {} in the cloud", name));
+        let enable = list.add("Enable for project");
+        list.start(register);
+        framework::stream_progress(
+            &base_url(),
+            "/v1/init",
+            serde_json::json!({ "model_name": name, "project_id": project_id, "cloud": true }),
+            list,
+            register,
+            &|status| match status {
+                "model_ready" => framework::Stage::Done(register),
+                _ => framework::Stage::Other,
+            },
+        );
+        list.finish_before(enable);
+        list.start(enable);
+        if let Err(e) = patch_project_model(client, project_id, name, true) {
+            list.fail(enable, e);
+        }
+        list.done(enable);
+        return;
+    }
     let download = list.add(&format!("Download {}", name));
     let enable = list.add("Enable for project");
 
@@ -1000,28 +1049,46 @@ mod tests {
     fn a_model_served_both_ways_is_a_local_download_even_if_registered_as_cloud() {
         let model = serde_json::json!({"name": "qwen3.8-27b", "type": "remote", "cloud": true, "local": true});
         let registered = serde_json::json!({"downloaded": true, "enabled": false});
-        let row = model_row(&model, Some(&registered));
+        let row = model_row(&model, Some(&registered), 16.0);
         assert!(row.local);
         assert!(!row.cloud, "off in the cloud, it reads as a local model");
         assert!(!row.downloaded, "the local copy is still to fetch");
 
         // Turned on in the cloud, it runs there.
         let on = serde_json::json!({"downloaded": true, "enabled": true});
-        let row = model_row(&model, Some(&on));
+        let row = model_row(&model, Some(&on), 16.0);
         assert!(row.cloud && row.enabled && !row.downloaded);
     }
 
     #[test]
     fn a_cloud_only_model_stays_cloud() {
         let model = serde_json::json!({"name": "minimax-m3", "type": "remote"});
-        let row = model_row(&model, Some(&serde_json::json!({"downloaded": true})));
+        let row = model_row(&model, Some(&serde_json::json!({"downloaded": true})), 16.0);
         assert!(row.cloud && !row.local && row.downloaded);
     }
 
     #[test]
     fn an_agent_without_the_local_flag_reads_as_before() {
         let model = serde_json::json!({"name": "gemma4-e2b", "type": "local"});
-        let row = model_row(&model, Some(&serde_json::json!({"downloaded": true, "enabled": true})));
+        let row = model_row(&model, Some(&serde_json::json!({"downloaded": true, "enabled": true})), 16.0);
         assert!(!row.cloud && !row.local && row.downloaded && row.enabled);
+    }
+
+    #[test]
+    fn a_model_fits_under_four_fifths_of_the_memory() {
+        let model = |size: f64| serde_json::json!({"name": "m", "type": "local", "local": true, "param_size_b": size});
+        assert!(model_row(&model(9.0), None, 16.0).fits);
+        assert!(!model_row(&model(27.0), None, 16.0).fits, "27B in 16GB doesn't fit");
+        assert!(model_row(&serde_json::json!({"name": "m", "local": true}), None, 16.0).fits, "an unknown size is taken to fit");
+    }
+
+    #[test]
+    fn the_cloud_copy_is_offered_or_locked_only_for_a_model_served_both_ways() {
+        let row = model_row(&serde_json::json!({"name": "q", "type": "local", "local": true, "cloud": true}), None, 16.0);
+        assert!(row.cloud_ready && !row.cloud_locked && !row.cloud, "offered, not yet running there");
+        let row = model_row(&serde_json::json!({"name": "q", "type": "local", "local": true, "cloud_locked": true}), None, 16.0);
+        assert!(!row.cloud_ready && row.cloud_locked);
+        let row = model_row(&serde_json::json!({"name": "s", "type": "remote", "cloud": true}), None, 16.0);
+        assert!(!row.cloud_ready, "a cloud-only model has no copy to offer instead");
     }
 }
