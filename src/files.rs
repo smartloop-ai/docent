@@ -904,9 +904,19 @@ pub fn blocks(reply: &str) -> Vec<Block> {
             path = heading;
         }
         above = None;
+        // A block that opens with a heredoc writing a file is that heredoc,
+        // however the block is marked or named: `**build.mjs**` over a
+        // ```` ```sh ```` block of `cat > build.mjs <<'EOF'`, or a ```` ```js ````
+        // block wrapped the same way, writes the heredoc's body, never the
+        // `cat` line and end word around it.
+        let wrapped = body
+            .iter()
+            .find(|l| !l.trim().is_empty())
+            .is_some_and(|l| heredoc_word(l).is_some() && heredoc_target(l).is_some());
+        let path = path.filter(|_| !wrapped);
         let Some(path) = path else {
             // A shell block names no file of its own; its heredocs do.
-            if heredoc_lang(info) {
+            if wrapped || heredoc_lang(info) {
                 for doc in heredocs(&body) {
                     blocks.push(Block {
                         file: File { path: doc.path, content: doc.content },
@@ -2115,6 +2125,21 @@ mod tests {
         assert_eq!(commands(reply), ["git add -A"]);
         let blocks = blocks(reply);
         assert_eq!((blocks[0].fence, blocks[0].end, blocks[0].closed), (3, 6, true));
+    }
+
+    #[test]
+    fn a_heredoc_in_a_block_named_otherwise_writes_its_body_not_the_command() {
+        let body = "cat > build.mjs <<'EOF'\nconsole.log(1);\nEOF\n";
+        for reply in [
+            format!("**build.mjs**\n\n```sh\n{body}```\n"),
+            format!("### build.mjs\n\n```js\n{body}```\n"),
+            format!("```js build.mjs\n{body}```\n"),
+        ] {
+            let files = extract(&reply);
+            assert_eq!(files.len(), 1, "{reply}");
+            assert_eq!((files[0].path.as_str(), files[0].content.as_str()), ("build.mjs", "console.log(1);\n"), "{reply}");
+            assert!(commands(&reply).is_empty(), "{reply}");
+        }
     }
 
     #[test]
