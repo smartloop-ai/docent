@@ -428,12 +428,9 @@ pub struct ModelRow {
     pub local: bool,
     /// Light enough for this machine, as the agent judges by its RAM.
     pub recommended: bool,
-    /// Served both ways and the plan covers the cloud copy: it can run in
-    /// the cloud instead of being downloaded (the catalog's `cloud`).
+    /// Served both ways and the plan (pro) covers the cloud copy: it can
+    /// run in the cloud instead of being downloaded (the catalog's `cloud`).
     pub cloud_ready: bool,
-    /// Served both ways, but the cloud copy needs a sign-in or a plan first
-    /// (the catalog's `cloud_locked`).
-    pub cloud_locked: bool,
     /// Its local copy fits this machine's memory, as far as its size is
     /// known; one of unknown size is taken to fit.
     pub fits: bool,
@@ -481,7 +478,6 @@ pub fn model_row(model: &serde_json::Value, entry: Option<&serde_json::Value>, t
         local,
         recommended: model["recommended"].as_bool().unwrap_or_default(),
         cloud_ready: local && model["cloud"].as_bool().unwrap_or_default(),
-        cloud_locked: local && model["cloud_locked"].as_bool().unwrap_or_default(),
         fits: fits(model["param_size_b"].as_f64(), total_gb),
         name,
     }
@@ -1083,11 +1079,9 @@ mod tests {
     }
 
     #[test]
-    fn the_cloud_copy_is_offered_or_locked_only_for_a_model_served_both_ways() {
+    fn the_cloud_copy_is_offered_only_for_a_model_served_both_ways() {
         let row = model_row(&serde_json::json!({"name": "q", "type": "local", "local": true, "cloud": true}), None, 16.0);
-        assert!(row.cloud_ready && !row.cloud_locked && !row.cloud, "offered, not yet running there");
-        let row = model_row(&serde_json::json!({"name": "q", "type": "local", "local": true, "cloud_locked": true}), None, 16.0);
-        assert!(!row.cloud_ready && row.cloud_locked);
+        assert!(row.cloud_ready && !row.cloud, "offered, not yet running there");
         let row = model_row(&serde_json::json!({"name": "s", "type": "remote", "cloud": true}), None, 16.0);
         assert!(!row.cloud_ready, "a cloud-only model has no copy to offer instead");
     }
