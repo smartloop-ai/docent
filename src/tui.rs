@@ -4203,10 +4203,11 @@ impl App {
                     return true;
                 };
                 let row = row.clone();
-                if row.enabled {
+                let signed_out = self.account == Some(None);
+                if row.enabled && !(signed_out && row.cloud) {
                     // Always allowed, even for a model the plan no longer covers.
                     self.disable_model(row.name);
-                } else if !row.accessible {
+                } else if locked(&row, signed_out) {
                     self.entries.push(Entry::Error(if self.search.is_some() {
                         format!("{} needs the pro plan; /upgrade to use it", row.name)
                     } else {
@@ -5113,7 +5114,8 @@ impl App {
             _ => None,
         };
         let downloading = chosen.is_some_and(|m| self.downloads.iter().any(|d| d.model == m.name && !d.finished));
-        let block = panel(&models_footer(chosen, downloading));
+        let signed_out = self.account == Some(None);
+        let block = panel(&models_footer(chosen, downloading, signed_out));
         frame.render_widget(Clear, area);
         let list = match rows {
             None => return frame.render_widget(Paragraph::new(format!(" Loading models {}", self.spinner())).block(block), area),
@@ -5140,8 +5142,9 @@ impl App {
                         Span::styled(format!("downloading {}%", done * 100 / total), Style::new().fg(pink()))
                     }
                     Some(_) => Span::styled(format!("downloading {}", self.spinner()), Style::new().fg(pink())),
+                    None if locked(m, signed_out) => Span::styled("disabled", dim()),
                     None if m.enabled => Span::styled("✓ enabled", Style::new().fg(Color::Green)),
-                    None if m.cloud || !m.accessible || cloud_instead(m) => Span::styled("disabled", dim()),
+                    None if m.cloud || cloud_instead(m) => Span::styled("disabled", dim()),
                     None if m.downloaded => Span::styled("downloaded", dim()),
                     None => Span::styled("↓ not downloaded", dim()),
                 };
@@ -5158,7 +5161,7 @@ impl App {
                 if !m.fits && !m.cloud && !m.downloaded {
                     spans.push(Span::styled("  · too big for this machine", Style::new().fg(Color::Yellow)));
                 }
-                if !m.accessible {
+                if locked(m, signed_out) {
                     // Signed in but still locked: the plan, not the sign-in, is what's missing.
                     let why = if self.search.is_some() { "  · pro plan" } else { "  · sign in to use" };
                     spans.push(Span::styled(why, Style::new().fg(Color::Yellow)));
@@ -6515,6 +6518,13 @@ fn downloadable(m: &ModelRow) -> bool {
     !m.downloaded && (m.local || !m.cloud)
 }
 
+/// Whether `m` can't be used as it stands: one the plan or a sign-in locks,
+/// or one that runs in the cloud while `signed_out`, as every cloud model
+/// needs a sign-in.  Shown disabled, and Enter asks for the sign-in.
+fn locked(m: &ModelRow, signed_out: bool) -> bool {
+    !m.accessible || (signed_out && m.cloud)
+}
+
 /// Whether `m` is too big for this machine but the plan covers its cloud
 /// copy, so it's offered there, not as a download.
 fn cloud_instead(m: &ModelRow) -> bool {
@@ -6532,10 +6542,16 @@ fn needs_download(m: &ModelRow) -> bool {
 /// Enter turns it on or off and never downloads; ctrl+d downloads a model's
 /// local copy (and turns it on), a model that needs one only so.  While it
 /// downloads, ctrl+x cancels it.
-fn models_footer(selected: Option<&ModelRow>, downloading: bool) -> Vec<Span<'static>> {
+fn models_footer(selected: Option<&ModelRow>, downloading: bool, signed_out: bool) -> Vec<Span<'static>> {
     let mut keys: Vec<(&str, &str)> = Vec::new();
     match selected {
         Some(_) if downloading => keys.push(("ctrl+x", "cancel download")),
+        // Locked: nothing to turn on, though a local copy can still come.
+        Some(m) if locked(m, signed_out) => {
+            if downloadable(m) && m.local && m.accessible {
+                keys.push(("ctrl+d", "download & enable"));
+            }
+        }
         Some(m) if cloud_instead(m) && !m.enabled => keys.push(("enter", "enable")),
         Some(m) => {
             if m.enabled {
@@ -8569,6 +8585,42 @@ mod tests {
         assert!(text.contains("llama-big     ↓ not downloaded"), "{}", text);
         assert!(text.contains("· too big for this machine"), "{}", text);
         assert!(text.contains("[ctrl+d] download & enable"), "{}", text);
+    }
+
+    #[test]
+    fn signed_out_a_cloud_model_is_disabled_and_asks_for_a_sign_in() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.account = Some(None);
+        let row = ModelRow {
+            name: "qwen3.8-27b".into(),
+            capabilities: "general".into(),
+            overridden: false,
+            context: None,
+            access: "free".into(),
+            accessible: true,
+            downloaded: false,
+            enabled: true,
+            cloud: true,
+            local: true,
+            recommended: false,
+            cloud_ready: false,
+            fits: true,
+        };
+        app.overlay = Overlay::Models { rows: Some(Ok(vec![row])), selected: 0 };
+        let text = screen(&app, 120, 24);
+        assert!(text.contains("qwen3.8-27b ☁  disabled"), "{}", text);
+        assert!(text.contains("· sign in to use"), "{}", text);
+        assert!(!text.contains("[enter]"), "{}", text);
+        assert!(text.contains("[ctrl+d] download & enable"), "its local copy can still come: {}", text);
+        app.key_models(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.entries.last(), Some(Entry::Error(e)) if e.contains("/login")));
+
+        // Signed in, it's on as before.
+        app.account = Some(Some("me".into()));
+        let text = screen(&app, 120, 24);
+        assert!(text.contains("✓ enabled") && !text.contains("sign in to use"), "{}", text);
     }
 
     #[test]

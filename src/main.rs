@@ -457,7 +457,10 @@ pub fn model_row(model: &serde_json::Value, entry: Option<&serde_json::Value>, t
     let name = model["name"].as_str().unwrap_or_default().to_string();
     let flag = |key: &str| entry.and_then(|m| m[key].as_bool()).unwrap_or_default();
     let local = model["local"].as_bool().unwrap_or_default();
-    let remote = model["type"].as_str() == Some("remote");
+    // Registered to run in the cloud, by the catalog or by the project's own
+    // entry: signed out, the catalog no longer folds a cloud registration in,
+    // but the project still has the model there, with nothing downloaded.
+    let remote = model["type"].as_str() == Some("remote") || entry.is_some_and(|m| m["type"].as_str() == Some("remote"));
     ModelRow {
         capabilities: model["capabilities"]
             .as_array()
@@ -706,16 +709,16 @@ pub fn enable_steps(list: &mut dyn Steps, client: &Client, project_id: &str, nam
     // reads as downloaded (a cloud model has nothing to fetch), but it's the
     // local copy that gets enabled: `/v1/init` switches it back and fetches
     // it, so docent never turns a paid cloud model on in its place.
+    let state = project_model_state(client, project_id).unwrap_or_else(|e| list.fail(download, e));
+    let entry = state.get(name);
     let needs_local = request_json(client, format!("{}/models", api_url()), "list models")
         .ok()
         .and_then(|catalog| catalog.as_array().and_then(|rows| rows.iter().find(|m| m["name"] == name).cloned()))
-        .is_some_and(|row| row["local"].as_bool() == Some(true) && row["type"].as_str() == Some("remote"));
-    let downloaded = !needs_local
-        && project_model_state(client, project_id)
-            .unwrap_or_else(|e| list.fail(download, e))
-            .get(name)
-            .and_then(|m| m["downloaded"].as_bool())
-            .unwrap_or_default();
+        .is_some_and(|row| {
+            let remote = |m: &serde_json::Value| m["type"].as_str() == Some("remote");
+            row["local"].as_bool() == Some(true) && (remote(&row) || entry.is_some_and(remote))
+        });
+    let downloaded = !needs_local && entry.and_then(|m| m["downloaded"].as_bool()).unwrap_or_default();
     if downloaded {
         list.set_detail(download, "downloaded");
         list.done(download);
@@ -1054,6 +1057,17 @@ mod tests {
         let on = serde_json::json!({"downloaded": true, "enabled": true});
         let row = model_row(&model, Some(&on), 16.0);
         assert!(row.cloud && row.enabled && !row.downloaded);
+    }
+
+    #[test]
+    fn a_model_the_project_runs_in_the_cloud_isnt_downloaded_when_signed_out() {
+        // Signed out, the catalog no longer folds the cloud registration in:
+        // its row reads local, but the project's entry is still remote.
+        let model = serde_json::json!({"name": "qwen3.8-27b", "type": "local", "local": true});
+        let row = model_row(&model, Some(&serde_json::json!({"type": "remote", "downloaded": true})), 16.0);
+        assert!(!row.downloaded, "nothing of it is on disk");
+        let on = model_row(&model, Some(&serde_json::json!({"type": "remote", "downloaded": true, "enabled": true})), 16.0);
+        assert!(on.cloud && on.enabled);
     }
 
     #[test]
