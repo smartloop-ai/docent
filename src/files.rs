@@ -443,10 +443,10 @@ const BARE_NAMES: [&str; 8] =
 /// about, expecting that to move where files go.
 pub fn folder_note(root: &Path) -> String {
     format!(
-        "The working folder is `{}`, and it is the project's root: every path is relative to it, as `Cargo.toml` \
-         and `src/main.rs` for a Rust program. Don't make a project folder inside it (no `cargo new <name>`, \
-         `cargo init <name>` or `npm create <name>`), and don't `cd`: commands always run in this folder, and a \
-         `cd` doesn't change where files are written.",
+        "The working folder is `{}`, and it is the project's root: every path is relative to it, as `README.md` \
+         or `src/app` rather than `<name>/src/app`. Don't make a project folder inside it (no scaffolding command \
+         that takes a project name), and don't `cd`: commands always run in this folder, and a `cd` doesn't \
+         change where files are written.",
         root.display()
     )
 }
@@ -454,7 +454,8 @@ pub fn folder_note(root: &Path) -> String {
 /// Told to the agent when the folder it works in has no files yet, so it
 /// doesn't take an edit block's example path for a file that's there.
 pub const EMPTY_FOLDER: &str = "The working folder is empty: there are no files to change, so write every file \
-whole as a heredoc, with no edit blocks.";
+whole as a heredoc, with no edit blocks. Write it in TypeScript on Node, with its `package.json` and \
+`tsconfig.json`, unless the request names another language or one is otherwise preferred, as Python or Rust.";
 
 /// Whether `root` has no files of its own: nothing but hidden entries,
 /// such as docent's `.docent/`.
@@ -1921,6 +1922,8 @@ mod tests {
         let note = folder_note(Path::new("/home/me/small-app"));
         assert!(note.starts_with("The working folder is `/home/me/small-app`, and it is the project's root"), "{note}");
         assert!(note.contains("don't `cd`"), "{note}");
+        // No one language as the example, which a model then writes in.
+        assert!(!note.contains("Rust") && !note.contains("cargo") && !note.contains(".rs"), "{note}");
     }
 
     #[test]
